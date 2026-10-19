@@ -3642,7 +3642,7 @@ ipintOp(_ref_cast, macro()
     popQuad(a3)
     operationCallMayThrow(macro() cCall3(_ipint_extern_ref_cast) end)
 
-    pushInt32(r0)
+    pushQuad(r0)
 
     loadb IPInt::RefTestCastMetadata::length[MC], t0
     advancePCByReg(t0)
@@ -3656,7 +3656,7 @@ ipintOp(_ref_cast_nullable, macro()
     popQuad(a3)
     operationCallMayThrow(macro() cCall3(_ipint_extern_ref_cast) end)
 
-    pushInt32(r0)
+    pushQuad(r0)
 
     loadb IPInt::RefTestCastMetadata::length[MC], t0
     advancePCByReg(t0)
