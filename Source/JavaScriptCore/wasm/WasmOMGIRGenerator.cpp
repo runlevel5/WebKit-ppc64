@@ -1975,12 +1975,18 @@ static void emitWasmCallStackResultsAndSPRestore(CCallHelpers& jit,
             }
         } else {
             ASSERT(rep.isStack());
+            // A result pinned to its canonical slot (see createCallPatchpoint) is still copied, since the
+            // callee may have returned with a different SP; for an i32 the pin names the payload half.
+            bool isPinnedPayload = narrowSlotOffset(toB3Type(wasmType))
+                && rep.offsetFromFP() == checkedSum<int32_t>(loc.location.offsetFromSP(), -static_cast<int32_t>(frameSize), PayloadOffset).value();
             if (wasmType.isV128())
                 jit.transferVector(src, CCallHelpers::Address(GPRInfo::callFrameRegister, rep.offsetFromFP()));
             else if (wasmType.isF32()) {
                 // Air keeps a Float in a 4-byte spill slot; a GP spill slot takes the whole word.
                 jit.transfer32(src.withOffset(PayloadOffset), CCallHelpers::Address(GPRInfo::callFrameRegister, rep.offsetFromFP()));
-            } else
+            } else if (isPinnedPayload)
+                jit.transfer32(src.withOffset(PayloadOffset), CCallHelpers::Address(GPRInfo::callFrameRegister, rep.offsetFromFP()));
+            else
                 jit.transfer64(src, CCallHelpers::Address(GPRInfo::callFrameRegister, rep.offsetFromFP()));
         }
     }
