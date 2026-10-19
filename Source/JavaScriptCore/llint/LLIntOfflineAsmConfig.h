@@ -40,6 +40,7 @@
 #define OFFLINE_ASM_ARMv7k 0
 #define OFFLINE_ASM_ARMv7s 0
 #define OFFLINE_ASM_RISCV64 0
+#define OFFLINE_ASM_PPC64 0
 
 #else // ENABLE(C_LOOP)
 
@@ -87,6 +88,12 @@
 #define OFFLINE_ASM_RISCV64 1
 #else
 #define OFFLINE_ASM_RISCV64 0
+#endif
+
+#if CPU(PPC64)
+#define OFFLINE_ASM_PPC64 1
+#else
+#define OFFLINE_ASM_PPC64 0
 #endif
 
 #endif // ENABLE(C_LOOP)

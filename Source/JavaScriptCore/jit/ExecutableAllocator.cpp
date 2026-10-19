@@ -105,6 +105,11 @@ static constexpr size_t fixedExecutableMemoryPoolSize = 16 * MB;
 #endif
 #elif CPU(X86_64)
 static constexpr size_t fixedExecutableMemoryPoolSize = 1 * GB;
+#elif CPU(PPC64)
+// A PPC64 direct branch reaches only +/-32 MB; the pool is split into regions with jump islands, as
+// on ARM64, for the sites that must stay a single branch (see PPC64Assembler). A single 32 MB pool
+// fills up in large runs, and memoryPressureMultiplier() then holds hot code in the lower tiers.
+static constexpr size_t fixedExecutableMemoryPoolSize = 1 * GB;
 #else
 static constexpr size_t fixedExecutableMemoryPoolSize = 32 * MB;
 #endif
@@ -116,6 +121,12 @@ static constexpr size_t islandSizeInBytes = 4;
 #elif CPU(ARM_THUMB2)
 static constexpr double islandRegionSizeFraction = 0.05;
 static constexpr size_t islandSizeInBytes = 4;
+#elif CPU(PPC64)
+// An island is a jump slot that reaches any address (PPC64Assembler::fillNearTailCall), so islands
+// are never chained. 2 MB of each 32 MB region holds 65,536 islands and leaves 28 MB for code, which
+// also bounds the largest single JIT allocation.
+static constexpr double islandRegionSizeFraction = 0.0625;
+static constexpr size_t islandSizeInBytes = PPC64Assembler::jumpIslandSize;
 #endif
 #endif
 
@@ -905,6 +916,12 @@ private:
 #endif
             m_fixedAllocator(allocator)
         {
+#if !ENABLE(LIBPAS_JIT_HEAP) && CPU(PPC64)
+            // A PPC64 direct branch reaches only +/-32 MB, so keep JIT code packed
+            // from the bottom rather than split between both ends of the free
+            // space, which makes far calls more likely. This is only about locality.
+            setAllocatesFromBottom(true);
+#endif
         }
 
 #if ENABLE(LIBPAS_JIT_HEAP)

@@ -271,6 +271,10 @@ void compile(State& state, Safepoint::Result& safepointResult)
 
 #if CPU(X86_64)
             jit.pop(GPRInfo::argumentGPR1);
+#elif CPU(PPC64)
+            // linkRegister is only a placeholder on PPC64; the return address is in
+            // LR, which nearCallThunk clobbers.
+            jit.moveFromLR(GPRInfo::argumentGPR1);
 #else
             jit.tagPtr(NoPtrTag, CCallHelpers::linkRegister);
             jit.move(CCallHelpers::linkRegister, GPRInfo::argumentGPR1);
@@ -278,6 +282,8 @@ void compile(State& state, Safepoint::Result& safepointResult)
             jit.nearCallThunk(CodeLocationLabel { LLInt::arityFixup() });
 #if CPU(X86_64)
             jit.push(GPRInfo::argumentGPR1);
+#elif CPU(PPC64)
+            jit.moveToLR(GPRInfo::argumentGPR1);
 #else
             jit.move(GPRInfo::argumentGPR1, CCallHelpers::linkRegister);
             jit.untagPtr(NoPtrTag, CCallHelpers::linkRegister);

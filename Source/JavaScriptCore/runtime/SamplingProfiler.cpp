@@ -314,6 +314,98 @@ private:
     void* m_machineFrame;
 };
 
+#if CPU(PPC64)
+// ELFv2 code keeps no frame-pointer chain. Instead every frame starts with a
+// back chain (the caller's stack pointer), and a function saves its return
+// address in its caller's frame, at 16(caller's sp). Walk the C frames on top
+// of the stack that way until a return address leads into JIT or LLInt code,
+// then walk the JS frames from callFrame. C frames below the first JS frame are
+// not recorded, and, as with frame-pointer walks, a function that has not yet
+// saved its return address loses its caller.
+class BackChainCFrameWalker : public FrameWalker {
+public:
+    typedef FrameWalker Base;
+
+    BackChainCFrameWalker(VM& vm, void* stackPointer, void* linkRegister, CallFrame* callFrame, const AbstractLocker* executableAllocatorLocker, const AbstractLocker& codeBlockSetLocker, const AbstractLocker& machineThreadsLocker)
+        : Base(vm, callFrame, codeBlockSetLocker, machineThreadsLocker)
+        , m_stackPointer(static_cast<uint8_t*>(stackPointer))
+        , m_executableAllocatorLocker(executableAllocatorLocker)
+    {
+        // A C function whose return address is still in LR and points into JS
+        // code was called straight from JS: it has no C callers, and if it has
+        // no frame, 0(sp) is the JS frame's, which holds no back chain.
+        if (m_stackPointer && isJSCode(linkRegister))
+            m_stackPointer = nullptr;
+    }
+
+    SUPPRESS_ASAN
+    size_t walk(Vector<UnprocessedStackFrame>& stackTrace, bool& didRunOutOfSpace)
+    {
+        if (sReportStats)
+            sNumTotalWalks++;
+        size_t maxStackTraceSize = stackTrace.size();
+        uint8_t* stackPointer = m_stackPointer;
+        bool reachedJSFrames = !stackPointer;
+        while (stackPointer && !m_bailingOut && m_depth < maxStackTraceSize) {
+            uint8_t* callerStackPointer = isValidStackPointer(stackPointer) ? *std::bit_cast<uint8_t**>(stackPointer) : nullptr;
+            if (!callerStackPointer) {
+                // The outermost frame's back chain is null; anything else is a bad walk.
+                if (!isValidStackPointer(stackPointer))
+                    bailOut();
+                break;
+            }
+            if (callerStackPointer <= stackPointer || !isValidStackPointer(callerStackPointer) || !isValidFramePointer(callerStackPointer + 16)) {
+                bailOut();
+                break;
+            }
+            void* returnPC = *std::bit_cast<void**>(callerStackPointer + 16);
+            if (isJSCode(returnPC)) {
+                reachedJSFrames = true;
+                break;
+            }
+            stackTrace[m_depth++] = UnprocessedStackFrame(returnPC);
+            stackPointer = callerStackPointer;
+        }
+
+        // callFrame is only below these C frames if they were called from JS.
+        if (reachedJSFrames && !m_bailingOut) {
+            resetAtMachineFrame();
+            while (!isAtTop() && !m_bailingOut && m_depth < maxStackTraceSize) {
+                recordJITFrame(stackTrace);
+                advanceToParentFrame();
+                resetAtMachineFrame();
+            }
+        }
+        didRunOutOfSpace = m_depth >= maxStackTraceSize && (!reachedJSFrames || !isAtTop());
+        reportStats();
+        return m_depth;
+    }
+
+private:
+    bool isJSCode(void* pc)
+    {
+        if (LLInt::isLLIntPC(pc))
+            return true;
+        return m_executableAllocatorLocker && ExecutableAllocator::singleton().isValidExecutableMemory(*m_executableAllocatorLocker, pc);
+    }
+
+    bool isValidStackPointer(uint8_t* stackPointer)
+    {
+        return !(std::bit_cast<uintptr_t>(stackPointer) & 15) && isValidFramePointer(stackPointer);
+    }
+
+    void bailOut()
+    {
+        m_bailingOut = true;
+        if (sReportStats)
+            sNumFailedWalks++;
+    }
+
+    uint8_t* m_stackPointer;
+    const AbstractLocker* m_executableAllocatorLocker;
+};
+#endif
+
 SamplingProfiler::SamplingProfiler(VM& vm, Ref<Stopwatch>&& stopwatch)
     : m_isPaused(false)
     , m_isShutDown(false)
@@ -395,6 +487,10 @@ void SamplingProfiler::takeSample(Seconds& stackTraceProcessingTime)
             void* machineFrame;
             CallFrame* callFrame;
             void* machinePC;
+#if CPU(PPC64)
+            void* machineStackPointer;
+            void* machineLinkRegister;
+#endif
             bool topFrameIsLLInt = false;
             RegExp* regExp = nullptr;
             void* llintPC;
@@ -403,6 +499,10 @@ void SamplingProfiler::takeSample(Seconds& stackTraceProcessingTime)
                 m_jscExecutionThread->getRegisters(threadSuspendLocker, registers);
                 machineFrame = MachineContext::framePointer(registers);
                 callFrame = static_cast<CallFrame*>(machineFrame);
+#if CPU(PPC64)
+                machineStackPointer = MachineContext::stackPointer(registers);
+                machineLinkRegister = MachineContext::linkRegister(registers).untaggedPtr();
+#endif
                 auto instructionPointer = MachineContext::instructionPointer(registers);
                 if (instructionPointer)
                     machinePC = instructionPointer->untaggedPtr();
@@ -413,6 +513,7 @@ void SamplingProfiler::takeSample(Seconds& stackTraceProcessingTime)
             }
 
             bool shouldAppendTopFrameAsCCode = false;
+            bool topFrameIsCCode = false;
             // FIXME: Lets have a way of detecting when we're parsing code.
             // https://bugs.webkit.org/show_bug.cgi?id=152761
             if (Options::useJIT() && ExecutableAllocator::singleton().isValidExecutableMemory(*executableAllocatorLocker, machinePC)) {
@@ -429,6 +530,7 @@ void SamplingProfiler::takeSample(Seconds& stackTraceProcessingTime)
                 // We resort to topCallFrame to see if we can get anything
                 // useful. We usually get here when we're executing C code.
                 callFrame = m_vm.topCallFrame;
+                topFrameIsCCode = true;
                 if (Options::collectExtraSamplingProfilerData() && !Options::sampleCCode())
                     shouldAppendTopFrameAsCCode = true;
             }
@@ -437,7 +539,13 @@ void SamplingProfiler::takeSample(Seconds& stackTraceProcessingTime)
             bool wasValidWalk;
             bool didRunOutOfVectorSpace;
             if (Options::sampleCCode()) {
+#if CPU(PPC64)
+                UNUSED_PARAM(machineFrame);
+                BackChainCFrameWalker walker(m_vm, topFrameIsCCode ? machineStackPointer : nullptr, machineLinkRegister, callFrame, executableAllocatorLocker ? &*executableAllocatorLocker : nullptr, codeBlockSetLocker, machineThreadsLocker);
+#else
+                UNUSED_VARIABLE(topFrameIsCCode);
                 CFrameWalker walker(m_vm, machineFrame, callFrame, codeBlockSetLocker, machineThreadsLocker);
+#endif
                 walkSize = walker.walk(m_currentFrames, didRunOutOfVectorSpace);
                 wasValidWalk = walker.wasValidWalk();
             } else {

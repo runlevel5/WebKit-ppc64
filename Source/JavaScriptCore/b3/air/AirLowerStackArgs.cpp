@@ -32,6 +32,7 @@
 #include "AirInsertionSet.h"
 #include "AirInstInlines.h"
 #include "AirPhaseScope.h"
+#include "MaxFrameExtentForSlowPathCall.h"
 
 namespace JSC { namespace B3 { namespace Air {
 
@@ -52,6 +53,14 @@ void lowerStackArgs(Code& code)
             }
         }
     }
+
+#if CPU(PPC64)
+    // An ELFv2 C callee saves CR, LR and the TOC at sp + 8..31 of its caller's frame.
+    // Patchpoints also reach C through thunks that build no frame of their own, and
+    // with no CCall and no spill slots sp == fp, so always keep that area below the
+    // frame, as the baseline JIT and DFG do.
+    code.requestCallArgAreaSizeInBytes(maxFrameExtentForSlowPathCall);
+#endif
 
     code.setFrameSize(code.frameSize() + code.callArgAreaSizeInBytes());
 
@@ -103,9 +112,11 @@ void lowerStackArgs(Code& code)
                 // We solve this in AirAllocateRegistersAndStackAndGenerateCode.cpp.
                 UNUSED_PARAM(insertionIndex);
                 return result;
-#elif CPU(X86_64)
+#elif CPU(X86_64) || CPU(PPC64)
                 UNUSED_PARAM(insertionIndex);
                 // Can't happen on x86: immediates are always big enough for frame size.
+                // Same on PPC64: isValidAddrForm() accepts any offset (the
+                // MacroAssembler folds large displacements via scratch registers).
                 RELEASE_ASSERT_NOT_REACHED();
 #else
 #error Unhandled architecture.
@@ -207,7 +218,7 @@ void lowerStackArgs(Code& code)
                             Air::Opcode storeOpcode = Move32;
                             Air::Arg::Kind operandKind = Arg::ZeroReg;
                             Air::Arg operand = Arg::zeroReg();
-#elif CPU(X86_64) || CPU(ARM)
+#elif CPU(X86_64) || CPU(ARM) || CPU(PPC64)
                             Air::Opcode storeOpcode = Move32;
                             Air::Arg::Kind operandKind = Arg::Imm;
                             Air::Arg operand = Arg::imm(0);

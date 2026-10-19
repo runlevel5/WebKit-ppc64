@@ -783,7 +783,58 @@ extern "C" void SYSV_ABI ipint_entry();
     m(0x11, uint_stack_vector) \
     m(0x12, uint_ret) \
 
-#if !ENABLE(C_LOOP) && (CPU(ADDRESS64) && (CPU(ARM64) || CPU(X86_64)))
+// PPC64-only f32 FPR transport slots (see ArgumINTBytecode::ArgFPRFloat in
+// WasmIPIntGenerator.h): an f32 sits in a PPC64 FPR in double format, so
+// moving it to or from an IPInt slot needs lfs/stfs.
+#if CPU(PPC64)
+#define FOR_EACH_IPINT_PPC64_FLOAT_ARGUMINT_OPCODE(m) \
+    m(0x13, argumINT_ffa0) \
+    m(0x14, argumINT_ffa1) \
+    m(0x15, argumINT_ffa2) \
+    m(0x16, argumINT_ffa3) \
+    m(0x17, argumINT_ffa4) \
+    m(0x18, argumINT_ffa5) \
+    m(0x19, argumINT_ffa6) \
+    m(0x1a, argumINT_ffa7) \
+
+#define FOR_EACH_IPINT_PPC64_FLOAT_MINT_CALL_OPCODE(m) \
+    m(0x1c, mint_ffa0) \
+    m(0x1d, mint_ffa1) \
+    m(0x1e, mint_ffa2) \
+    m(0x1f, mint_ffa3) \
+    m(0x20, mint_ffa4) \
+    m(0x21, mint_ffa5) \
+    m(0x22, mint_ffa6) \
+    m(0x23, mint_ffa7) \
+
+#define FOR_EACH_IPINT_PPC64_FLOAT_MINT_RETURN_OPCODE(m) \
+    m(0x13, mint_ffr0) \
+    m(0x14, mint_ffr1) \
+    m(0x15, mint_ffr2) \
+    m(0x16, mint_ffr3) \
+    m(0x17, mint_ffr4) \
+    m(0x18, mint_ffr5) \
+    m(0x19, mint_ffr6) \
+    m(0x1a, mint_ffr7) \
+
+#define FOR_EACH_IPINT_PPC64_FLOAT_UINT_OPCODE(m) \
+    m(0x13, uint_ffr0) \
+    m(0x14, uint_ffr1) \
+    m(0x15, uint_ffr2) \
+    m(0x16, uint_ffr3) \
+    m(0x17, uint_ffr4) \
+    m(0x18, uint_ffr5) \
+    m(0x19, uint_ffr6) \
+    m(0x1a, uint_ffr7) \
+
+#else
+#define FOR_EACH_IPINT_PPC64_FLOAT_ARGUMINT_OPCODE(m)
+#define FOR_EACH_IPINT_PPC64_FLOAT_MINT_CALL_OPCODE(m)
+#define FOR_EACH_IPINT_PPC64_FLOAT_MINT_RETURN_OPCODE(m)
+#define FOR_EACH_IPINT_PPC64_FLOAT_UINT_OPCODE(m)
+#endif
+
+#if !ENABLE(C_LOOP) && (CPU(ADDRESS64) && (CPU(ARM64) || CPU(X86_64) || CPU(PPC64)))
 FOR_EACH_IPINT_OPCODE(IPINT_VALIDATE_DEFINE_FUNCTION);
 FOR_EACH_IPINT_GC_OPCODE(IPINT_VALIDATE_DEFINE_FUNCTION);
 FOR_EACH_IPINT_CONVERSION_OPCODE(IPINT_VALIDATE_DEFINE_FUNCTION);
@@ -793,23 +844,36 @@ FOR_EACH_IPINT_ARGUMINT_OPCODE(IPINT_VALIDATE_DEFINE_FUNCTION);
 FOR_EACH_IPINT_MINT_CALL_OPCODE(IPINT_VALIDATE_DEFINE_FUNCTION);
 FOR_EACH_IPINT_MINT_RETURN_OPCODE(IPINT_VALIDATE_DEFINE_FUNCTION);
 FOR_EACH_IPINT_UINT_OPCODE(IPINT_VALIDATE_DEFINE_FUNCTION);
+FOR_EACH_IPINT_PPC64_FLOAT_ARGUMINT_OPCODE(IPINT_VALIDATE_DEFINE_FUNCTION);
+FOR_EACH_IPINT_PPC64_FLOAT_MINT_CALL_OPCODE(IPINT_VALIDATE_DEFINE_FUNCTION);
+FOR_EACH_IPINT_PPC64_FLOAT_MINT_RETURN_OPCODE(IPINT_VALIDATE_DEFINE_FUNCTION);
+FOR_EACH_IPINT_PPC64_FLOAT_UINT_OPCODE(IPINT_VALIDATE_DEFINE_FUNCTION);
 #endif
 
 namespace JSC { namespace IPInt {
 
-#if LLINT_TRACING
+#if LLINT_TRACING || CPU(PPC64)
 // When LLINT_TRACING is enabled, each ipintOp handler has a trace prologue injected,
 // which can push the largest handlers past 256 bytes. Double the slot size in tracing
 // builds so the dispatch table stays valid.
+// PPC64 has no PC-relative addressing before POWER10, so a dispatch-table address
+// takes six instructions and a 64-bit constant up to five. Some handlers need up to
+// 290 bytes, so all slots are doubled there.
 constexpr uint64_t alignIPInt = 512;
 #else
 constexpr uint64_t alignIPInt = 256;
 #endif
 // FIXME: adding an adds instruction to offlineasm could shrink atomic handlers back to 256 bytes
 constexpr uint64_t alignAtomicIPInt = 2 * alignIPInt;
+#if CPU(PPC64)
+constexpr uint64_t alignArgumInt = 128;
+constexpr uint64_t alignUInt = 128;
+constexpr uint64_t alignMInt = 128;
+#else
 constexpr uint64_t alignArgumInt = 64;
 constexpr uint64_t alignUInt = 64;
 constexpr uint64_t alignMInt = 64;
+#endif
 
 
 void initialize();

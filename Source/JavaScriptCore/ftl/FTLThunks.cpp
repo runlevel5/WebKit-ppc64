@@ -88,7 +88,15 @@ static MacroAssemblerCodeRef<JITThunkPtrTag> genericGenerationThunkGenerator(
         GPRInfo::argumentGPR1,
         (stackMisalignment - pushToSaveByteOffset) / sizeof(void*));
     jit.prepareCallOperation(vm);
+#if CPU(PPC64)
+    // An ELFv2 C callee saves CR/LR/TOC at sp + 8..31, where this thunk's
+    // pushToSave slots are.
+    jit.makeSpaceOnStackForCCall();
+#endif
     jit.callOperation<OperationPtrTag>(generationFunction.retagged<OperationPtrTag>());
+#if CPU(PPC64)
+    jit.reclaimSpaceOnStackForCCall();
+#endif
 
     // At this point we want to make a tail call to what was returned to us in the
     // returnValueGPR. But at the same time as we do this, we must restore all registers.
@@ -143,7 +151,10 @@ MacroAssemblerCodeRef<JITThunkPtrTag> lazySlowPathGenerationThunkGenerator(VM& v
 static void registerClobberCheck(AssemblyHelpers& jit, RegisterSet dontClobber)
 {
     ASSERT(Options::clobberAllRegsInFTLICSlowPath());
-    RegisterSet clobber = RegisterSet::registersToSaveForJSCall(RegisterSet::allScalarRegisters());
+    // Clobber what the C call itself may clobber. SlowPathCallContext does not save registers the C
+    // ABI preserves, and on some CPUs (PPC64: r24-r31, f22-f31) the C ABI preserves registers that the
+    // VM's callee-save convention does not, so registersToSaveForJSCall would scribble on live values.
+    RegisterSet clobber = RegisterSet::registersToSaveForCCall(RegisterSet::allScalarRegisters());
     clobber.exclude(dontClobber);
     auto wholeClobberedRegisters = clobber.normalizeWidths();
     
