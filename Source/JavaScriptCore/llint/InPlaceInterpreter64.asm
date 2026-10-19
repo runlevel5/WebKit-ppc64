@@ -1420,7 +1420,7 @@ ipintOp(_memory_grow, macro()
     loadb IPInt::MemoryGrowMetadata::memoryIndex[MC], a2
     advanceMC(constexpr (sizeof(IPInt::MemoryGrowMetadata)))
     operationCall(macro() cCall3(_ipint_extern_memory_grow) end)
-    pushInt32(r0)
+    pushQuad(r0)
     ipintReloadMemory(t2)
     advancePC(2)
     nextIPIntInstruction()

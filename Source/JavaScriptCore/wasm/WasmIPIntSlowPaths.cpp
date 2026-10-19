@@ -638,8 +638,11 @@ WASM_IPINT_EXTERN_CPP_DECL(table_grow, IPIntStackEntry* sp, TableGrowMetadata* m
 WASM_IPINT_EXTERN_CPP_DECL(memory_grow, int64_t delta, uint8_t memoryIndex)
 {
     WasmSlowPathWithoutCallFrameTracer tracer(instance->vm());
-    if (!instance->module().moduleInformation().memory(memoryIndex).isMemory64())
-        delta = static_cast<uint32_t>(delta);
+    if (!instance->module().moduleInformation().memory(memoryIndex).isMemory64()) {
+        // The result is an i32; return it zero-extended like any i32 stack slot.
+        uint32_t result = static_cast<uint32_t>(Wasm::growMemory(instance, static_cast<uint32_t>(delta), memoryIndex));
+        WASM_RETURN_TWO(reinterpret_cast<void*>(static_cast<uintptr_t>(result)), 0);
+    }
     WASM_RETURN_TWO(reinterpret_cast<void*>(Wasm::growMemory(instance, delta, memoryIndex)), 0);
 }
 
