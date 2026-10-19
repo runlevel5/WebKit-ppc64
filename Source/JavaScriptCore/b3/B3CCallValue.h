@@ -29,6 +29,8 @@
 
 #include "B3Effects.h"
 #include "B3Value.h"
+#include <type_traits>
+#include <wtf/FunctionTraits.h>
 
 WTF_ALLOW_UNSAFE_BUFFER_USAGE_BEGIN
 
@@ -70,6 +72,24 @@ private:
         RELEASE_ASSERT(numChildren() >= 1);
     }
 };
+
+#if CPU(PPC64)
+// ELFv2 has the caller extend a narrow integer argument by its C type. A B3 CCall
+// only knows B3 types, so Air's CCallSpecial sign-extends every Int32 argument,
+// which is wrong for a uint32_t. Creators that know the C type use this to pass such
+// an argument zero-extended as an Int64.
+template<typename OperationType, size_t index>
+constexpr bool cCallArgumentIsUnsigned32()
+{
+    using Traits = FunctionTraits<OperationType>;
+    if constexpr (index < Traits::arity) {
+        using RawArgument = std::remove_cvref_t<typename Traits::template ArgumentType<index>>;
+        using Argument = typename std::conditional_t<std::is_enum_v<RawArgument>, std::underlying_type<RawArgument>, std::type_identity<RawArgument>>::type;
+        return std::is_integral_v<Argument> && std::is_unsigned_v<Argument> && sizeof(Argument) == sizeof(uint32_t);
+    } else
+        return false;
+}
+#endif
 
 } } // namespace JSC::B3
 

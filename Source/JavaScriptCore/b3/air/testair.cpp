@@ -101,6 +101,28 @@ std::unique_ptr<Compilation> compile(B3::Procedure& proc)
         FINALIZE_CODE(linkBuffer, JITCompilationPtrTag, nullptr, "testair compilation"), proc.releaseByproducts());
 }
 
+#if CPU(PPC64)
+// On PPC64, r29/r30 are ELFv2 callee-saves that the JIT uses as scratch
+// (GPRInfo::nonPreservedNonArgumentGPR0/1): Air never allocates them, but a CCall
+// loads its callee into r29 and patchpoints may clobber either one without saving
+// it. Production code only enters JIT code through the VM entry, which saves them
+// for its C caller; this harness calls the code directly, so do the same here.
+// The asm after the call makes this frame save and restore both registers and
+// keeps the call from becoming a tail call.
+template<typename T, typename Function, typename... Arguments>
+NEVER_INLINE T callPreservingJITScratchRegisters(Function function, Arguments... arguments)
+{
+    if constexpr (std::is_void_v<T>) {
+        function(arguments...);
+        asm volatile("" ::: "r29", "r30", "memory");
+    } else {
+        T result = function(arguments...);
+        asm volatile("" ::: "r29", "r30", "memory");
+        return result;
+    }
+}
+#endif
+
 template<typename T, typename... Arguments>
 T invoke(const Compilation& code, Arguments... arguments)
 {
@@ -110,7 +132,11 @@ T invoke(const Compilation& code, Arguments... arguments)
 
     executableAddress = untagCFunctionPtr<JITCompilationPtrTag>(code.code().taggedPtr());
     function = std::bit_cast<T(SYSV_ABI *)(Arguments...)>(executableAddress);
+#if CPU(PPC64)
+    result = callPreservingJITScratchRegisters<T>(function, arguments...);
+#else
     result = function(arguments...);
+#endif
 
     return result;
 }
@@ -2219,6 +2245,7 @@ inline Vector<String> matchAll(const CString& source, std::regex regex)
     return matches;
 }
 
+#if ENABLE(DISASSEMBLER)
 void testElideSimpleMove()
 {
     for (unsigned tmpCount = 1; tmpCount < 100; tmpCount++) {
@@ -2259,6 +2286,7 @@ void testElideSimpleMove()
             RELEASE_ASSERT_NOT_REACHED();
     }
 }
+#endif
 
 void testElideHandlesEarlyClobber()
 {
@@ -2336,7 +2364,7 @@ void testElideMoveThenRealloc()
         if (isARM64() || isARM_THUMB2()) {
             negOne = code.newTmp(B3::GP);
             root->append(Move, nullptr, Arg::bigImm(-1), negOne);
-        } else if (isX86())
+        } else if (isX86() || isPPC64())
             negOne = Arg::bitImm(-1);
         else
             RELEASE_ASSERT_NOT_REACHED();
@@ -2847,6 +2875,12 @@ void testMoveFloatConstantSpill()
     // 1.0f = 0x3f800000 as a 32-bit float
     // If misinterpreted as a 64-bit double, it's ~4.6e-315
     uint32_t floatBits = 0x3f800000U;
+
+    // MoveFloat $imm, %tmp is only a valid Air form for an immediate the target
+    // can materialise directly (Arg::isValidFPImm32Form); on PPC64 that is
+    // only zero, which cannot tell a float constant from a double one.
+    if (!Arg::isValidFPImm32Form(floatBits))
+        return;
 
     // Create many float constants to force spilling
     Vector<Tmp> tmps;
@@ -3444,7 +3478,10 @@ void run(const char* filter)
     RUN(testLea64());
 #endif
 
+#if ENABLE(DISASSEMBLER)
+    // Counts register-to-register moves in the disassembly.
     RUN(testElideSimpleMove());
+#endif
     RUN(testElideHandlesEarlyClobber());
     RUN(testElideMoveThenRealloc());
 

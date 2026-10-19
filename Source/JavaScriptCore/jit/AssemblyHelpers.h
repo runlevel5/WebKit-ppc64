@@ -425,7 +425,7 @@ public:
     void emitSaveThenMaterializeTagRegisters()
     {
 #if USE(JSVALUE64)
-#if CPU(ARM64) || CPU(RISCV64)
+#if CPU(ARM64) || CPU(RISCV64) || CPU(PPC64)
         pushPair(GPRInfo::numberTagRegister, GPRInfo::notCellMaskRegister);
 #else
         push(GPRInfo::numberTagRegister);
@@ -438,7 +438,7 @@ public:
     void emitRestoreSavedTagRegisters()
     {
 #if USE(JSVALUE64)
-#if CPU(ARM64) || CPU(RISCV64)
+#if CPU(ARM64) || CPU(RISCV64) || CPU(PPC64)
         popPair(GPRInfo::numberTagRegister, GPRInfo::notCellMaskRegister);
 #else
         pop(GPRInfo::notCellMaskRegister);
@@ -642,6 +642,47 @@ public:
     ALWAYS_INLINE void restoreReturnAddressBeforeReturn(Address address)
     {
         loadPtr(address, linkRegister);
+    }
+#endif
+
+#if CPU(PPC64)
+    // As on ARM64/RISCV64: [fp] = caller fp, [fp+8] = return pc. The return
+    // address arrives in LR and is spilled through a scratch register.
+    void emitFunctionPrologue()
+    {
+        sub64(TrustedImm32(16), stackPointerRegister);
+        store64(framePointerRegister, Address(stackPointerRegister));
+        moveFromLR(dataTempRegister);
+        store64(dataTempRegister, Address(stackPointerRegister, 8));
+        move(stackPointerRegister, framePointerRegister);
+    }
+
+    void emitFunctionEpilogueWithEmptyFrame()
+    {
+        load64(Address(stackPointerRegister, 8), dataTempRegister);
+        moveToLR(dataTempRegister);
+        load64(Address(stackPointerRegister), framePointerRegister);
+        add64(TrustedImm32(16), stackPointerRegister);
+    }
+
+    void emitFunctionEpilogue()
+    {
+        move(framePointerRegister, stackPointerRegister);
+        emitFunctionEpilogueWithEmptyFrame();
+    }
+
+    ALWAYS_INLINE void preserveReturnAddressAfterCall(RegisterID reg)
+    {
+        moveFromLR(reg);
+    }
+    ALWAYS_INLINE void restoreReturnAddressBeforeReturn(RegisterID reg)
+    {
+        moveToLR(reg);
+    }
+    ALWAYS_INLINE void restoreReturnAddressBeforeReturn(Address address)
+    {
+        load64(address, dataTempRegister);
+        moveToLR(dataTempRegister);
     }
 #endif
 
@@ -2228,7 +2269,7 @@ public:
     }
 
 #if ENABLE(WEBASSEMBLY)
-#if CPU(ARM64) || CPU(X86_64) || CPU(RISCV64) || CPU(ARM_THUMB2)
+#if CPU(ARM64) || CPU(X86_64) || CPU(RISCV64) || CPU(ARM_THUMB2) || CPU(PPC64)
     JumpList checkWasmStackOverflow(GPRReg instanceGPR, TrustedImm32, GPRReg framePointerGPR);
 #endif
 #endif

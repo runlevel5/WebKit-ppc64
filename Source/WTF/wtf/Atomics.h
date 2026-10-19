@@ -297,6 +297,22 @@ inline void storeLoadFence() { x86_ortop(); }
 inline void storeStoreFence() { compilerFence(); }
 inline void crossModifyingCodeFence() { x86_cpuid(); }
 
+#elif CPU(PPC64)
+
+inline void ppc_isync()
+{
+    asm volatile("isync" ::: "memory");
+}
+
+inline void loadLoadFence() { std::atomic_thread_fence(std::memory_order_seq_cst); }
+inline void loadStoreFence() { std::atomic_thread_fence(std::memory_order_seq_cst); }
+inline void storeLoadFence() { std::atomic_thread_fence(std::memory_order_seq_cst); }
+inline void storeStoreFence() { std::atomic_thread_fence(std::memory_order_seq_cst); }
+// `sync` (a seq_cst fence) does not discard instructions the processor has
+// already prefetched; `isync` does, and each processor that will run the
+// modified instructions must execute it.
+inline void crossModifyingCodeFence() { ppc_isync(); }
+
 #else
 
 inline void loadLoadFence() { std::atomic_thread_fence(std::memory_order_seq_cst); }

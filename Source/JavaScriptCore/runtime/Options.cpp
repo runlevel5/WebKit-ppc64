@@ -841,14 +841,19 @@ void Options::notifyOptionsChanged()
 #if !CPU(X86_64) && !CPU(ARM64)
     Options::useConcurrentGC() = false;
     Options::forceUnlinkedDFG() = false;
+#if !CPU(PPC64)
     Options::useWasmSIMD() = false;
+#endif
+#if !CPU(PPC64)
     Options::useWasmIPInt() = false;
-#if !CPU(ARM_THUMB2)
+#endif
+    // PPC64 has IPInt (InPlaceInterpreter64.asm) and BBQ, so neither is forced off.
+#if !CPU(ARM_THUMB2) && !CPU(PPC64)
     Options::useBBQJIT() = false;
 #endif
 #endif
 
-#if !CPU(ARM64)
+#if !CPU(ARM64) && !CPU(PPC64)
     Options::useRandomizingExecutableIslandAllocation() = false;
 #endif
 
@@ -868,7 +873,10 @@ void Options::notifyOptionsChanged()
         Options::thresholdForBBQOptimizeAfterWarmUp() = 0; // Trigger immediate BBQ tier up.
 
 #if CPU(ARM_THUMB2)
-    // WasmIPInt is not supported on ARM32, so disable wasm if BBQJIT is disabled.
+    // WasmIPInt is not supported on ARM32, so disable wasm if BBQJIT is
+    // disabled: that platform has no other engine, and aborting on the
+    // coherence check would take down every configuration that merely turns the
+    // JIT off, including ones that never touch wasm.
     if (Options::useWasm() && !Options::useBBQJIT())
         Options::useWasm() = false;
 #endif
