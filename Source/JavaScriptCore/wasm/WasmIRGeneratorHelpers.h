@@ -35,6 +35,7 @@
 #include "JSWebAssemblyException.h"
 #include "JSWebAssemblyInstance.h"
 #include "LinkBuffer.h"
+#include "MaxFrameExtentForSlowPathCall.h"
 #include "ProbeContext.h"
 #include "WasmCallee.h"
 #include "WasmCompilationContext.h"
@@ -160,6 +161,10 @@ static inline void emitThrowImpl(CCallHelpers& jit, unsigned exceptionIndex)
 
     jit.move(MacroAssembler::TrustedImm32(exceptionIndex), GPRInfo::argumentGPR1);
     jit.move(MacroAssembler::stackPointerRegister, GPRInfo::argumentGPR2);
+    // The payload sits at sp, where an ELFv2 C call's linkage area would be, so
+    // give the call its own area below it. operationWasmThrow does not return.
+    if constexpr (!!maxFrameExtentForSlowPathCall)
+        jit.subPtr(CCallHelpers::TrustedImm32(maxFrameExtentForSlowPathCall), CCallHelpers::stackPointerRegister);
     jit.prepareWasmCallOperation(GPRInfo::argumentGPR0);
     jit.callOperation<OperationPtrTag>(operationWasmThrow);
     jit.farJump(GPRInfo::returnValueGPR, ExceptionHandlerPtrTag);
@@ -215,6 +220,9 @@ static inline void prepareForTailCall(CCallHelpers& jit, const B3::StackmapGener
     jit.untagPtr(callerSP, MacroAssembler::linkRegister);
     jit.validateUntaggedPtr(MacroAssembler::linkRegister);
 #endif
+#elif CPU(PPC64)
+    // linkRegister is only a placeholder on PPC64; the return PC goes to LR.
+    jit.restoreReturnAddressBeforeReturn(CCallHelpers::Address(MacroAssembler::stackPointerRegister, newStackOffset - Checked<int32_t>(sizeof(Register))));
 #else
     UNREACHABLE_FOR_PLATFORM();
 #endif

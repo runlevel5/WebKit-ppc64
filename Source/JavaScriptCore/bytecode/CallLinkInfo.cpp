@@ -631,8 +631,12 @@ void DirectCallLinkInfo::validateSpeculativeRepatchOnMainThread(VM&)
     } else
         dataLogLnIf(verbose, "Speculative repatching succeeded ", RawPointer(m_codeBlock), " ", m_target);
 
-    if (m_codeBlock)
+    if (m_codeBlock) {
+        // See linkDirectCall: never double-push onto an incoming-calls list.
+        if (isOnList())
+            remove();
         m_codeBlock->linkIncomingCall(owner(), this);
+    }
 }
 
 #endif

@@ -247,8 +247,10 @@ MetaAllocator::FreeSpacePtr MetaAllocator::findAndRemoveFreeSpace(size_t sizeInB
 
         uintptr_t lastPageForLeftAllocation = (nodeStartAsInt + sizeInBytes - 1) >> m_logPageSize;
         uintptr_t firstPageForRightAllocation = (nodeStartAsInt + nodeSizeInBytes - sizeInBytes) >> m_logPageSize;
-        
-        if (lastPageForLeftAllocation - firstPage + 1 <= lastPage - firstPageForRightAllocation + 1) {
+
+        bool allocateOnLeft = m_allocatesFromBottom || lastPageForLeftAllocation - firstPage + 1 <= lastPage - firstPageForRightAllocation + 1;
+
+        if (allocateOnLeft) {
             // Allocate in the left side of the returned chunk, and slide the node to the right.
             result = node->m_start;
             

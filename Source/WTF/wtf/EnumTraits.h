@@ -164,6 +164,28 @@ template <typename, auto>
 inline constexpr bool isEnumConstexprStaticCastValid = true;
 #endif
 
+#if COMPILER(GCC)
+// Returns the spelling of template parameter `parameter` in a GCC __PRETTY_FUNCTION__ such as
+// "constexpr std::span<const char> WTF::enumNameImpl() [with auto V = Foo::Bar]". GCC's spelling of
+// the rest of the signature is not stable -- some builds spell out std::span's default extent,
+// "std::span<const char, 18446744073709551615>" -- so a fixed-length prefix is wrong. Find the
+// argument by its " <parameter> = " marker and stop at the next ';' or the closing ']'.
+// prettyFunction includes the terminating NUL.
+constexpr std::span<const char> gccPrettyFunctionTemplateArgument(std::span<const char> prettyFunction, char parameter)
+{
+    for (size_t i = 1; i + 3 < prettyFunction.size(); ++i) {
+        if (prettyFunction[i - 1] != ' ' || prettyFunction[i] != parameter || prettyFunction[i + 1] != ' ' || prettyFunction[i + 2] != '=' || prettyFunction[i + 3] != ' ')
+            continue;
+        size_t start = i + 4;
+        size_t end = start;
+        while (end < prettyFunction.size() && prettyFunction[end] != ';' && prettyFunction[end] != ']' && prettyFunction[end])
+            ++end;
+        return prettyFunction.subspan(start, end - start);
+    }
+    return { };
+}
+#endif
+
 template<typename E>
 constexpr std::span<const char> enumTypeNameImpl()
 {
@@ -174,9 +196,7 @@ constexpr std::span<const char> enumTypeNameImpl()
     const size_t suffix = sizeof("]") - 1;
     std::span<const char> name = std::span { __PRETTY_FUNCTION__ }.subspan(prefix, sizeof(__PRETTY_FUNCTION__) - prefix - suffix - 1);
 #elif COMPILER(GCC)
-    const size_t prefix = sizeof("constexpr std::span<const char> WTF::enumTypeNameImpl() [with auto V = ") - 1;
-    const size_t suffix = sizeof("]") - 1;
-    std::span<const char> name = std::span { __PRETTY_FUNCTION__ }.subspan(prefix, sizeof(__PRETTY_FUNCTION__) - prefix - suffix - 1);
+    std::span<const char> name = gccPrettyFunctionTemplateArgument(std::span { __PRETTY_FUNCTION__ }, 'E');
 #else
 #error "Unsupported compiler"
 #endif
@@ -205,10 +225,9 @@ constexpr std::span<const char> enumNameImpl()
     if (name[0] == '(' || name[0] == '-' || ('0' <= name[0] && name[0] <= '9'))
         return { };
 #elif COMPILER(GCC)
-    const size_t prefix = sizeof("constexpr std::span<const char> WTF::enumNameImpl() [with auto V = ") - 1;
-    const size_t suffix = sizeof("]") - 1;
-    std::span<const char> name = std::span { __PRETTY_FUNCTION__ }.subspan(prefix, sizeof(__PRETTY_FUNCTION__) - prefix - suffix - 1);
-    if (name[0] == '(')
+    // A value that is not an enumerator is spelled as a cast, e.g. "(Foo)50".
+    std::span<const char> name = gccPrettyFunctionTemplateArgument(std::span { __PRETTY_FUNCTION__ }, 'V');
+    if (name.empty() || name[0] == '(')
         name = { };
 #else
 #error "Unsupported compiler"
@@ -307,7 +326,7 @@ constexpr std::span<const char> enumName(E v)
 
     Underlying value = static_cast<Underlying>(v);
     if (value < min || value > max)
-        return { "enum out of range" };
+        return std::span<const char> { "enum out of range", sizeof("enum out of range") - 1 };
 
     // Compute index safely using unsigned extension.
     size_t index = static_cast<size_t>(static_cast<Unsigned>(value - min));

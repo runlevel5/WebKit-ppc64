@@ -252,6 +252,7 @@ set(OFFLINE_ASM
     offlineasm/offsets.rb
     offlineasm/opt.rb
     offlineasm/parser.rb
+    offlineasm/ppc64.rb
     offlineasm/registers.rb
     offlineasm/risc.rb
     offlineasm/riscv64.rb
@@ -315,6 +316,13 @@ elseif (ARM_THUMB2_DETECTED)
     set(OFFLINE_ASM_BACKEND "ARMv7")
 elseif (WTF_CPU_RISCV64)
     set(OFFLINE_ASM_BACKEND "RISCV64")
+elseif (WTF_CPU_PPC64LE)
+    # A C_LOOP build of ppc64 still uses the C_LOOP offlineasm backend.
+    if (ENABLE_C_LOOP)
+        set(OFFLINE_ASM_BACKEND "C_LOOP")
+    else ()
+        set(OFFLINE_ASM_BACKEND "PPC64")
+    endif ()
 endif ()
 
 if (NOT ENABLE_JIT)
@@ -639,9 +647,12 @@ set(JavaScriptCore_PRIVATE_FRAMEWORK_HEADERS
     assembler/MacroAssemblerARMv7.h
     assembler/MacroAssemblerCodeRef.h
     assembler/MacroAssemblerHelpers.h
+    assembler/MacroAssemblerPPC64.h
     assembler/MacroAssemblerX86_64.h
     assembler/MaxFrameExtentForSlowPathCall.h
     assembler/OSCheck.h
+    assembler/PPC64Assembler.h
+    assembler/PPC64Registers.h
     assembler/Printer.h
     assembler/ProbeContext.h
     assembler/ProbeStack.h

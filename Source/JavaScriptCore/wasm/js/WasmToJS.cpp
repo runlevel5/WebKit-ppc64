@@ -546,6 +546,9 @@ void emitThrowWasmToJSException(CCallHelpers& jit, GPRReg wasmInstance, Wasm::Ex
 
     jit.move(CCallHelpers::TrustedImm32(static_cast<int32_t>(type)), GPRInfo::argumentGPR1);
 
+    // sp may equal cfr here, and an ELFv2 C call saves LR/TOC at sp + 16/24, the
+    // frame's CodeBlock and Callee slots. The operation does not return.
+    jit.makeSpaceOnStackForCCall();
     jit.prepareWasmCallOperation(GPRInfo::argumentGPR0);
     jit.callOperation<OperationPtrTag>(Wasm::operationWasmToJSException);
 

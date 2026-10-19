@@ -565,7 +565,7 @@ const RegisterAtOffsetList* JSToWasmCallee::calleeSaveRegistersImpl()
     // This must be the same to JSToWasm's callee save registers.
     // The reason is that we may use m_replacementCallee which can be set at any time.
     // So, we must store the same callee save registers at the same location to the JIT version.
-#if CPU(X86_64) || CPU(ARM64) || CPU(RISCV64)
+#if CPU(X86_64) || CPU(ARM64) || CPU(RISCV64) || CPU(PPC64)
     ASSERT(RegisterAtOffsetList::wasmPinnedRegisters().registerCount() == 3);
 #elif CPU(ARM)
 #else

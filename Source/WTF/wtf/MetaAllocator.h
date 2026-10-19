@@ -121,7 +121,10 @@ public:
 #endif
 
 protected:
-    
+    // Always allocate from the low end of a free chunk, instead of whichever
+    // end touches fewer pages, for pools where address locality matters more.
+    void setAllocatesFromBottom(bool value) { m_allocatesFromBottom = value; }
+
     // Allocate new virtual space, but don't commit. This may return more
     // pages than we asked, in which case numPages is changed.
     virtual FreeSpacePtr allocateNewSpace(size_t& numPages) = 0;
@@ -209,6 +212,8 @@ private:
     Lock& m_lock;
 
     MetaAllocatorTracker* m_tracker { nullptr };
+
+    bool m_allocatesFromBottom { false };
 
 #ifndef NDEBUG
     size_t m_mallocBalance;

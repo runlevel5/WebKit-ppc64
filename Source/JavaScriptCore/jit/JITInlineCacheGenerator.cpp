@@ -121,7 +121,15 @@ void JITByIdGenerator::generateFastCommon(CCallHelpers& jit, size_t inlineICSize
     jit.padBeforePatch(); // On ARMv7, this ensures that the patchable jump does not make the inline code too large.
     m_start = jit.label();
     size_t startSize = jit.m_assembler.buffer().codeSize();
-    m_slowPathJump = jit.jump();
+    {
+#if CPU(PPC64)
+        // The inline region is later overwritten in place (InlineAccess, and
+        // rewireStubAsJumpInAccess with a jump slot), so it must keep its
+        // emitted size: keep branch compaction from shrinking this jump.
+        CCallHelpers::FixedSizeJumpScope fixedSizeJumps(jit);
+#endif
+        m_slowPathJump = jit.jump();
+    }
     size_t jumpSize = jit.m_assembler.buffer().codeSize() - startSize;
     size_t nopsToEmitInBytes = inlineICSize - jumpSize;
     jit.emitNops(nopsToEmitInBytes);

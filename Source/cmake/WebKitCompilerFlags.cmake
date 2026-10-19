@@ -391,7 +391,14 @@ if (COMPILER_IS_GCC_OR_CLANG)
         foreach (SANITIZER ${ENABLE_SANITIZERS})
             if (${SANITIZER} MATCHES "address")
                 WEBKIT_PREPEND_GLOBAL_COMPILER_FLAGS("-fno-omit-frame-pointer -fno-optimize-sibling-calls")
-                set(SANITIZER_COMPILER_FLAGS "-fsanitize=address ${SANITIZER_COMPILER_FLAGS}")
+                # JSC's conservative GC scans the machine stack from the address of a local up to the
+                # stack origin. ASan's use-after-return detection moves locals to a separate "fake
+                # stack", so the scan would start there (and never see the values it holds).
+                if (COMPILER_IS_CLANG)
+                    set(SANITIZER_COMPILER_FLAGS "-fsanitize=address -fsanitize-address-use-after-return=never ${SANITIZER_COMPILER_FLAGS}")
+                else ()
+                    set(SANITIZER_COMPILER_FLAGS "-fsanitize=address --param=asan-use-after-return=0 ${SANITIZER_COMPILER_FLAGS}")
+                endif ()
                 set(SANITIZER_LINK_FLAGS "-fsanitize=address ${SANITIZER_LINK_FLAGS}")
 
             elseif (${SANITIZER} MATCHES "undefined")

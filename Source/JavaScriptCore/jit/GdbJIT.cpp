@@ -868,7 +868,7 @@ private:
             0x7F, 'E', 'L', 'F', 1, 1, 1, 0,
             0, 0, 0, 0, 0, 0, 0, 0
         };
-#elif CPU(X86_64) || CPU(ARM64) || CPU(RISCV64)
+#elif CPU(X86_64) || CPU(ARM64) || CPU(RISCV64) || CPU(PPC64)
         const uint8_t ident[16] = {
             0x7F, 'E', 'L', 'F', 2, 1, 1, 0,
             0, 0, 0, 0, 0, 0, 0, 0
@@ -893,6 +893,9 @@ private:
 #elif CPU(RISCV64)
         // RISC-V 64
         header->machine = 0xF3;
+#elif CPU(PPC64)
+        // EM_PPC64
+        header->machine = 21;
 #else
 #error Unsupported target architecture.
 #endif
@@ -994,7 +997,7 @@ public:
         uint8_t m_other;
         uint16_t m_section;
     } __attribute__((packed,aligned(1)));
-#elif CPU(X86_64) || CPU(ARM64) || CPU(RISCV64)
+#elif CPU(X86_64) || CPU(ARM64) || CPU(RISCV64) || CPU(PPC64)
     struct SerializedLayout {
         SerializedLayout(uint32_t name, uintptr_t value, uintptr_t size, Binding binding, Type type, uint16_t section)
             : m_name(name)
