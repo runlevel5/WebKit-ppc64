@@ -865,14 +865,18 @@ TEST(WTF_WeakPtr, WeakHashSetComputeSize)
         weakHashSet.checkConsistency();
     }
 
-    while (1) {
+    {
         WeakHashSet<Base> weakHashSet;
         auto firstObject = makeUnique<Base>();
         auto lastObject = makeUnique<Base>();
         weakHashSet.add(*firstObject);
         weakHashSet.add(*lastObject);
+        // Iteration order follows the objects' addresses. Retrying until it matches
+        // the insertion order never terminates under an allocator that hands the
+        // same two addresses back each time, so name the objects by iteration order.
         if (weakHashSet.begin().get() != firstObject.get())
-            continue;
+            std::swap(firstObject, lastObject);
+        EXPECT_EQ(weakHashSet.begin().get(), firstObject.get());
         EXPECT_EQ(s_baseWeakReferences, 2u);
         EXPECT_EQ(weakHashSet.computeSize(), 2u);
         EXPECT_EQ(s_baseWeakReferences, 2u);
@@ -886,7 +890,6 @@ TEST(WTF_WeakPtr, WeakHashSetComputeSize)
         EXPECT_EQ(weakHashSet.computeSize(), 0u);
         EXPECT_EQ(s_baseWeakReferences, 0u);
         weakHashSet.checkConsistency();
-        break;
     }
 
     {

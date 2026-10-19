@@ -2053,6 +2053,25 @@ private:
             m_stats[bank].numSpillStackSlots++;
         }
 
+#if CPU(PPC64)
+        // FP spill slots that some instruction reads; see the width rule below.
+        // A slot nothing reads may be written in place at any width.
+        UncheckedKeyHashSet<StackSlot*> fpSlotsRead;
+        if constexpr (bank == FP) {
+            for (BasicBlock* block : m_code) {
+                for (Inst& inst : *block) {
+                    inst.forEachArg([&] (Arg& arg, Arg::Role role, Bank argBank, Width) {
+                        if (argBank != FP || !arg.isTmp() || arg.isReg() || !Arg::isAnyUse(role))
+                            return;
+                        auto entry = stackSlots.find(arg.tmp());
+                        if (entry != stackSlots.end())
+                            fpSlotsRead.add(entry->value);
+                    });
+                }
+            }
+        }
+#endif
+
         // Rewrite the program to get rid of the spilled Tmp.
         InsertionSet insertionSet(m_code);
         for (BasicBlock* block : m_code) {
@@ -2121,6 +2140,17 @@ private:
                             return;
                         
                         Width spillWidth = m_tmpWidth.requiredWidth(arg.tmp());
+#if CPU(PPC64)
+                        // See the spill-move selection below: on PPC64 an FP
+                        // slot is always accessed at its tmp's use width, since
+                        // 32- and 64-bit FP accesses use different memory
+                        // encodings, so never touch it in place at another width.
+                        if (bank == FP) {
+                            spillWidth = std::max(m_tmpWidth.useWidth(arg.tmp()), Width32);
+                            if (fpSlotsRead.contains(stackSlotEntry->value) && bytesForWidth(width) != stackSlotMinimumWidth(spillWidth))
+                                return;
+                        }
+#endif
                         if (Arg::isAnyDef(role) && width < spillWidth) {
                             // Either there are users of this tmp who will use more than width,
                             // or there are producers who will produce more than width non-zero
@@ -2206,6 +2236,14 @@ private:
                     }
 
                     Width spillWidth = m_tmpWidth.requiredWidth(tmp);
+#if CPU(PPC64)
+                    // A PPC64 FPR holds a float in double format, so stfd/lfd and stfs/lfs use
+                    // different memory encodings. defWidth() is 64 for any non-ZDef def, but every
+                    // reader of a Float in memory uses the 4-byte encoding, so spill FP tmps by
+                    // their use width.
+                    if (bank == FP)
+                        spillWidth = std::max(m_tmpWidth.useWidth(tmp), Width32);
+#endif
                     Opcode move = Oops;
                     switch (stackSlotMinimumWidth(spillWidth)) {
                     case 4:

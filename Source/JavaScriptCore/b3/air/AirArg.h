@@ -667,13 +667,13 @@ public:
     {
         switch (scale) {
         case 1:
-            if (isX86() || isARM64() || isARM_THUMB2())
+            if (isX86() || isARM64() || isARM_THUMB2() || isPPC64())
                 return true;
             return false;
         case 2:
         case 4:
         case 8:
-            if (isX86() || isARM_THUMB2())
+            if (isX86() || isARM_THUMB2() || isPPC64())
                 return true;
             if (isARM64()) {
                 if (!width)
@@ -1356,6 +1356,11 @@ public:
         }
         if (isARM_THUMB2())
             return isValidARMThumb2Immediate(value);
+        if (isPPC64()) {
+            // MacroAssemblerPPC64 materializes any 32-bit immediate through the
+            // assembler scratch registers, so accept the x86-like range.
+            return WTF::isRepresentableAs<int32_t>(value);
+        }
         return false;
     }
 
@@ -1367,6 +1372,8 @@ public:
             return ARM64LogicalImmediate::create32(value).isValid();
         if (isARM_THUMB2())
             return isValidARMThumb2Immediate(value);
+        if (isPPC64())
+            return WTF::isRepresentableAs<int32_t>(value);
         return false;
     }
 
@@ -1376,6 +1383,8 @@ public:
             return WTF::isRepresentableAs<int32_t>(value);
         if (isARM64())
             return ARM64LogicalImmediate::create64(value).isValid();
+        if (isPPC64())
+            return WTF::isRepresentableAs<int32_t>(value);
         return false;
     }
 
@@ -1493,6 +1502,8 @@ public:
         auto pattern = X86ContiguousBitPattern64::create(u64);
         if (pattern.isValid())
             return true;
+#else
+        uint64_t u64 = static_cast<uint64_t>(value);
 #endif
 
         uint32_t low32 = static_cast<uint32_t>(u64);
@@ -1527,6 +1538,12 @@ public:
 #endif
         if (isX86())
             return true;
+
+        if (isPPC64()) {
+            // resolveAddress() folds any 32-bit displacement through the
+            // scratch registers, at every access width.
+            return true;
+        }
 
         if (!width)
             return true;
@@ -1573,6 +1590,8 @@ public:
         if (!isValidScale(scale, width))
             return false;
         if (isX86())
+            return true;
+        if (isPPC64())
             return true;
         if (isARM64())
             return !offset;
