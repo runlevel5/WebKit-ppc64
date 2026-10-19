@@ -930,8 +930,28 @@ private:
         emitPrepareWasmOperation(block);
         static_assert(FunctionTraits<OperationType>::cCallArity() == sizeof...(Args), "Sanity check");
         Value* operationValue = block->appendNew<ConstPtrValue>(m_proc, origin(), tagCFunction<OperationPtrTag>(operation));
+#if CPU(PPC64)
+        return [&]<size_t... I>(std::index_sequence<I...>) {
+            return block->appendNew<CCallValue>(m_proc, resultType, origin(), operationValue, extendCCallArgumentForELFv2<OperationType, I>(block, std::forward<Args>(args))...);
+        }(std::index_sequence_for<Args...> { });
+#else
         return block->appendNew<CCallValue>(m_proc, resultType, origin(), operationValue, std::forward<Args>(args)...);
+#endif
     }
+
+#if CPU(PPC64)
+    // See cCallArgumentIsUnsigned32: pass an Int32 argument for a uint32_t parameter
+    // zero-extended, so CCallSpecial does not sign-extend it.
+    template<typename OperationType, size_t index>
+    Value* extendCCallArgumentForELFv2(BasicBlock* block, Value* argument)
+    {
+        if constexpr (B3::cCallArgumentIsUnsigned32<OperationType, index>()) {
+            if (argument->type() == Int32)
+                return block->appendNew<Value>(m_proc, ZExt32, origin(), argument);
+        }
+        return argument;
+    }
+#endif
 
     void emitExceptionCheck(CCallHelpers&, Origin, ExceptionType);
 
@@ -1658,8 +1678,10 @@ auto OMGIRGenerator::addArguments(const RTT& signature) -> PartialResult
                         dataLog(context.gpr(src.jsr().payloadGPR()), " / ", (int) context.gpr(src.jsr().payloadGPR()));
                     else if (src.isFPR() && width <= Width::Width64)
                         dataLog(context.fpr(src.fpr()));
+#if CPU(X86_64) || CPU(ARM64) || CPU(PPC64) // Context::vector() exists only where SIMD does
                     else if (src.isFPR())
                         dataLog(context.vector(src.fpr()));
+#endif
                     else
                         dataLog(fpl[src.offsetFromFP() / sizeof(uint64_t)], " / ", fpi[src.offsetFromFP() / sizeof(uint32_t)],  " / ", RawHex(fpi[src.offsetFromFP() / sizeof(uint32_t)]), " / ", std::bit_cast<double>(fpl[src.offsetFromFP() / sizeof(uint64_t)]), " at ", RawPointer(&fpi[src.offsetFromFP() / sizeof(uint32_t)]));
                     dataLogLn();
@@ -3503,7 +3525,7 @@ auto OMGIRGenerator::addI64Add128(ExpressionType lhsLoVar, ExpressionType lhsHiV
         GPRReg aHi = params[3].gpr();
         GPRReg bLo = params[4].gpr();
         GPRReg bHi = params[5].gpr();
-#if CPU(ARM64)
+#if CPU(ARM64) || CPU(PPC64)
         jit.add64AndSetFlags(aLo, bLo, resLo);
         jit.addCarry64(aHi, bHi, resHi);
 #elif CPU(X86_64)
@@ -3511,6 +3533,8 @@ auto OMGIRGenerator::addI64Add128(ExpressionType lhsLoVar, ExpressionType lhsHiV
         jit.add64(bLo, resLo);
         jit.move(aHi, resHi);
         jit.addCarry64(bHi, resHi);
+#else
+#error "Not implemented for this CPU"
 #endif
     });
     patchpoint->effects = Effects::none();
@@ -3541,7 +3565,7 @@ auto OMGIRGenerator::addI64Sub128(ExpressionType lhsLoVar, ExpressionType lhsHiV
         GPRReg aHi = params[3].gpr();
         GPRReg bLo = params[4].gpr();
         GPRReg bHi = params[5].gpr();
-#if CPU(ARM64)
+#if CPU(ARM64) || CPU(PPC64)
         jit.sub64AndSetFlags(aLo, bLo, resLo);
         jit.subBorrow64(aHi, bHi, resHi);
 #elif CPU(X86_64)
@@ -3549,6 +3573,8 @@ auto OMGIRGenerator::addI64Sub128(ExpressionType lhsLoVar, ExpressionType lhsHiV
         jit.sub64(bLo, resLo);
         jit.move(aHi, resHi);
         jit.subBorrow64(bHi, resHi);
+#else
+#error "Not implemented for this CPU"
 #endif
     });
     patchpoint->effects = Effects::none();
@@ -3563,7 +3589,7 @@ auto OMGIRGenerator::addI64MulWideU(ExpressionType lhsVar, ExpressionType rhsVar
     Value* lhs = get(lhsVar);
     Value* rhs = get(rhsVar);
 
-#if CPU(ARM64)
+#if CPU(ARM64) || CPU(PPC64)
     resultLo = push(m_currentBlock->appendNew<Value>(m_proc, Mul, origin(), lhs, rhs));
     resultHi = push(m_currentBlock->appendNew<Value>(m_proc, UMulHigh, origin(), lhs, rhs));
 
@@ -3581,6 +3607,8 @@ auto OMGIRGenerator::addI64MulWideU(ExpressionType lhsVar, ExpressionType rhsVar
 
     resultLo = push(m_currentBlock->appendNew<ExtractValue>(m_proc, origin(), B3::Int64, patchpoint, 0));
     resultHi = push(m_currentBlock->appendNew<ExtractValue>(m_proc, origin(), B3::Int64, patchpoint, 1));
+#else
+#error "I64MulWideU is not implemented for this CPU"
 #endif
 
     return { };
@@ -3591,7 +3619,7 @@ auto OMGIRGenerator::addI64MulWideS(ExpressionType lhsVar, ExpressionType rhsVar
     Value* lhs = get(lhsVar);
     Value* rhs = get(rhsVar);
 
-#if CPU(ARM64)
+#if CPU(ARM64) || CPU(PPC64)
     resultLo = push(m_currentBlock->appendNew<Value>(m_proc, Mul, origin(), lhs, rhs));
     resultHi = push(m_currentBlock->appendNew<Value>(m_proc, MulHigh, origin(), lhs, rhs));
 
@@ -3609,6 +3637,8 @@ auto OMGIRGenerator::addI64MulWideS(ExpressionType lhsVar, ExpressionType rhsVar
 
     resultLo = push(m_currentBlock->appendNew<ExtractValue>(m_proc, origin(), B3::Int64, patchpoint, 0));
     resultHi = push(m_currentBlock->appendNew<ExtractValue>(m_proc, origin(), B3::Int64, patchpoint, 1));
+#else
+#error "I64MulWideS is not implemented for this CPU"
 #endif
 
     return { };
@@ -4302,7 +4332,7 @@ auto OMGIRGenerator::addSIMDShuffle(v128_t imm, ExpressionType a, ExpressionType
         return { };
     }
 
-    if constexpr (!isARM64())
+    if constexpr (!isARM64() && !isPPC64())
         UNREACHABLE_FOR_PLATFORM();
 
     Value* indexes = m_currentBlock->appendNew<Const128Value>(m_proc, origin(), imm);
@@ -5468,8 +5498,10 @@ static inline void prepareForTailCallImpl(unsigned functionIndex, CCallHelpers& 
                     dataLog(context.gpr(src.gpr()), " / ", (int) context.gpr(src.gpr()));
                 else if (src.isFPR() && width <= Width64)
                     dataLog(context.fpr(src.fpr()));
+#if CPU(X86_64) || CPU(ARM64) || CPU(PPC64) // Context::vector() exists only where SIMD does
                 else if (src.isFPR())
                     dataLog(context.vector(src.fpr()));
+#endif
                 else if (src.isConstant())
                     dataLog(src.value(), " / ", src.doubleValue());
                 else
@@ -5653,6 +5685,9 @@ static inline void prepareForTailCallImpl(unsigned functionIndex, CCallHelpers& 
         ASSERT(!calleeSaves.find(MacroAssembler::linkRegister));
         entry.dst = ShuffleLocation::fromGPR(MacroAssembler::linkRegister);
 #else
+        // On PPC64 LR is a special-purpose register that the shuffle cannot target, so the
+        // return PC goes to the new frame's return PC slot as on x86_64, and is loaded into
+        // LR from there once the shuffle is done (see below).
         entry.dst = ShuffleLocation::fromStack(newReturnPCOffset);
 #endif
         entries.append(entry);
@@ -5855,6 +5890,13 @@ static inline void prepareForTailCallImpl(unsigned functionIndex, CCallHelpers& 
 
     auto newSPAtPrologueOffsetFromSP = newFPOffsetFromSP + prologueStackPointerDelta();
 
+#if CPU(PPC64)
+    // The callee's prologue spills LR, not a stack slot, as its return PC (the frame header
+    // is [fp] = caller fp, [fp+8] = return PC, as on ARM64). Commit the shuffled return PC
+    // to LR with mtlr; nothing from here to the jump makes a call, and only calls write LR.
+    jit.restoreReturnAddressBeforeReturn(CCallHelpers::Address(MacroAssembler::stackPointerRegister, newReturnPCOffset));
+#endif
+
 #if CPU(ARM) || CPU(ARM64) || CPU(RISCV64)
     // the return PC should already be in the linkRegister from the shuffle above.
     if (WasmOMGIRGeneratorInternal::verboseTailCalls) {
@@ -5903,8 +5945,10 @@ static inline void prepareForTailCallImpl(unsigned functionIndex, CCallHelpers& 
                         dataLog(context.gpr(arg.location.jsr().payloadGPR()), " / ", (int) context.gpr(arg.location.jsr().payloadGPR()));
                     else if (arg.location.isFPR() && arg.width <= Width::Width64)
                         dataLog(context.fpr(arg.location.fpr()));
+#if CPU(X86_64) || CPU(ARM64) || CPU(PPC64) // Context::vector() exists only where SIMD does
                     else if (arg.location.isFPR())
                         dataLog(context.vector(arg.location.fpr()));
+#endif
                     else
                         dataLog(fpl[src.offsetFromFP() / sizeof(*fpl)], " / ", fpi[src.offsetFromFP() / sizeof(*fpi)],  " / ", RawHex(fpi[src.offsetFromFP() / sizeof(*fpi)]), " / ", std::bit_cast<double>(fpl[src.offsetFromFP() / sizeof(*fpl)]), " at ", RawPointer(&fpi[src.offsetFromFP() / sizeof(*fpi)]));
                     dataLogLn();

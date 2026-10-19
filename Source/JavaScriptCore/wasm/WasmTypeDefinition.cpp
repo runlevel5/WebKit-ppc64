@@ -1076,6 +1076,9 @@ void Type::dump(PrintStream& out) const
     }
 }
 
+// PPC64 keeps an f32 in an FPR in double format, but IPInt slots hold its 4-byte
+// encoding, so moving one needs lfs/stfs: the PPC64-only *FPRFloat bytecodes.
+
 void RTT::ensureArgumINTBytecode(const CallInformation& callCC) const
 {
     ASSERT(kind() == RTTKind::Function);
@@ -1109,6 +1112,10 @@ void RTT::ensureArgumINTBytecode(const CallInformation& callCC) const
 
                 if (loc.isFPR()) {
                     ASSERT_UNUSED(NUM_ARGUMINT_FPRS, FPRInfo::toArgumentIndex(loc.fpr()) < NUM_ARGUMINT_FPRS);
+#if CPU(PPC64)
+                    if (argumentType(index).isF32())
+                        return static_cast<uint8_t>(IPInt::ArgumINTBytecode::ArgFPRFloat) + FPRInfo::toArgumentIndex(loc.fpr());
+#endif
                     return static_cast<uint8_t>(IPInt::ArgumINTBytecode::ArgFPR) + FPRInfo::toArgumentIndex(loc.fpr());
                 }
 
@@ -1164,6 +1171,10 @@ void RTT::ensureUINTBytecode(const CallInformation& returnCC) const
 
             if (loc.isFPR()) {
                 ASSERT_UNUSED(NUM_UINT_FPRS, FPRInfo::toArgumentIndex(loc.fpr()) < NUM_UINT_FPRS);
+#if CPU(PPC64)
+                if (returnType(index).isF32())
+                    return static_cast<uint8_t>(IPInt::UINTBytecode::RetFPRFloat) + FPRInfo::toArgumentIndex(loc.fpr());
+#endif
                 return static_cast<uint8_t>(IPInt::UINTBytecode::RetFPR) + FPRInfo::toArgumentIndex(loc.fpr());
             }
 
@@ -1199,8 +1210,11 @@ void RTT::ensureUINTBytecode(const CallInformation& returnCC) const
 }
 
 template<bool isTailCall>
-static Vector<uint8_t, 16> buildCallArgumentBytecode(const CallInformation& callConvention)
+static Vector<uint8_t, 16> buildCallArgumentBytecode(const RTT& signature, const CallInformation& callConvention)
 {
+#if !CPU(PPC64)
+    UNUSED_PARAM(signature);
+#endif
     constexpr static int NUM_MINT_CALL_GPRS = 8;
     constexpr static int NUM_MINT_CALL_FPRS = 8;
     ASSERT_UNUSED(NUM_MINT_CALL_GPRS, wasmCallingConvention().jsrArgs.size() <= NUM_MINT_CALL_GPRS);
@@ -1243,6 +1257,10 @@ static Vector<uint8_t, 16> buildCallArgumentBytecode(const CallInformation& call
 
             if (loc.isFPR()) {
                 ASSERT_UNUSED(NUM_MINT_CALL_FPRS, FPRInfo::toArgumentIndex(loc.fpr()) < NUM_MINT_CALL_FPRS);
+#if CPU(PPC64)
+                if (signature.argumentType(index).isF32())
+                    return static_cast<uint8_t>(IPInt::CallArgumentBytecode::ArgumentFPRFloat) + FPRInfo::toArgumentIndex(loc.fpr());
+#endif
                 return static_cast<uint8_t>(IPInt::CallArgumentBytecode::ArgumentFPR) + FPRInfo::toArgumentIndex(loc.fpr());
             }
             RELEASE_ASSERT(loc.isStackArgument());
@@ -1278,8 +1296,11 @@ static Vector<uint8_t, 16> buildCallArgumentBytecode(const CallInformation& call
     return results;
 }
 
-static intptr_t buildCallResultBytecode(Vector<uint8_t, 16>& results, const CallInformation& callConvention)
+static intptr_t buildCallResultBytecode(Vector<uint8_t, 16>& results, const RTT& signature, const CallInformation& callConvention)
 {
+#if !CPU(PPC64)
+    UNUSED_PARAM(signature);
+#endif
     constexpr static int NUM_MINT_RET_GPRS = 8;
     constexpr static int NUM_MINT_RET_FPRS = 8;
     ASSERT_UNUSED(NUM_MINT_RET_GPRS, wasmCallingConvention().jsrArgs.size() <= NUM_MINT_RET_GPRS);
@@ -1305,6 +1326,10 @@ static intptr_t buildCallResultBytecode(Vector<uint8_t, 16>& results, const Call
 
             if (loc.isFPR()) {
                 ASSERT_UNUSED(NUM_MINT_RET_FPRS, FPRInfo::toArgumentIndex(loc.fpr()) < NUM_MINT_RET_FPRS);
+#if CPU(PPC64)
+                if (signature.returnType(index).isF32())
+                    return static_cast<uint8_t>(IPInt::CallResultBytecode::ResultFPRFloat) + FPRInfo::toArgumentIndex(loc.fpr());
+#endif
                 return static_cast<uint8_t>(IPInt::CallResultBytecode::ResultFPR) + FPRInfo::toArgumentIndex(loc.fpr());
             }
             RELEASE_ASSERT(loc.isStackArgument());
@@ -1341,7 +1366,7 @@ void RTT::ensureCallBytecode() const
         // thing during one call: arg dispatch leaves MC at CallReturnMetadata (inside the
         // buffer), and ret dispatch continues from there.
         auto callConvention = wasmCallingConvention().callInformationFor(*this, CallRole::Caller);
-        Vector<uint8_t, 16> bytes = buildCallArgumentBytecode</* isTailCall */ false>(callConvention);
+        Vector<uint8_t, 16> bytes = buildCallArgumentBytecode</* isTailCall */ false>(*this, callConvention);
 
         Checked<uint32_t> frameSize = WTF::roundUpToMultipleOf<stackAlignmentBytes()>(callConvention.headerAndArgumentStackSizeInBytes);
         IPInt::CallReturnMetadata returnMeta {
@@ -1350,7 +1375,7 @@ void RTT::ensureCallBytecode() const
         };
 
         Vector<uint8_t, 16> resultBytes;
-        Checked<uint32_t> firstStackResultSPOffset = buildCallResultBytecode(resultBytes, callConvention);
+        Checked<uint32_t> firstStackResultSPOffset = buildCallResultBytecode(resultBytes, *this, callConvention);
         returnMeta.firstStackResultSPOffset = firstStackResultSPOffset;
 
         auto toSpan = [&](auto& value) {
@@ -1373,7 +1398,7 @@ void RTT::ensureTailCallBytecode() const
         // The trailing u32 is read by .ipint_perform_tail_call via `loadi [MC]`
         // after mINT dispatch hits TailCall, so MC naturally lands on it.
         auto callConvention = wasmCallingConvention().callInformationFor(*this, CallRole::Caller);
-        auto bytes = buildCallArgumentBytecode</* isTailCall */ true>(callConvention);
+        auto bytes = buildCallArgumentBytecode</* isTailCall */ true>(*this, callConvention);
 
         uint32_t stackArgumentsAndResultsInBytes = roundUpToMultipleOf<stackAlignmentBytes()>(callConvention.headerAndArgumentStackSizeInBytes) - callConvention.headerIncludingThisSizeInBytes;
         ASSERT(!(stackArgumentsAndResultsInBytes % 16));

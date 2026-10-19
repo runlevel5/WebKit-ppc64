@@ -399,7 +399,7 @@ public:
         {
         }
 
-#if CPU(X86_64) || CPU(ARM64) || CPU(RISCV64)
+#if CPU(X86_64) || CPU(ARM64) || CPU(RISCV64) || CPU(PPC64)
         explicit constexpr TrustedImm64(TrustedImmPtr ptr)
             : m_value(ptr.asIntptr())
         {
@@ -746,6 +746,10 @@ public:
                 masm->m_assembler.linkJumpThunk(m_label, label.dataLocation(), m_type, m_condition, m_bitNumber, m_compareRegister);
             else
                 masm->m_assembler.linkJumpThunk(m_label, label.dataLocation(), m_type, m_condition);
+#elif CPU(PPC64)
+            // Recorded for branch compaction, which can then shrink the slot
+            // to a single b when the thunk is in reach.
+            masm->m_assembler.linkJumpThunk(m_label, label.dataLocation());
 #else
             Jump target = *this;
             masm->addLinkTask([=](auto& linkBuffer) {

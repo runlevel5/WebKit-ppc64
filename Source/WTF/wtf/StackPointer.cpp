@@ -171,6 +171,18 @@ __asm__(
      ".previous" "\n"
 );
 
+#elif CPU(PPC64)
+// ELFv2: r1 is the stack pointer, r3 the return value.
+__asm__(
+    ".text" "\n"
+    ".globl " SYMBOL_STRING(currentStackPointer) "\n"
+    SYMBOL_STRING(currentStackPointer) ":" "\n"
+
+    "mr 3, 1" "\n"
+    "blr" "\n"
+    ".previous" "\n"
+);
+
 #else
 #error "Unsupported platform: need implementation of currentStackPointer."
 #endif

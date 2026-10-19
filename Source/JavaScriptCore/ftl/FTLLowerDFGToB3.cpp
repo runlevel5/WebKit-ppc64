@@ -104,6 +104,7 @@
 #include "JSWebAssemblyInstance.h"
 #include "JSWrapForValidIterator.h"
 #include "LLIntThunks.h"
+#include "MaxFrameExtentForSlowPathCall.h"
 #include "MegamorphicCache.h"
 #include "MicrotaskCall.h"
 #include "OperandsInlines.h"
@@ -14042,6 +14043,13 @@ IGNORE_CLANG_WARNINGS_END
                         jit.loadPtr(CCallHelpers::Address(GPRInfo::argumentGPR2, JSCallee::offsetOfScopeChain()), GPRInfo::argumentGPR0);
                     }
                     jit.move(GPRInfo::callFrameRegister, GPRInfo::argumentGPR1);
+#if CPU(PPC64)
+                    // As in the DFG: an ELFv2 C callee's CR/LR/TOC saves at
+                    // sp + 8..31 would overwrite this frame's header (sp == cfr).
+                    // sp stays lowered through the exception check; the epilogue
+                    // restores it from cfr.
+                    jit.makeSpaceOnStackForCCall();
+#endif
                     if (Options::useJITCage()) {
                         jit.move(CCallHelpers::TrustedImmPtr(nativeFunction.taggedPtr()), GPRInfo::argumentGPR2);
                         jit.CCallHelpers::callOperation<OperationPtrTag>(vmEntryHostFunction);
@@ -14940,7 +14948,13 @@ IGNORE_CLANG_WARNINGS_END
                 // - The caller frame and PC for a call to operationCallDirectEvalSloppy/operationCallDirectEvalStrict.
                 // - Potentially two arguments on the stack.
                 CodeBlock* baselineCodeBlock = state->graph.baselineCodeBlockFor(semanticNodeOrigin);
+#if CPU(PPC64)
+                // As in the DFG: reserve the ELFv2 C-call area below the eval
+                // callee frame's CallerFrameAndPC at sp - 16.
+                unsigned requiredBytes = sizeof(CallerFrameAndPC) + maxFrameExtentForSlowPathCall;
+#else
                 unsigned requiredBytes = sizeof(CallerFrameAndPC) + sizeof(CallFrame*) * 2;
+#endif
                 requiredBytes = WTF::roundUpToMultipleOf<stackAlignmentBytes()>(requiredBytes);
                 jit.subPtr(CCallHelpers::TrustedImm32(requiredBytes), CCallHelpers::stackPointerRegister);
                 jit.setupArguments<decltype(operationCallDirectEvalSloppy)>(GPRInfo::regT1, GPRInfo::regT2, GPRInfo::regT3, CCallHelpers::TrustedImmPtr(baselineCodeBlock), CCallHelpers::TrustedImm32(semanticNodeOrigin.bytecodeIndex().asBits()));
@@ -15102,7 +15116,11 @@ IGNORE_CLANG_WARNINGS_END
         if (!wasmBaseMemoryPointerConfiguredAsInputContraints)
             clobber.add(GPRInfo::wasmBaseMemoryPointer, IgnoreVectors);
         patchpoint->clobber(WTF::move(clobber));
-        auto clobberLate = RegisterSet::registersToSaveForCCall(RegisterSet::allScalarRegisters());
+        // The callee is wasm code (IPInt, BBQ or OMG), which preserves the VM
+        // callee-saves, not every register the C ABI makes callee-saved. The
+        // two sets coincide on ARM64 and x86_64 (up to the frame pointer),
+        // but not on PPC64, where r24-r30 are scratch to IPInt and BBQ.
+        auto clobberLate = RegisterSet::registersToSaveForJSCall(RegisterSet::allScalarRegisters());
         clobberLate.add(GPRInfo::wasmContextInstancePointer, IgnoreVectors); // Because it is already tied to JSWebAssemblyInstance* in patchpoint's input constraint, we should say it is late clobbered.
         if (wasmBoundsCheckingSizeRegisterConfiguredAsInputContraints)
             clobberLate.add(GPRInfo::wasmBoundsCheckingSizeRegister, IgnoreVectors);
@@ -26610,6 +26628,32 @@ IGNORE_CLANG_WARNINGS_END
         m_out.appendTo(continuation, lastNext);
     }
 
+    template<typename OperationType, typename... Args>
+    LValue callOperationWithELFv2Extension(LType type, LValue function, Args&&... args)
+    {
+#if CPU(PPC64)
+        // See B3::cCallArgumentIsUnsigned32: pass an Int32 argument for a uint32_t
+        // parameter zero-extended, so CCallSpecial does not sign-extend it.
+        return [&]<size_t... I>(std::index_sequence<I...>) {
+            return m_out.call(type, function, extendCCallArgumentForELFv2<OperationType, I>(std::forward<Args>(args))...);
+        }(std::index_sequence_for<Args...> { });
+#else
+        return m_out.call(type, function, std::forward<Args>(args)...);
+#endif
+    }
+
+#if CPU(PPC64)
+    template<typename OperationType, size_t index>
+    LValue extendCCallArgumentForELFv2(LValue argument)
+    {
+        if constexpr (B3::cCallArgumentIsUnsigned32<OperationType, index>()) {
+            if (argument->type() == B3::Int32)
+                return m_out.zeroExtPtr(argument);
+        }
+        return argument;
+    }
+#endif
+
     // FIXME: We should be able to infer type from OperationType
     template<typename OperationResultType>
     LType resultTypeForOperation(LType type)
@@ -26626,7 +26670,7 @@ IGNORE_CLANG_WARNINGS_END
         static_assert(FunctionTraits<OperationType>::cCallArity() == sizeof...(Args), "Sanity check");
         callPreflight();
         using ResultType = typename FunctionTraits<OperationType>::ResultType;
-        LValue result = m_out.call(resultTypeForOperation<ResultType>(type), m_out.operation(function), std::forward<Args>(args)...);
+        LValue result = callOperationWithELFv2Extension<OperationType>(resultTypeForOperation<ResultType>(type), m_out.operation(function), std::forward<Args>(args)...);
         return operationExceptionCheckAndExtractResultIfNeeded<ResultType>(result);
     }
 
@@ -26637,7 +26681,7 @@ IGNORE_CLANG_WARNINGS_END
         static_assert(FunctionTraits<OperationType>::cCallArity() == sizeof...(Args), "Sanity check");
         callPreflight();
         using ResultType = typename FunctionTraits<OperationType>::ResultType;
-        LValue result = m_out.call(resultTypeForOperation<ResultType>(type), m_out.operation(function), std::forward<Args>(args)...);
+        LValue result = callOperationWithELFv2Extension<OperationType>(resultTypeForOperation<ResultType>(type), m_out.operation(function), std::forward<Args>(args)...);
         return operationExceptionCheckAndExtractResultIfNeeded<ResultType>(result);
     }
 

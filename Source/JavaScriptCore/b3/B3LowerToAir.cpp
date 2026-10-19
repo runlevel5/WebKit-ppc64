@@ -244,6 +244,10 @@ public:
     }
 
 private:
+    // On PPC64 a scalar f32 lives in an FPR in double format, while an f32x4
+    // lane is single format, so f32x4 lane 0 is not the scalar register.
+    static constexpr bool scalarFloatIsDoubleFormat() { return isPPC64(); }
+
     bool NODELETE shouldCopyPropagate(Value* value)
     {
         switch (value->opcode()) {
@@ -258,7 +262,7 @@ private:
             // this is effectively the same to Trunc for V128.
             SIMDValue* simdValue = value->as<SIMDValue>();
             auto lane = simdValue->simdLane();
-            return simdValue->immediate() == 0 && (lane == SIMDLane::f32x4 || lane == SIMDLane::f64x2);
+            return simdValue->immediate() == 0 && (lane == SIMDLane::f64x2 || (lane == SIMDLane::f32x4 && !scalarFloatIsDoubleFormat()));
         }
         default:
             return false;
@@ -3554,7 +3558,7 @@ private:
             return;
         }
         
-        RELEASE_ASSERT(isARM64());
+        RELEASE_ASSERT(isARM64() || isPPC64());
         // We wish to emit:
         //
         // Block #reloop:
@@ -3620,8 +3624,15 @@ private:
                 successBlock->append(Air::Jump, m_value);
                 successBlock->setSuccessors(doneBlock);
             } else {
-                if (!invert)
-                    storeBlock->append(Xor32, m_value, Arg::bitImm(1), boolResultTmp, boolResultTmp);
+                if (!invert) {
+                    if (isValidForm(Xor32, Arg::BitImm, Arg::Tmp, Arg::Tmp))
+                        storeBlock->append(Xor32, m_value, Arg::bitImm(1), boolResultTmp, boolResultTmp);
+                    else {
+                        Tmp one = m_code.newTmp(GP);
+                        storeBlock->append(Move, m_value, Arg::imm(1), one);
+                        storeBlock->append(Xor32, m_value, one, boolResultTmp, boolResultTmp);
+                    }
+                }
                 
                 storeBlock->append(Air::Jump, m_value);
                 storeBlock->setSuccessors(doneBlock);
@@ -3709,7 +3720,7 @@ private:
                 break;
             }
         } else {
-            RELEASE_ASSERT(isARM64());
+            RELEASE_ASSERT(isARM64() || isPPC64());
             prepareOpcode = loadLinkOpcode(atomic->accessWidth(), atomic->hasFence());
         }
         reloopBlock->append(trappingInst(m_value, prepareOpcode, m_value, address, oldValue));
@@ -3740,7 +3751,7 @@ private:
             reloopBlock->append(relaxedMoveForType(atomic->type()), m_value, oldValue, m_eax);
             reloopBlock->append(trappingInst(m_value, casOpcode, m_value, Arg::statusCond(MacroAssembler::Success), m_eax, newValue, address));
         } else {
-            RELEASE_ASSERT(isARM64());
+            RELEASE_ASSERT(isARM64() || isPPC64());
             Tmp boolResult = m_code.newTmp(GP);
             reloopBlock->append(trappingInst(m_value, storeCondOpcode(atomic->accessWidth(), atomic->hasFence()), m_value, newValue, address, boolResult));
             reloopBlock->append(BranchTest32, m_value, Arg::resCond(MacroAssembler::Zero), boolResult, boolResult);
@@ -4164,26 +4175,36 @@ private:
         }
 
         case Mod: {
-            RELEASE_ASSERT(isX86());
             RELEASE_ASSERT(!m_value->isChill());
+#if CPU(PPC64)
+            RELEASE_ASSERT(MacroAssembler::supportsISA3_00());
+            appendBinOp<Mod32, Mod64, Air::Oops, Air::Oops>(m_value->child(0), m_value->child(1));
+#else
+            RELEASE_ASSERT(isX86());
             appendX86Div(Mod);
+#endif
             return;
         }
 
         case UMod: {
+#if CPU(PPC64)
+            RELEASE_ASSERT(MacroAssembler::supportsISA3_00());
+            appendBinOp<UMod32, UMod64, Air::Oops, Air::Oops>(m_value->child(0), m_value->child(1));
+#else
             RELEASE_ASSERT(isX86());
             appendX86UDiv(UMod);
+#endif
             return;
         }
 
         case FMin: {
-            RELEASE_ASSERT(isARM64());
+            RELEASE_ASSERT(isARM64() || isPPC64());
             append(m_value->type() == Float ? FloatMin : DoubleMin, tmp(m_value->child(0)), tmp(m_value->child(1)), tmp(m_value));
             return;
         }
 
         case FMax: {
-            RELEASE_ASSERT(isARM64());
+            RELEASE_ASSERT(isARM64() || isPPC64());
             append(m_value->type() == Float ? FloatMax : DoubleMax, tmp(m_value->child(0)), tmp(m_value->child(1)), tmp(m_value));
             return;
         }
@@ -4551,7 +4572,7 @@ private:
         }
             
         case Depend: {
-            RELEASE_ASSERT(isARM64());
+            RELEASE_ASSERT(isARM64() || isPPC64());
             appendUnOp<Depend32, Depend64>(m_value->child(0));
             return;
         }
@@ -5043,7 +5064,7 @@ private:
             SIMDValue* value = m_value->as<SIMDValue>();
             auto lane = value->simdLane();
             auto signMode = value->signMode();
-            if (value->immediate() == 0 && (lane == SIMDLane::f32x4 || lane == SIMDLane::f64x2)) {
+            if (value->immediate() == 0 && (lane == SIMDLane::f64x2 || (lane == SIMDLane::f32x4 && !scalarFloatIsDoubleFormat()))) {
                 ASSERT(tmp(m_value->child(0)) == tmp(m_value));
                 return;
             }
@@ -5222,6 +5243,37 @@ private:
                     return;
                 }
 
+                if (value->opcode() == VectorShl)
+                    append(VectorUshl, Arg::simdInfo(value->simdInfo()), v, shiftVector, tmp(value));
+                else
+                    append(value->signMode() == SIMDSignMode::Signed ? VectorSshr : VectorUshr, Arg::simdInfo(value->simdInfo()), v, shiftVector, tmp(value));
+                return;
+            }
+
+            if constexpr (isPPC64()) {
+                // VMX shifts take a per-lane count (modulo the lane width) from
+                // the low bits of each lane, so a byte splat serves every lane size.
+                auto v = tmp(value->child(0));
+
+                if (value->child(1)->hasInt32()) {
+                    int32_t shiftImm = value->child(1)->asInt32() & mask;
+                    if (!shiftImm) {
+                        append(Air::MoveVector, v, tmp(value));
+                        return;
+                    }
+                    if (value->opcode() == VectorShl)
+                        append(VectorShl8, Arg::simdInfo(value->simdInfo()), v, Arg::imm(shiftImm), tmp(value));
+                    else
+                        append(value->signMode() == SIMDSignMode::Signed ? VectorSshr8 : VectorUshr8, Arg::simdInfo(value->simdInfo()), v, Arg::imm(shiftImm), tmp(value));
+                    return;
+                }
+
+                // PPC64 has no immediate And32 form, so the mask goes through a tmp.
+                Tmp shiftAmount = m_code.newTmp(B3::GP);
+                Tmp shiftVector = m_code.newTmp(B3::FP);
+                append(Move, Arg::imm(mask), shiftAmount);
+                append(And32, shiftAmount, tmp(value->child(1)), shiftAmount);
+                append(VectorSplatInt8, shiftAmount, shiftVector);
                 if (value->opcode() == VectorShl)
                     append(VectorUshl, Arg::simdInfo(value->simdInfo()), v, shiftVector, tmp(value));
                 else
@@ -5741,8 +5793,12 @@ private:
                 return;
             }
 
-            ASSERT(isARM64());
+            ASSERT(isARM64() || isPPC64());
             ASSERT(m_value->numChildren() == 3);
+            if constexpr (isPPC64()) {
+                append(Air::VectorSwizzleTwoTables, tmp(m_value->child(0)), tmp(m_value->child(1)), tmp(m_value->child(2)), tmp(m_value));
+                return;
+            }
 #if CPU(ARM64)
             // The tbl instruction requires these values to be adjacent.
             Tmp a(ARM64Registers::q30);

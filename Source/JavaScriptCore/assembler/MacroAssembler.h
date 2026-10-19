@@ -54,6 +54,10 @@ WTF_ALLOW_UNSAFE_BUFFER_USAGE_BEGIN
 #define TARGET_MACROASSEMBLER MacroAssemblerRISCV64
 #include "MacroAssemblerRISCV64.h"
 
+#elif CPU(PPC64)
+#define TARGET_MACROASSEMBLER MacroAssemblerPPC64
+#include <JavaScriptCore/MacroAssemblerPPC64.h>
+
 #else
 #error "The MacroAssembler is not supported on this platform."
 #endif
@@ -137,10 +141,10 @@ public:
     using MacroAssemblerBase::and32;
     using MacroAssemblerBase::branchAdd32;
     using MacroAssemblerBase::branchMul32;
-#if CPU(ARM64) || CPU(ARM_THUMB2) || CPU(X86_64) || CPU(RISCV64)
+#if CPU(ARM64) || CPU(ARM_THUMB2) || CPU(X86_64) || CPU(RISCV64) || CPU(PPC64)
     using MacroAssemblerBase::branchPtr;
 #endif
-#if CPU(X86_64)
+#if CPU(X86_64) || CPU(PPC64)
     using MacroAssemblerBase::branch64;
 #endif
 #if CPU(RISCV64)
@@ -155,10 +159,10 @@ public:
     using MacroAssemblerBase::urshift32;
     using MacroAssemblerBase::xor32;
 
-#if CPU(ARM64) || CPU(X86_64) || CPU(RISCV64) || CPU(ARM_THUMB2)
+#if CPU(ARM64) || CPU(X86_64) || CPU(RISCV64) || CPU(ARM_THUMB2) || CPU(PPC64)
     using MacroAssemblerBase::convertInt32ToDouble;
 #endif
-#if CPU(ARM64) || CPU(X86_64) || CPU(RISCV64)
+#if CPU(ARM64) || CPU(X86_64) || CPU(RISCV64) || CPU(PPC64)
     using MacroAssemblerBase::add64;
     using MacroAssemblerBase::sub64;
     using MacroAssemblerBase::and64;
@@ -351,7 +355,7 @@ public:
     static constexpr ptrdiff_t pushToSaveByteOffset() { return sizeof(void*); }
 #endif // !CPU(ARM64)
 
-#if CPU(X86_64) || CPU(ARM64) || CPU(RISCV64)
+#if CPU(X86_64) || CPU(ARM64) || CPU(RISCV64) || CPU(PPC64)
     void peek64(RegisterID dest, int index = 0)
     {
         load64(Address(stackPointerRegister, (index * sizeof(void*))), dest);
@@ -431,58 +435,63 @@ public:
     }
 
 #if !CPU(ARM_THUMB2) && !CPU(ARM64)
-    PatchableJump patchableBranchPtr(RelationalCondition cond, Address left, TrustedImmPtr right = TrustedImmPtr(nullptr))
+private:
+    template<typename EmitJump>
+    PatchableJump makePatchableJump(const EmitJump& emitJump)
     {
         padBeforePatch();
-        return PatchableJump(branchPtr(cond, left, right));
+#if CPU(PPC64)
+        // A jump that will be repatched keeps its full slot through branch
+        // compaction.
+        FixedSizeJumpScope fixedSizeJumps(*this);
+#endif
+        return PatchableJump(emitJump());
+    }
+
+public:
+    PatchableJump patchableBranchPtr(RelationalCondition cond, Address left, TrustedImmPtr right = TrustedImmPtr(nullptr))
+    {
+        return makePatchableJump([&] { return branchPtr(cond, left, right); });
     }
     
     PatchableJump patchableBranchPtrWithPatch(RelationalCondition cond, Address left, DataLabelPtr& dataLabel, TrustedImmPtr initialRightValue = TrustedImmPtr(nullptr))
     {
-        padBeforePatch();
-        return PatchableJump(branchPtrWithPatch(cond, left, dataLabel, initialRightValue));
+        return makePatchableJump([&] { return branchPtrWithPatch(cond, left, dataLabel, initialRightValue); });
     }
 
     PatchableJump patchableBranch32WithPatch(RelationalCondition cond, Address left, DataLabel32& dataLabel, TrustedImm32 initialRightValue = TrustedImm32(0))
     {
-        padBeforePatch();
-        return PatchableJump(branch32WithPatch(cond, left, dataLabel, initialRightValue));
+        return makePatchableJump([&] { return branch32WithPatch(cond, left, dataLabel, initialRightValue); });
     }
 
     PatchableJump patchableJump()
     {
-        padBeforePatch();
-        return PatchableJump(jump());
+        return makePatchableJump([&] { return jump(); });
     }
 
     PatchableJump patchableBranchTest32(ResultCondition cond, RegisterID reg, TrustedImm32 mask = TrustedImm32(-1))
     {
-        padBeforePatch();
-        return PatchableJump(branchTest32(cond, reg, mask));
+        return makePatchableJump([&] { return branchTest32(cond, reg, mask); });
     }
 
     PatchableJump patchableBranch32(RelationalCondition cond, RegisterID reg, TrustedImm32 imm)
     {
-        padBeforePatch();
-        return PatchableJump(branch32(cond, reg, imm));
+        return makePatchableJump([&] { return branch32(cond, reg, imm); });
     }
 
     PatchableJump patchableBranch8(RelationalCondition cond, Address address, TrustedImm32 imm)
     {
-        padBeforePatch();
-        return PatchableJump(branch8(cond, address, imm));
+        return makePatchableJump([&] { return branch8(cond, address, imm); });
     }
 
     PatchableJump patchableBranch16(RelationalCondition cond, Address address, TrustedImm32 imm)
     {
-        padBeforePatch();
-        return PatchableJump(branch16(cond, address, imm));
+        return makePatchableJump([&] { return branch16(cond, address, imm); });
     }
 
     PatchableJump patchableBranch32(RelationalCondition cond, Address address, TrustedImm32 imm)
     {
-        padBeforePatch();
-        return PatchableJump(branch32(cond, address, imm));
+        return makePatchableJump([&] { return branch32(cond, address, imm); });
     }
 #endif
 
@@ -1957,7 +1966,7 @@ public:
     }
 #endif
 
-#if !CPU(X86_64) && !CPU(ARM64)
+#if !CPU(X86_64) && !CPU(ARM64) && !CPU(PPC64)
     // We should implement this the right way eventually, but for now, it's fine because it arises so
     // infrequently.
     void compareDouble(DoubleCondition cond, FPRegisterID left, FPRegisterID right, RegisterID dest)
@@ -1982,7 +1991,7 @@ public:
         add32(TrustedImm32(address.offset), address.base, dest);
     }
 
-#if CPU(X86_64) || CPU(ARM64) || CPU(RISCV64)
+#if CPU(X86_64) || CPU(ARM64) || CPU(RISCV64) || CPU(PPC64)
     void lea64(Address address, RegisterID dest)
     {
         add64(TrustedImm32(address.offset), address.base, dest);
@@ -2224,7 +2233,7 @@ public:
         storePtr(value, addressForPoke(index));
     }
     
-#if CPU(X86_64) || CPU(ARM64) || CPU(RISCV64)
+#if CPU(X86_64) || CPU(ARM64) || CPU(RISCV64) || CPU(PPC64)
     void poke(Imm64 value, int index = 0)
     {
         store64(value, addressForPoke(index));

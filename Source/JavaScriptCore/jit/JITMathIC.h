@@ -71,6 +71,12 @@ public:
     {
         jit.padBeforePatch(); // Make sure that the first patchable jump below is aligned, but don't count alignment in the inline size.
         // On ARMv7, this ensures that the patchable jump does not make the inline code too large.
+#if CPU(PPC64)
+        // generateOutOfLine() overwrites this inline code with a jump slot, which
+        // needs patchableJumpSize() bytes after linking: keep branch compaction
+        // from shrinking the jumps in here.
+        CCallHelpers::FixedSizeJumpScope fixedSizeJumps(jit);
+#endif
         state.fastPathStart = jit.label();
         size_t startSize = jit.m_assembler.buffer().codeSize();
 

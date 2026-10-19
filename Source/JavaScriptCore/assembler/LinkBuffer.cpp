@@ -492,7 +492,7 @@ void LinkBuffer::linkCode(MacroAssembler& macroAssembler, JITCompilationEffort e
     performJITMemcpy<jitMemcpyRepatch>(code, buffer.data(), buffer.codeSize());
 #elif CPU(ARM_THUMB2)
     copyCompactAndLinkCode<uint16_t>(macroAssembler, effort);
-#elif CPU(ARM64)
+#elif CPU(ARM64) || CPU(PPC64)
     copyCompactAndLinkCode<uint32_t>(macroAssembler, effort);
 #endif // !ENABLE(BRANCH_COMPACTION)
 #else  // ENABLE(JIT)

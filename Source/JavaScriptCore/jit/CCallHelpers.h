@@ -33,6 +33,7 @@
 #include <JavaScriptCore/DisallowMacroScratchRegisterUsage.h>
 #include <JavaScriptCore/FPRInfo.h>
 #include <JavaScriptCore/GPRInfo.h>
+#include <JavaScriptCore/MaxFrameExtentForSlowPathCall.h>
 #include <JavaScriptCore/OperationResult.h>
 #include <JavaScriptCore/StackAlignment.h>
 #include <wtf/FunctionTraits.h>
@@ -75,6 +76,49 @@ public:
     // It offers DerivedClass::materialize and poke functions.
     class ConstantMaterializer { };
 
+#if CPU(PPC64)
+    // ELFv2 gives every C argument, integer or floating point, one doubleword of
+    // the parameter save area by its position in the argument list, starting
+    // after the 32-byte linkage area at sp + 32. Positions 0-7 are also r3-r10:
+    // an integer argument takes the GPR of its position (an FP argument skips its
+    // GPR) or, from position 8 on, its doubleword. FP arguments take f1-f13 in
+    // order, then their doubleword. An argument in memory is always at
+    // sp + 32 + 8 * position.
+    static constexpr unsigned elfV2ArgumentGPRs = 8;
+    static constexpr unsigned elfV2ArgumentFPRs = 13;
+    static constexpr unsigned elfV2ParameterSaveAreaOffsetInWords = 4;
+
+    static constexpr GPRReg cArgumentRegister(GPRReg, unsigned index) { return GPRInfo::toArgumentRegister(index); }
+    static constexpr FPRReg cArgumentRegister(FPRReg, unsigned index)
+    {
+        ASSERT_UNDER_CONSTEXPR_CONTEXT(index < elfV2ArgumentFPRs);
+        return static_cast<FPRReg>(PPC64Registers::f1 + index);
+    }
+
+    // The bytes at sp a C call to OperationType needs reserved: the linkage area
+    // the callee may store into, and, once any argument is passed in memory, the
+    // whole parameter save area (one doubleword per argument position).
+    template<typename OperationType>
+    static constexpr size_t outgoingArgumentAreaBytes()
+    {
+        return outgoingArgumentAreaBytesImpl<FunctionTraits<OperationType>>(std::make_index_sequence<FunctionTraits<OperationType>::arity>());
+    }
+
+    template<typename OperationTraitsType, size_t... argIndices>
+    static constexpr size_t outgoingArgumentAreaBytesImpl(std::index_sequence<argIndices...>)
+    {
+        constexpr std::array<bool, sizeof...(argIndices)> isFP { std::is_same_v<typename OperationTraitsType::template ArgumentType<argIndices>, double>... };
+        unsigned fprs = 0;
+        bool usesParameterSaveArea = false;
+        for (unsigned position = 0; position < isFP.size(); ++position) {
+            if (isFP[position] ? fprs++ >= elfV2ArgumentFPRs : position >= elfV2ArgumentGPRs)
+                usesParameterSaveArea = true;
+        }
+        size_t words = elfV2ParameterSaveAreaOffsetInWords + (usesParameterSaveArea ? isFP.size() : 0);
+        return words * sizeof(CPURegister);
+    }
+#endif
+
     // The most general helper for setting arguments that fit in a GPR, if you can compute each
     // argument without using any argument registers. You usually want one of the setupArguments*()
     // methods below instead of this. This thing is most useful if you have *a lot* of arguments.
@@ -88,7 +132,12 @@ public:
         }
 
         functor(GPRInfo::nonArgGPR0);
+#if CPU(PPC64)
+        // Every argument here is GPR-class, so the index is the ELFv2 position.
+        poke(GPRInfo::nonArgGPR0, elfV2ParameterSaveAreaOffsetInWords + argumentIndex);
+#else
         poke(GPRInfo::nonArgGPR0, POKE_ARGUMENT_OFFSET + argumentIndex - GPRInfo::numberOfArgumentRegisters);
+#endif
     }
 
     enum class ShuffleStatus : uint8_t {
@@ -97,6 +146,11 @@ public:
         Moved
     };
 
+    // GCC cannot prove this recursion terminates (the status updates end it).
+#if COMPILER(GCC) && !COMPILER(CLANG)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winfinite-recursion"
+#endif
     template<typename RegType, size_t N, typename RegPair = std::pair<RegType, RegType>>
     void emitShuffleMove(Vector<RegPair, N>& moves, Vector<ShuffleStatus, N>& status, unsigned index, RegType scratch)
     {
@@ -127,6 +181,9 @@ public:
             move(moves[index].first, moves[index].second);
         status[index] = ShuffleStatus::Moved;
     }
+#if COMPILER(GCC) && !COMPILER(CLANG)
+#pragma GCC diagnostic pop
+#endif
 
     template<typename RegType, unsigned NumberOfRegisters>
     ALWAYS_INLINE void shuffleRegisters(std::array<RegType, NumberOfRegisters> sources, std::array<RegType, NumberOfRegisters> destinations)
@@ -293,7 +350,15 @@ private:
             return ArgCollection<numGPRArgs, numGPRSources, numFPRArgs, numFPRSources, numCrossSources, extraGPRArgs, nonArgGPRs, extraPoke + 1>(*this);
         }
 
+#if CPU(PPC64)
+        // ELFv2: an FP argument skips its GPR, so an integer argument's GPR is
+        // chosen by its position among all arguments, not by the GP count.
+        // FP arguments still select FPRs by FP count.
+        // e.g. f(void* a, double b, void* c) passes a in r3, c in r5.
+        unsigned argCount(GPRReg) { return numGPRArgs + numFPRArgs + extraGPRArgs; }
+#else
         unsigned argCount(GPRReg) { return numGPRArgs + extraGPRArgs; }
+#endif
         unsigned argCount(FPRReg) { return numFPRArgs; }
 
         // store GPR -> GPR assignments
@@ -330,6 +395,19 @@ private:
 
     ALWAYS_INLINE unsigned calculatePokeOffset(unsigned currentGPRArgument, unsigned currentFPRArgument, unsigned numCrossSources, unsigned extraGPRArgs, unsigned nonArgGPRs, unsigned extraPoke)
     {
+#if CPU(PPC64)
+        // The argument's ELFv2 position is the number of arguments of either bank
+        // before it; its doubleword is at sp + 32 + 8 * position (see
+        // elfV2ArgumentGPRs). extraGPRArgs, numCrossSources and extraPoke are
+        // always 0 on this JSVALUE64 target.
+        UNUSED_PARAM(numCrossSources);
+        UNUSED_PARAM(extraGPRArgs);
+        UNUSED_PARAM(nonArgGPRs);
+        UNUSED_PARAM(extraPoke);
+        ASSERT(!numCrossSources && !extraGPRArgs && !extraPoke);
+        ASSERT(currentGPRArgument + currentFPRArgument >= elfV2ArgumentGPRs || currentFPRArgument >= elfV2ArgumentFPRs);
+        return elfV2ParameterSaveAreaOffsetInWords + currentGPRArgument + currentFPRArgument;
+#else
         // Clang claims that it cannot find the symbol for FPRReg/GPRReg::numberOfArgumentRegisters when they are passed directly to std::max... seems like a bug
         unsigned numberOfFPArgumentRegisters = FPRInfo::numberOfArgumentRegisters;
         unsigned numberOfGPArgumentRegisters = GPRInfo::numberOfArgumentRegisters;
@@ -347,6 +425,7 @@ private:
         pokeOffset += std::max(currentGPRArgument, numberOfGPArgumentRegisters) - numberOfGPArgumentRegisters;
         pokeOffset += std::max(currentFPRArgument, numberOfFPArgumentRegisters) - numberOfFPArgumentRegisters;
         return pokeOffset;
+#endif
     }
 
     template<typename ArgType>
@@ -382,6 +461,20 @@ private:
     template<typename OperationType, unsigned numGPRArgs, unsigned numGPRSources, unsigned numFPRArgs, unsigned numFPRSources, unsigned numCrossSources, unsigned extraGPRArgs, unsigned nonArgGPRs, unsigned extraPoke, typename RegType, typename... Args>
     ALWAYS_INLINE void marshallArgumentRegister(ArgCollection<numGPRArgs, numGPRSources, numFPRArgs, numFPRSources, numCrossSources, extraGPRArgs, nonArgGPRs, extraPoke> argSourceRegs, RegType arg, Args... args)
     {
+#if CPU(PPC64)
+        // Decided at compile time: instantiating the register path for an argument
+        // that goes to memory would size the source arrays past the register file
+        // (FPRInfo has 13 registers, so a 14th FP argument could not compile).
+        constexpr bool isFP = std::is_same_v<RegType, FPRReg>;
+        constexpr unsigned currentArgCount = isFP ? numFPRArgs : numGPRArgs + numFPRArgs + extraGPRArgs;
+        if constexpr (currentArgCount < (isFP ? elfV2ArgumentFPRs : elfV2ArgumentGPRs)) {
+            auto updatedArgSourceRegs = argSourceRegs.pushRegArg(arg, cArgumentRegister(arg, currentArgCount));
+            setupArgumentsImpl<OperationType>(updatedArgSourceRegs, args...);
+        } else {
+            pokeForArgument(arg, numGPRArgs, numFPRArgs, numCrossSources, extraGPRArgs, nonArgGPRs, extraPoke);
+            setupArgumentsImpl<OperationType>(argSourceRegs.addStackArg(arg), args...);
+        }
+#else
         using InfoType = InfoTypeForReg<RegType>;
         unsigned numArgRegisters = InfoType::numberOfArgumentRegisters;
         unsigned currentArgCount = argSourceRegs.argCount(arg);
@@ -393,6 +486,7 @@ private:
 
         pokeForArgument(arg, numGPRArgs, numFPRArgs, numCrossSources, extraGPRArgs, nonArgGPRs, extraPoke);
         setupArgumentsImpl<OperationType>(argSourceRegs.addStackArg(arg), args...);
+#endif
     }
 
     template<typename OperationType, unsigned numGPRArgs, unsigned numGPRSources, unsigned numFPRArgs, unsigned numFPRSources, unsigned numCrossSources, unsigned extraGPRArgs, unsigned nonArgGPRs, unsigned extraPoke, typename... Args>
@@ -541,14 +635,45 @@ private:
         // gross so it's probably better to do that marshalling before the call operation...
         static_assert(!std::is_floating_point_v<CURRENT_ARGUMENT_TYPE>, "We don't support immediate floats/doubles in setupArguments");
         auto numArgRegisters = GPRInfo::numberOfArgumentRegisters;
+#if CPU(PPC64)
+        // ELFv2: FP arguments consume their GPR slot, so an immediate integer
+        // argument's register is selected by total argument position, matching
+        // ArgCollection::argCount(GPRReg).
+        auto currentArgCount = numGPRArgs + numFPRArgs + extraGPRArgs;
+#else
         auto currentArgCount = numGPRArgs + extraGPRArgs;
+#endif
         if (currentArgCount < numArgRegisters) {
             setupArgumentsImpl<OperationType>(argSourceRegs.addGPRArg(), args...);
+#if CPU(PPC64)
+            // ELFv2 has the caller extend a 32-bit argument to 64 bits by its
+            // signedness, but move(TrustedImm32) zero-extends. Materialize the
+            // immediate with the C argument type's own extension.
+            if constexpr (std::is_same_v<std::decay_t<Arg>, TrustedImm32> && std::is_integral_v<CURRENT_ARGUMENT_TYPE> && sizeof(CURRENT_ARGUMENT_TYPE) <= 4) {
+                if constexpr (std::is_signed_v<CURRENT_ARGUMENT_TYPE>)
+                    move(TrustedImm64(static_cast<int64_t>(arg.m_value)), GPRInfo::toArgumentRegister(currentArgCount));
+                else
+                    move(TrustedImm64(static_cast<int64_t>(static_cast<uint32_t>(arg.m_value))), GPRInfo::toArgumentRegister(currentArgCount));
+            } else
+                move(arg, GPRInfo::toArgumentRegister(currentArgCount));
+#else
             move(arg, GPRInfo::toArgumentRegister(currentArgCount));
+#endif
             return;
         }
 
+#if CPU(PPC64)
+        // In memory too, ELFv2 has the caller extend an int to its whole doubleword.
+        if constexpr (std::is_same_v<std::decay_t<Arg>, TrustedImm32> && std::is_integral_v<CURRENT_ARGUMENT_TYPE> && sizeof(CURRENT_ARGUMENT_TYPE) <= 4) {
+            if constexpr (std::is_signed_v<CURRENT_ARGUMENT_TYPE>)
+                pokeForArgument(TrustedImm64(static_cast<int64_t>(arg.m_value)), numGPRArgs, numFPRArgs, numCrossSources, extraGPRArgs, nonArgGPRs, extraPoke);
+            else
+                pokeForArgument(TrustedImm64(static_cast<int64_t>(static_cast<uint32_t>(arg.m_value))), numGPRArgs, numFPRArgs, numCrossSources, extraGPRArgs, nonArgGPRs, extraPoke);
+        } else
+            pokeForArgument(arg, numGPRArgs, numFPRArgs, numCrossSources, extraGPRArgs, nonArgGPRs, extraPoke);
+#else
         pokeForArgument(arg, numGPRArgs, numFPRArgs, numCrossSources, extraGPRArgs, nonArgGPRs, extraPoke);
+#endif
         setupArgumentsImpl<OperationType>(argSourceRegs.addGPRArg(), args...);
     }
 
@@ -587,7 +712,12 @@ private:
     {
         static_assert(!std::is_floating_point_v<CURRENT_ARGUMENT_TYPE>, "We don't support immediate floats/doubles in setupArguments");
         auto numArgRegisters = GPRInfo::numberOfArgumentRegisters;
+#if CPU(PPC64)
+        // ELFv2 position, as in ArgCollection::argCount(GPRReg).
+        auto currentArgCount = numGPRArgs + numFPRArgs + extraGPRArgs;
+#else
         auto currentArgCount = numGPRArgs + extraGPRArgs;
+#endif
         if (currentArgCount < numArgRegisters) {
             setupArgumentsImpl<OperationType>(argSourceRegs.addGPRArg(), args...);
             arg.materialize(*this, GPRInfo::toArgumentRegister(currentArgCount));
@@ -598,6 +728,37 @@ private:
         pokeForArgument(arg, numGPRArgs, numFPRArgs, numCrossSources, extraGPRArgs, nonArgGPRs, extraPoke);
         setupArgumentsImpl<OperationType>(argSourceRegs.addGPRArg(), args...);
     }
+
+#if CPU(PPC64)
+    template<typename ArgumentType>
+    void widenNarrowIntegerArgument(GPRReg reg)
+    {
+        // Callers that do not know the C function's type pass a signature made of the argument
+        // values' own types instead (FTL's callOperation: setupArguments<void(ArgumentTypes...)>).
+        // A GPRReg there names the register holding the value, not a narrow integer parameter.
+        if constexpr (std::is_same_v<ArgumentType, GPRReg>)
+            return;
+        else if constexpr (std::is_enum_v<ArgumentType>)
+            widenNarrowIntegerArgument<std::underlying_type_t<ArgumentType>>(reg);
+        else if constexpr (std::is_integral_v<ArgumentType> && sizeof(ArgumentType) < sizeof(CPURegister)) {
+            if constexpr (std::is_signed_v<ArgumentType>) {
+                if constexpr (sizeof(ArgumentType) == 1)
+                    signExtend8To32(reg, reg);
+                else if constexpr (sizeof(ArgumentType) == 2)
+                    signExtend16To32(reg, reg);
+                else
+                    signExtend32ToPtr(reg, reg);
+            } else {
+                if constexpr (sizeof(ArgumentType) == 1)
+                    zeroExtend8To32(reg, reg);
+                else if constexpr (sizeof(ArgumentType) == 2)
+                    zeroExtend16To32(reg, reg);
+                else
+                    zeroExtend32ToWord(reg, reg);
+            }
+        }
+    }
+#endif
 
     template<typename OperationType, unsigned gprIndex>
     constexpr void finalizeGPRArguments(std::index_sequence<>)
@@ -623,6 +784,14 @@ private:
                 GPRReg argReg = GPRInfo::toArgumentRegister(gprIndex);
                 signExtend32ToPtr(argReg, argReg);
             }
+#if CPU(PPC64)
+            // ELFv2 likewise has the caller sign- or zero-extend every narrow integer argument
+            // to 64 bits, and compiled callees rely on it. JIT code leaves the upper half of a
+            // 32-bit value unspecified (a DFG int32 may still carry the number tag). The register
+            // is the argument position's, not gprIndex's, since an FP argument skips its GPR.
+            if (arityIndex < elfV2ArgumentGPRs)
+                widenNarrowIntegerArgument<ArgumentType>(GPRInfo::toArgumentRegister(arityIndex));
+#endif
 
             finalizeGPRArguments<OperationType, gprIndex + 1>(NextIndexSequenceType());
         } else
@@ -692,23 +861,48 @@ private:
 
 public:
 
+#if CPU(PPC64)
+    // JIT C-call sites reserve maxFrameExtentForSlowPathCall bytes at sp for the
+    // callee's linkage area and any memory arguments. An operation that needs
+    // more must raise it rather than have its arguments stored past the area.
+#define CHECK_OUTGOING_ARGUMENT_AREA(OperationType, reservedBytes) \
+    static_assert(outgoingArgumentAreaBytes<OperationType>() <= (reservedBytes), "The C call's ELFv2 parameter save area does not fit in the reserved outgoing argument area")
+#else
+#define CHECK_OUTGOING_ARGUMENT_AREA(OperationType, reservedBytes) static_assert(true)
+#endif
+
     template<typename OperationType, typename... Args>
     ALWAYS_INLINE void setupArguments(Args... args)
     {
+        CHECK_OUTGOING_ARGUMENT_AREA(OperationType, maxFrameExtentForSlowPathCall);
+        setupArgumentsEntryImpl<OperationType>(ArgCollection<0, 0, 0, 0, 0, 0, 0, 0>(), args...);
+    }
+
+    // setupArguments for a caller that has itself reserved reservedBytes at sp for
+    // the outgoing C arguments, for calls that pass more in memory than a slow
+    // path call may.
+    template<typename OperationType, size_t reservedBytes, typename... Args>
+    ALWAYS_INLINE void setupArgumentsWithReservedArgumentArea(Args... args)
+    {
+        CHECK_OUTGOING_ARGUMENT_AREA(OperationType, reservedBytes);
         setupArgumentsEntryImpl<OperationType>(ArgCollection<0, 0, 0, 0, 0, 0, 0, 0>(), args...);
     }
 
     template<typename OperationType, typename... Args>
     ALWAYS_INLINE void setupArgumentsForIndirectCall(GPRReg functionGPR, Args... args)
     {
+        CHECK_OUTGOING_ARGUMENT_AREA(OperationType, maxFrameExtentForSlowPathCall);
         setupArgumentsEntryImpl<OperationType>(ArgCollection<0, 0, 0, 0, 0, 0, 0, 0>().pushNonArg(functionGPR, GPRInfo::nonArgGPR0), args...);
     }
 
     template<typename OperationType, typename... Args>
     ALWAYS_INLINE void setupArgumentsForIndirectCall(Address address, Args... args)
     {
+        CHECK_OUTGOING_ARGUMENT_AREA(OperationType, maxFrameExtentForSlowPathCall);
         setupArgumentsEntryImpl<OperationType>(ArgCollection<0, 0, 0, 0, 0, 0, 0, 0>().pushNonArg(address.base, GPRInfo::nonArgGPR0), args...);
     }
+
+#undef CHECK_OUTGOING_ARGUMENT_AREA
 
     void setupResults(GPRReg destA, GPRReg destB = InvalidGPRReg)
     {
@@ -858,6 +1052,11 @@ public:
 #elif CPU(X86_64)
         push(Address(framePointerRegister, sizeof(void*)));
         subPtr(TrustedImm32(sizeof(void*)), newFrameSizeGPR);
+#elif CPU(PPC64)
+        // linkRegister is only a placeholder on PPC64; restore the caller's return PC
+        // to LR. As on ARM64, the callee prologue re-pushes fp and the return PC.
+        restoreReturnAddressBeforeReturn(Address(framePointerRegister, CallFrame::returnPCOffset()));
+        subPtr(TrustedImm32(2 * sizeof(void*)), newFrameSizeGPR);
 #else
         UNREACHABLE_FOR_PLATFORM();
 #endif

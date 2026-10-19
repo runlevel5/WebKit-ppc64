@@ -3007,10 +3007,25 @@ private:
         return true;
     }
 
+#if CPU(PPC64)
+    // A PPC64 FPR holds a float in double format, so stfd/lfd and stfs/lfs use
+    // different memory encodings. defWidth() is 64 for any non-ZDef def, but
+    // every reader of a Float in memory uses the 4-byte encoding, so spill FP
+    // tmps by their use width.
+    Width spillWidthForFP(Tmp tmp)
+    {
+        return std::max(m_tmpWidth.useWidth(tmp), Width32);
+    }
+#endif
+
     Opcode moveOpcode(Tmp tmp)
     {
         Opcode move = Oops;
         Width width = m_tmpWidth.requiredWidth(tmp);
+#if CPU(PPC64)
+        if (tmp.bank() == FP)
+            width = spillWidthForFP(tmp);
+#endif
         switch (stackSlotMinimumWidth(width)) {
         case 4:
             move = tmp.bank() == GP ? Move32 : MoveFloat;
@@ -3045,6 +3060,25 @@ private:
             }
             ASSERT(spillSlot<bank>(tmp));
         });
+#if CPU(PPC64)
+        // FP spill slots that some instruction reads. The width rule below only
+        // protects readers; a slot nothing reads (say the slot of a dead result
+        // of a call returning many values) may be written in place at any width,
+        // and must be, or every such result needs a register at the same time.
+        UncheckedKeyHashSet<StackSlot*> fpSlotsRead;
+        if constexpr (bank == FP) {
+            for (BasicBlock* block : m_code) {
+                for (Inst& inst : *block) {
+                    inst.forEachArg([&] (Arg& arg, Arg::Role role, Bank argBank, Width) {
+                        if (argBank != FP || !arg.isTmp() || arg.isReg() || !Arg::isAnyUse(role))
+                            return;
+                        if (StackSlot* slot = spillSlot<bank>(arg.tmp()))
+                            fpSlotsRead.add(slot);
+                    });
+                }
+            }
+        }
+#endif
         for (BasicBlock* block : m_code) {
             Point positionOfHead = this->positionOfHead(block);
             for (unsigned instIndex = 0; instIndex < block->size(); ++instIndex) {
@@ -3134,6 +3168,15 @@ private:
                         }
 
                         Arg spilledArg = Arg::stack(spilled);
+#if CPU(PPC64)
+                        // On PPC64 an FP spill slot may only be accessed at
+                        // its tmp's spill width (see above); an access at the
+                        // other width goes through a register.
+                        if (bank == FP && fpSlotsRead.contains(spilled) && bytesForWidth(width) != stackSlotMinimumWidth(spillWidthForFP(arg.tmp()))) {
+                            m_stats[bank].numInPlaceSpillGiveUpSpillWidth++;
+                            return;
+                        }
+#endif
                         if (Arg::isZDef(role) && bytesForWidth(width) < spilled->byteSize()) {
                             // ZDef32 to 64 slot would require two 32-bit accesses (second one for zero extend), so
                             // usually it will be better to ZDef into a register and then storePtr the register.

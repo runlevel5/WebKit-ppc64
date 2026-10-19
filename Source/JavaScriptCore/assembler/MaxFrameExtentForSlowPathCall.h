@@ -46,6 +46,13 @@ static constexpr size_t maxFrameExtentForSlowPathCall = 0;
 // All args in registers.
 static constexpr size_t maxFrameExtentForSlowPathCall = 0;
 
+#elif CPU(PPC64)
+// An ELFv2 callee writes its CR/LR/TOC saves into the caller's 32-byte linkage
+// area at sp, and a variadic callee may store its register arguments into the
+// 64-byte parameter save area above it. A call that passes arguments in memory
+// needs more; CCallHelpers::setupArguments static_asserts that every operation fits.
+static constexpr size_t maxFrameExtentForSlowPathCall = 96;
+
 #elif CPU(ARM)
 // First four args in registers, remaining 4 args on stack.
 static constexpr size_t maxFrameExtentForSlowPathCall = 24;
