@@ -201,8 +201,32 @@ int32's payload, the low word of a pointer-sized field, a `Move32` spill into an
 - Yarr: surrogate-pair loads are 32-bit pairs of UTF-16 code units — `rotateRight32(16)` after the
   load; multi-character compares (`maxCharactersAtOnce = 1`) and SIMD searches are off on BE.
 - Uint8Array hex encode/decode lane shifts and the DataView stress tests assumed an LE host.
-- Off on BE: WebAssembly (compiled in, `canUseWasm()` false — IPInt/BBQ/OMG memory accesses and
-  SIMD lane order would need byte reversal), Yarr multi-character compares and SIMD searches.
+- WebAssembly runs on BE in every tier. Two rules carry it: wasm memory is little-endian, so every
+  access wider than a byte byte-reverses — offlineasm `load*le`/`store*le`/`bswap*` under
+  `if BIG_ENDIAN` (ppc64 lowers them to `l*brx`/`st*brx`, r0 and the red zone as scratch), the
+  `*LittleEndian` helpers in MacroAssemblerPPC64 for BBQ, patchpoints in OMG (B3 has no
+  byte-reversed memory ops), LL/SC and CAS loops swapping around the operation; and a 32-bit value
+  lives at `PayloadOffset` (+4) of its 8-byte frame slot everywhere — IPInt pushes whole words, BBQ
+  gives i32/f32 8-byte slots on BE (its 4-byte slots put a payload on a saved callee-save), the
+  `IPIntStackEntry`/`IPIntLocal` unions pad i32/f32, OMG and Air address the payload half of
+  stack-passed and global 32-bit values, the entry thunks already did. Module data is
+  little-endian by format: header version, f32/f64 constants, `memory.atomic.wait` operands,
+  data-segment copies into i16/i32/i64 arrays. Two LE-invisible bugs fell out: the JS→wasm call
+  stub stored the boxed callee pointer at `slot + PayloadOffset`, and the frame builder wrote
+  converted i32/f32 arguments as 4 bytes at the slot start. SIMD stays off on BE (v128 lane order
+  is not reversed). Test aid: wabt needs a working wasm, so compile WAT on power10 and ship the
+  bytes (`/tmp/gen.js` → JSON → `/tmp/be-ops.js`). IPInt pushes an int32 zero-extended (ELFv2
+  returns it sign-extended), so 64-bit results (`ref.cast`, memory64 `memory.grow`) push whole
+  words. Gate (`wasm.yaml`, `--memory-limited`): 15,313 pass / 766 fail, all expected — 567
+  SIMD-named variants, and 199 that are BE-divergent by design: tests reading wasm memory through
+  JS typed arrays or DataView (host order: context-switch, grow-memory-2, load-offset,
+  memory-reuse, trap-from-start*, test_memory, memory_copy_shared, simple-inline-stacktrace*, v8
+  import-memory/instance-gc/instantiate-module-basic), modules that need SIMD
+  (tail-call-should-not-clobber-caller-origin, omg-tail-call-clobber-scratch-register,
+  ipint-multimem-oob), and `wasm-slow-memory` variants of wabt-using tests, whose emscripten glue
+  writes `environ_sizes_get` through `HEAPU32` in host order; wasm reads a huge size, grows its
+  memory to ~2 GB, and slow memory's zeroed malloc makes that resident past the 2 GB limit.
+- Off on BE: Yarr multi-character compares and SIMD searches.
 - Debugging: `--dumpFTLDisassembly=true` prints per-Air-instruction address ranges without a
   disassembler, usable with gdb `x/Ni`; `--collectContinuously=true` makes heap corruption
   deterministic. Release `RELEASE_ASSERT`s fold into one `abort()` block per function, so a -g1 line
