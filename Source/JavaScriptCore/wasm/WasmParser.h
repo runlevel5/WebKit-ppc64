@@ -40,6 +40,7 @@
 #include "WasmTypeSectionState.h"
 #include "Width.h"
 #include <type_traits>
+#include <wtf/FlipBytes.h>
 #include <wtf/Expected.h>
 #include <wtf/LEBDecoder.h>
 #include <wtf/StdLibExtras.h>
@@ -218,6 +219,9 @@ ALWAYS_INLINE bool ParserBase::parseUInt32(uint32_t& result)
     if (m_source.size() < m_offset + 4)
         return false;
     memcpy(&result, m_source.data() + m_offset, sizeof(uint32_t)); // src can be unaligned
+#if CPU(BIG_ENDIAN)
+    result = flipBytes(result);
+#endif
     m_offset += 4;
     return true;
 }
@@ -227,6 +231,9 @@ ALWAYS_INLINE bool ParserBase::parseUInt64(uint64_t& result)
     if (m_source.size() < m_offset + 8)
         return false;
     memcpy(&result, m_source.data() + m_offset, sizeof(uint64_t)); // src can be unaligned
+#if CPU(BIG_ENDIAN)
+    result = flipBytes(result);
+#endif
     m_offset += 8;
     return true;
 }

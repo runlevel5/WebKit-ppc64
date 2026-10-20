@@ -621,8 +621,10 @@ $isFTLPlatform = !($architecture == "x86" || $architecture == "mips" || $archite
 # Special case windows, we want to run the wasm tests temporarily without B3/Air support
 $isWasmPlatform = (not $cloop) && $jitTests && ($isFTLPlatform || ($hostOS == "windows" && $architecture == "x86_64"))
 $isOMGPlatform = $isFTLPlatform
-# "powerpc64" is the ELF machine of ppc64, the only PowerPC build with wasm JITs.
-$isSIMDPlatform = $isWasmPlatform && ($architecture == "arm64" || $architecture == "x86_64" || $architecture == "powerpc64")
+# "powerpc64" is the ELF machine of ppc64, the only PowerPC build with wasm JITs; its
+# big-endian builds run wasm without SIMD.
+$isBigEndianHost = [1].pack("S").unpack("C").first.zero?
+$isSIMDPlatform = $isWasmPlatform && ($architecture == "arm64" || $architecture == "x86_64" || ($architecture == "powerpc64" && !$isBigEndianHost))
 
 $skipLockdown = false
 $skipMiniMode = false

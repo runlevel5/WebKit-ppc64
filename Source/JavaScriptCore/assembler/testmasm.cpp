@@ -6206,6 +6206,51 @@ void testMove64BitImmediates()
     }
 }
 
+#if CPU(PPC64) && CPU(BIG_ENDIAN)
+// The little-endian float and double stores resolve the address before moving
+// the data, since a BaseIndex with a displacement outside 16 bits resolves
+// through the register the data then travels in.
+void testFloatingPointLittleEndianBaseIndexLargeOffset()
+{
+    constexpr int32_t offset = 0x12340;
+    static uint8_t buffer[offset + 64];
+    auto storeBoth = compile([] (CCallHelpers& jit) {
+        emitFunctionPrologue(jit);
+        jit.loadDouble(CCallHelpers::Address(GPRInfo::argumentGPR0), FPRInfo::fpRegT0);
+        jit.loadFloat(CCallHelpers::Address(GPRInfo::argumentGPR0, 8), FPRInfo::fpRegT1);
+        jit.storeDoubleLittleEndian(FPRInfo::fpRegT0, CCallHelpers::BaseIndex(GPRInfo::argumentGPR1, GPRInfo::argumentGPR2, CCallHelpers::TimesOne, offset));
+        jit.storeFloatLittleEndian(FPRInfo::fpRegT1, CCallHelpers::BaseIndex(GPRInfo::argumentGPR1, GPRInfo::argumentGPR2, CCallHelpers::TimesOne, offset + 8));
+        emitFunctionEpilogue(jit);
+        jit.ret();
+    });
+    auto loadBoth = compile([] (CCallHelpers& jit) {
+        emitFunctionPrologue(jit);
+        jit.loadDoubleLittleEndian(CCallHelpers::BaseIndex(GPRInfo::argumentGPR1, GPRInfo::argumentGPR2, CCallHelpers::TimesOne, offset), FPRInfo::fpRegT0);
+        jit.loadFloatLittleEndian(CCallHelpers::BaseIndex(GPRInfo::argumentGPR1, GPRInfo::argumentGPR2, CCallHelpers::TimesOne, offset + 8), FPRInfo::fpRegT1);
+        jit.storeDouble(FPRInfo::fpRegT0, CCallHelpers::Address(GPRInfo::argumentGPR0));
+        jit.storeFloat(FPRInfo::fpRegT1, CCallHelpers::Address(GPRInfo::argumentGPR0, 8));
+        emitFunctionEpilogue(jit);
+        jit.ret();
+    });
+    struct { double d; float f; uint32_t pad; } values = { -1234.5678e-12, 3.14159f, 0 }, back = { 0, 0, 0 };
+    memset(buffer, 0xee, sizeof(buffer));
+    invoke<void>(storeBoth, &values, buffer, static_cast<int64_t>(16));
+    uint64_t doubleBits, doubleStored;
+    uint32_t floatBits, floatStored;
+    memcpy(&doubleBits, &values.d, 8);
+    memcpy(&floatBits, &values.f, 4);
+    memcpy(&doubleStored, buffer + offset + 16, 8);
+    memcpy(&floatStored, buffer + offset + 16 + 8, 4);
+    CHECK_EQ(doubleStored, __builtin_bswap64(doubleBits));
+    CHECK_EQ(floatStored, __builtin_bswap32(floatBits));
+    CHECK_EQ(buffer[offset + 15], 0xee);
+    CHECK_EQ(buffer[offset + 16 + 12], 0xee);
+    invoke<void>(loadBoth, &back, buffer, static_cast<int64_t>(16));
+    CHECK_EQ(back.d, values.d);
+    CHECK_EQ(back.f, values.f);
+}
+#endif
+
 // GPR selects on integer compares and tests, with every aliasing of the destination
 // against the then and else inputs, in both the two- and three-operand forms.
 void testMoveConditionally32And64()
@@ -10026,6 +10071,9 @@ void run(const char* filter) WTF_IGNORES_THREAD_SAFETY_ANALYSIS
     RUN(testTest32AllOnesMask());
     RUN(testOr32ImmediateWithDistinctDestination());
     RUN(testMove64BitImmediates());
+#if CPU(PPC64) && CPU(BIG_ENDIAN)
+    RUN(testFloatingPointLittleEndianBaseIndexLargeOffset());
+#endif
     RUN(testMove32ToFloatAndBack());
     RUN(testFloatBitwiseOps());
     RUN(testAndOrDouble());

@@ -615,7 +615,15 @@ private:
 
 public:
     static constexpr ptrdiff_t offsetOfLength() { return OBJECT_OFFSETOF(JSRopeString, m_compactFibers) + CompactFibers::offsetOfLength(); } // 32byte width.
-    static constexpr ptrdiff_t offsetOfFlags() { return offsetOfValue(); }
+    // The flags share the fiber word; 32-bit readers want its low half.
+    static constexpr ptrdiff_t offsetOfFlags()
+    {
+#if CPU(BIG_ENDIAN)
+        return offsetOfValue() + sizeof(uintptr_t) - sizeof(uint32_t);
+#else
+        return offsetOfValue();
+#endif
+    }
     static constexpr ptrdiff_t offsetOfFiber0() { return offsetOfValue(); }
     static constexpr ptrdiff_t offsetOfFiber1() { return OBJECT_OFFSETOF(JSRopeString, m_compactFibers) + CompactFibers::offsetOfFiber1(); }
     static constexpr ptrdiff_t offsetOfFiber2() { return OBJECT_OFFSETOF(JSRopeString, m_compactFibers) + CompactFibers::offsetOfFiber2(); }
