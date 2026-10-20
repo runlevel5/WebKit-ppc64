@@ -118,19 +118,29 @@ SI float reciprocal_alpha(float a) {
 }
 #endif
 
+// The portable swizzles address a pixel's bytes 0..3 by shifting a uint32_t, which reads the
+// pixel as a little-endian word. Byte-swap on big-endian so the shifts address the same bytes.
+SI uint32_t pixel_le32(uint32_t pixel) {
+#ifdef SK_CPU_BENDIAN
+    return __builtin_bswap32(pixel);
+#else
+    return pixel;
+#endif
+}
+
 static void RGBA_to_rgbA_portable(uint32_t* dst, const uint32_t* src, int count) {
     for (int i = 0; i < count; i++) {
-        uint8_t a = (src[i] >> 24) & 0xFF,
-                b = (src[i] >> 16) & 0xFF,
-                g = (src[i] >>  8) & 0xFF,
-                r = (src[i] >>  0) & 0xFF;
+        uint8_t a = (pixel_le32(src[i]) >> 24) & 0xFF,
+                b = (pixel_le32(src[i]) >> 16) & 0xFF,
+                g = (pixel_le32(src[i]) >>  8) & 0xFF,
+                r = (pixel_le32(src[i]) >>  0) & 0xFF;
         b = (b*a+127)/255;
         g = (g*a+127)/255;
         r = (r*a+127)/255;
-        dst[i] = (uint32_t)a << 24
+        dst[i] = pixel_le32((uint32_t)a << 24
                | (uint32_t)b << 16
                | (uint32_t)g <<  8
-               | (uint32_t)r <<  0;
+               | (uint32_t)r <<  0);
     }
 }
 
@@ -204,56 +214,56 @@ SI uint32_t rgbA_to_CCCA(float c00, float c08, float c16, float a) {
 
 static void rgbA_to_RGBA_portable(uint32_t* dst, const uint32_t* src, int count) {
     for (int i = 0; i < count; i++) {
-        const uint32_t p = src[i];
+        const uint32_t p = pixel_le32(src[i]);
 
         const float a = (p >> 24) & 0xFF,
                     b = (p >> 16) & 0xFF,
                     g = (p >>  8) & 0xFF,
                     r = (p >>  0) & 0xFF;
 
-        dst[i] = rgbA_to_CCCA(r, g, b, a);
+        dst[i] = pixel_le32(rgbA_to_CCCA(r, g, b, a));
     }
 }
 
 static void rgbA_to_BGRA_portable(uint32_t* dst, const uint32_t* src, int count) {
     for (int i = 0; i < count; i++) {
-        const uint32_t p = src[i];
+        const uint32_t p = pixel_le32(src[i]);
 
         const uint32_t a = (p >> 24) & 0xFF,
                        b = (p >> 16) & 0xFF,
                        g = (p >>  8) & 0xFF,
                        r = (p >>  0) & 0xFF;
 
-        dst[i] = rgbA_to_CCCA(b, g, r, a);
+        dst[i] = pixel_le32(rgbA_to_CCCA(b, g, r, a));
     }
 }
 
 static void RGBA_to_bgrA_portable(uint32_t* dst, const uint32_t* src, int count) {
     for (int i = 0; i < count; i++) {
-        uint8_t a = (src[i] >> 24) & 0xFF,
-                b = (src[i] >> 16) & 0xFF,
-                g = (src[i] >>  8) & 0xFF,
-                r = (src[i] >>  0) & 0xFF;
+        uint8_t a = (pixel_le32(src[i]) >> 24) & 0xFF,
+                b = (pixel_le32(src[i]) >> 16) & 0xFF,
+                g = (pixel_le32(src[i]) >>  8) & 0xFF,
+                r = (pixel_le32(src[i]) >>  0) & 0xFF;
         b = (b*a+127)/255;
         g = (g*a+127)/255;
         r = (r*a+127)/255;
-        dst[i] = (uint32_t)a << 24
+        dst[i] = pixel_le32((uint32_t)a << 24
                | (uint32_t)r << 16
                | (uint32_t)g <<  8
-               | (uint32_t)b <<  0;
+               | (uint32_t)b <<  0);
     }
 }
 
 static void RGBA_to_BGRA_portable(uint32_t* dst, const uint32_t* src, int count) {
     for (int i = 0; i < count; i++) {
-        uint8_t a = (src[i] >> 24) & 0xFF,
-                b = (src[i] >> 16) & 0xFF,
-                g = (src[i] >>  8) & 0xFF,
-                r = (src[i] >>  0) & 0xFF;
-        dst[i] = (uint32_t)a << 24
+        uint8_t a = (pixel_le32(src[i]) >> 24) & 0xFF,
+                b = (pixel_le32(src[i]) >> 16) & 0xFF,
+                g = (pixel_le32(src[i]) >>  8) & 0xFF,
+                r = (pixel_le32(src[i]) >>  0) & 0xFF;
+        dst[i] = pixel_le32((uint32_t)a << 24
                | (uint32_t)r << 16
                | (uint32_t)g <<  8
-               | (uint32_t)b <<  0;
+               | (uint32_t)b <<  0);
     }
 }
 
@@ -262,10 +272,10 @@ static void grayA_to_RGBA_portable(uint32_t dst[], const uint8_t* src, int count
         uint8_t g = src[0],
                 a = src[1];
         src += 2;
-        dst[i] = (uint32_t)a << 24
+        dst[i] = pixel_le32((uint32_t)a << 24
                | (uint32_t)g << 16
                | (uint32_t)g <<  8
-               | (uint32_t)g <<  0;
+               | (uint32_t)g <<  0);
     }
 }
 
@@ -275,43 +285,43 @@ static void grayA_to_rgbA_portable(uint32_t dst[], const uint8_t* src, int count
                 a = src[1];
         src += 2;
         g = (g*a+127)/255;
-        dst[i] = (uint32_t)a << 24
+        dst[i] = pixel_le32((uint32_t)a << 24
                | (uint32_t)g << 16
                | (uint32_t)g <<  8
-               | (uint32_t)g <<  0;
+               | (uint32_t)g <<  0);
     }
 }
 
 static void inverted_CMYK_to_RGB1_portable(uint32_t* dst, const uint32_t* src, int count) {
     for (int i = 0; i < count; i++) {
-        uint8_t k = (src[i] >> 24) & 0xFF,
-                y = (src[i] >> 16) & 0xFF,
-                m = (src[i] >>  8) & 0xFF,
-                c = (src[i] >>  0) & 0xFF;
+        uint8_t k = (pixel_le32(src[i]) >> 24) & 0xFF,
+                y = (pixel_le32(src[i]) >> 16) & 0xFF,
+                m = (pixel_le32(src[i]) >>  8) & 0xFF,
+                c = (pixel_le32(src[i]) >>  0) & 0xFF;
         // See comments in SkSwizzler.cpp for details on the conversion formula.
         uint8_t b = (y*k+127)/255,
                 g = (m*k+127)/255,
                 r = (c*k+127)/255;
-        dst[i] = (uint32_t)0xFF << 24
+        dst[i] = pixel_le32((uint32_t)0xFF << 24
                | (uint32_t)   b << 16
                | (uint32_t)   g <<  8
-               | (uint32_t)   r <<  0;
+               | (uint32_t)   r <<  0);
     }
 }
 
 static void inverted_CMYK_to_BGR1_portable(uint32_t* dst, const uint32_t* src, int count) {
     for (int i = 0; i < count; i++) {
-        uint8_t k = (src[i] >> 24) & 0xFF,
-                y = (src[i] >> 16) & 0xFF,
-                m = (src[i] >>  8) & 0xFF,
-                c = (src[i] >>  0) & 0xFF;
+        uint8_t k = (pixel_le32(src[i]) >> 24) & 0xFF,
+                y = (pixel_le32(src[i]) >> 16) & 0xFF,
+                m = (pixel_le32(src[i]) >>  8) & 0xFF,
+                c = (pixel_le32(src[i]) >>  0) & 0xFF;
         uint8_t b = (y*k+127)/255,
                 g = (m*k+127)/255,
                 r = (c*k+127)/255;
-        dst[i] = (uint32_t)0xFF << 24
+        dst[i] = pixel_le32((uint32_t)0xFF << 24
                | (uint32_t)   r << 16
                | (uint32_t)   g <<  8
-               | (uint32_t)   b <<  0;
+               | (uint32_t)   b <<  0);
     }
 }
 

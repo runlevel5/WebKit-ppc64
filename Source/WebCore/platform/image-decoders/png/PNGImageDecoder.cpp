@@ -558,7 +558,7 @@ void PNGImageDecoder::rowAvailable(unsigned char* rowBuffer, unsigned rowIndex, 
         }
     } else {
         for (int x = 0; x < width; ++x, pixel += 3, address = address.subspan(1))
-            address[0] = 0xFF000000 | pixel[0] << 16 | pixel[1] << 8 | pixel[2];
+            buffer.backingStore()->setPixel(address[0], pixel[0], pixel[1], pixel[2], 255);
     }
 
 #if USE(LCMS)
