@@ -4721,7 +4721,7 @@ void InlineCacheCompiler::emitIntrinsicGetter(IntrinsicGetterAccessCase& accessC
         jit.move(CCallHelpers::TrustedImm32(0), valueGPR);
         auto nullCase = jit.branchTestPtr(CCallHelpers::Zero, scratchGPR);
         // offsetOfAliveEntryCount() is the same for both JSSet::Helper and JSMap::Helper.
-        jit.load32(CCallHelpers::Address(scratchGPR, JSSet::Helper::offsetOfAliveEntryCount()), valueGPR);
+        jit.load32(CCallHelpers::Address(scratchGPR, JSSet::Helper::offsetOfAliveEntryCount() + PayloadOffset), valueGPR);
         nullCase.link(&jit);
         jit.boxInt32(valueGPR, valueRegs);
         succeed();

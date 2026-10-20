@@ -10887,7 +10887,7 @@ IGNORE_CLANG_WARNINGS_END
             // Check deletedEntryCount == 0.
             m_out.appendTo(deletedCheck, sizeCheck);
             LValue length = unboxInt32(aliveEntryCountValue);
-            LValue deletedCount = m_out.load32(m_out.baseIndex(m_heaps.indexedContiguousProperties, storageButterfly, m_out.constIntPtr(Helper::deletedEntryCountIndex())));
+            LValue deletedCount = m_out.load32(m_out.baseIndex(m_heaps.indexedContiguousProperties, storageButterfly, m_out.constIntPtr(Helper::deletedEntryCountIndex()), JSValue(), PayloadOffset));
             m_out.branch(m_out.isZero32(deletedCount), usually(sizeCheck), rarely(slowPath));
 
             // Check length <= MAX_STORAGE_VECTOR_LENGTH.
@@ -10907,7 +10907,7 @@ IGNORE_CLANG_WARNINGS_END
             ValueFromBlock fastResult = m_out.anchor(fastAllocation);
 
             // Compute dataTableStartIndex = hashTableStartIndex + capacity.
-            LValue capacity = m_out.load32(m_out.baseIndex(m_heaps.indexedContiguousProperties, storageButterfly, m_out.constIntPtr(Helper::capacityIndex())));
+            LValue capacity = m_out.load32(m_out.baseIndex(m_heaps.indexedContiguousProperties, storageButterfly, m_out.constIntPtr(Helper::capacityIndex()), JSValue(), PayloadOffset));
             LValue dataTableStart = m_out.add(m_out.constInt32(Helper::hashTableStartIndex()), capacity);
 
             ValueFromBlock startIndex = m_out.anchor(m_out.constIntPtr(0));
@@ -11836,13 +11836,8 @@ IGNORE_CLANG_WARNINGS_END
                 m_out.bitOr(kids[0], m_out.constIntPtr(JSString::isRopeInPointer)),
                 m_out.bitAnd(m_out.constIntPtr(JSRopeString::is8BitInPointer), m_out.zeroExtPtr(flagsAndLength.flags))),
             result, m_heaps.JSRopeString_fiber0);
-        m_out.storePtr(
-            m_out.bitOr(m_out.zeroExtPtr(flagsAndLength.length), m_out.shl(kids[1], m_out.constInt32(32))),
-            result, m_heaps.JSRopeString_fiber1);
-        if (numKids == 2)
-            m_out.storePtr(m_out.lShr(kids[1], m_out.constInt32(32)), result, m_heaps.JSRopeString_fiber2);
-        else
-            m_out.storePtr(m_out.bitOr(m_out.lShr(kids[1], m_out.constInt32(32)), m_out.shl(kids[2], m_out.constInt32(16))), result, m_heaps.JSRopeString_fiber2);
+        m_out.storePtr(ropeFiber1Word(flagsAndLength.length, kids[1]), result, m_heaps.JSRopeString_fiber1);
+        m_out.storePtr(ropeFiber2Word(kids[1], numKids == 2 ? nullptr : kids[2]), result, m_heaps.JSRopeString_fiber2);
 
         mutatorFence();
         ValueFromBlock fastResult = m_out.anchor(result);
@@ -12597,9 +12592,15 @@ IGNORE_CLANG_WARNINGS_END
         // Encode the search bytes as little-endian immediates so the comparison is a few
         // wide loads + compares, with overlap when searchLength isn't a power of two.
         auto chunk = [&](unsigned offset, unsigned width) -> uint64_t {
+            // The characters as the word a load of them yields on this host.
             uint64_t value = 0;
-            for (unsigned i = 0; i < width; ++i)
+            for (unsigned i = 0; i < width; ++i) {
+#if CPU(BIG_ENDIAN)
+                value |= static_cast<uint64_t>(search[offset + i]) << ((width - 1 - i) * 8);
+#else
                 value |= static_cast<uint64_t>(search[offset + i]) << (i * 8);
+#endif
+            }
             return value;
         };
         auto loadAt = [&](unsigned offset, unsigned width) -> LValue {
@@ -13083,7 +13084,7 @@ IGNORE_CLANG_WARNINGS_END
     void compileSetCallee()
     {
         auto callee = lowCell(m_node->child1());
-        m_out.storePtr(callee, payloadFor(VirtualRegister(CallFrameSlot::callee)));
+        m_out.storePtr(callee, addressFor(VirtualRegister(CallFrameSlot::callee)));
     }
 
     void compileGetArgumentCountIncludingThis()
@@ -15001,7 +15002,7 @@ IGNORE_CLANG_WARNINGS_END
             switch (type.kind) {
             case Wasm::TypeKind::I32:
                 if (isStack)
-                    arguments.append(ConstrainedValue(lowInt32(m_graph.varArgChild(node, 2 + i)), ValueRep::stackArgument(safeCast<int32_t>(wasmCallInfo.params[i].location.offsetFromSP()))));
+                    arguments.append(ConstrainedValue(lowInt32(m_graph.varArgChild(node, 2 + i)), ValueRep::stackArgument(safeCast<int32_t>(wasmCallInfo.params[i].location.offsetFromSP() + PayloadOffset))));
                 else
                     arguments.append(ConstrainedValue(m_out.zeroExtPtr(lowInt32(m_graph.varArgChild(node, 2 + i))), ValueRep::reg(wasmCallInfo.params[i].location.jsr().payloadGPR())));
                 break;
@@ -15035,7 +15036,7 @@ IGNORE_CLANG_WARNINGS_END
                 break;
             case Wasm::TypeKind::F32:
                 if (isStack)
-                    arguments.append(ConstrainedValue(m_out.doubleToFloat(lowDouble(m_graph.varArgChild(node, 2 + i))), ValueRep::stackArgument(safeCast<Value::OffsetType>(wasmCallInfo.params[i].location.offsetFromSP()))));
+                    arguments.append(ConstrainedValue(m_out.doubleToFloat(lowDouble(m_graph.varArgChild(node, 2 + i))), ValueRep::stackArgument(safeCast<Value::OffsetType>(wasmCallInfo.params[i].location.offsetFromSP() + PayloadOffset))));
                 else
                     arguments.append(ConstrainedValue(m_out.doubleToFloat(lowDouble(m_graph.varArgChild(node, 2 + i))), ValueRep::reg(wasmCallInfo.params[i].location.fpr())));
                 break;
@@ -16468,7 +16469,7 @@ IGNORE_CLANG_WARNINGS_END
         // Compute the bucketCount = Capacity and bucketIndex = hashTableStartIndex + (hash & bucketCount - 1).
         LBasicBlock lastNext = m_out.appendTo(indexSetUp, loopStart);
         LValue mapStorageData = toButterfly(mapStorage);
-        LValue bucketCount = m_out.load32(m_out.baseIndex(m_heaps.indexedContiguousProperties, mapStorageData, m_out.constIntPtr(MapOrSet::Helper::capacityIndex())));
+        LValue bucketCount = m_out.load32(m_out.baseIndex(m_heaps.indexedContiguousProperties, mapStorageData, m_out.constIntPtr(MapOrSet::Helper::capacityIndex()), JSValue(), PayloadOffset));
         LValue bucketIndex = m_out.add(m_out.constInt32(MapOrSet::Helper::hashTableStartIndex()), m_out.bitAnd(hash, m_out.sub(bucketCount, m_out.int32One)));
 
         // Get the entryKeyIndex JSValue.
@@ -16784,7 +16785,7 @@ IGNORE_CLANG_WARNINGS_END
 
         // Fast path: iterate through entries to find next non-deleted entry
         m_out.appendTo(fastPath, loop);
-        LValue bucketCount = m_out.load32(m_out.baseIndex(m_heaps.indexedContiguousProperties, butterfly, m_out.constIntPtr(isMapIterator ? JSMap::Helper::capacityIndex() : JSSet::Helper::capacityIndex())));
+        LValue bucketCount = m_out.load32(m_out.baseIndex(m_heaps.indexedContiguousProperties, butterfly, m_out.constIntPtr(isMapIterator ? JSMap::Helper::capacityIndex() : JSSet::Helper::capacityIndex()), JSValue(), PayloadOffset));
         LValue dataTableStartIndex = m_out.add(m_out.constInt32(isMapIterator ? JSMap::Helper::hashTableStartIndex() : JSSet::Helper::hashTableStartIndex()), bucketCount);
         LValue entrySize = m_out.constIntPtr(isMapIterator ? JSMap::Helper::EntrySize : JSSet::Helper::EntrySize);
 
@@ -16843,7 +16844,7 @@ IGNORE_CLANG_WARNINGS_END
         LValue entry = lowInt32(m_node->child2());
 
         LValue butterfly = toButterfly(storage);
-        LValue bucketCount = m_out.load32(m_out.baseIndex(m_heaps.indexedContiguousProperties, butterfly, m_out.constIntPtr(isMapIterator ? JSMap::Helper::capacityIndex() : JSSet::Helper::capacityIndex())));
+        LValue bucketCount = m_out.load32(m_out.baseIndex(m_heaps.indexedContiguousProperties, butterfly, m_out.constIntPtr(isMapIterator ? JSMap::Helper::capacityIndex() : JSSet::Helper::capacityIndex()), JSValue(), PayloadOffset));
 
         LValue multiplied;
         int32_t entrySize;
@@ -16871,7 +16872,7 @@ IGNORE_CLANG_WARNINGS_END
         LValue entry = lowInt32(m_node->child2());
 
         LValue butterfly = toButterfly(storage);
-        LValue bucketCount = m_out.load32(m_out.baseIndex(m_heaps.indexedContiguousProperties, butterfly, m_out.constIntPtr(JSMap::Helper::capacityIndex())));
+        LValue bucketCount = m_out.load32(m_out.baseIndex(m_heaps.indexedContiguousProperties, butterfly, m_out.constIntPtr(JSMap::Helper::capacityIndex()), JSValue(), PayloadOffset));
 
         static_assert(JSMap::Helper::EntrySize == 3);
         LValue multiplied = m_out.add(entry, m_out.shl(entry, m_out.constInt32(1)));
@@ -16911,7 +16912,7 @@ IGNORE_CLANG_WARNINGS_END
         LValue butterfly = toButterfly(storage);
         // aliveEntryCountIndex() is the same for both JSSet::Helper and JSMap::Helper.
         LValue size = m_out.load32(m_out.baseIndex(m_heaps.indexedContiguousProperties, butterfly,
-            m_out.constIntPtr(JSSet::Helper::aliveEntryCountIndex())));
+            m_out.constIntPtr(JSSet::Helper::aliveEntryCountIndex()), JSValue(), PayloadOffset));
         ValueFromBlock hasStorageResult = m_out.anchor(size);
         m_out.jump(continuation);
 
@@ -19940,7 +19941,7 @@ IGNORE_CLANG_WARNINGS_END
 
         m_out.storePtr(m_callFrame, packet, m_heaps.ShadowChicken_Packet_frame);
         m_out.storePtr(m_out.loadPtr(addressFor(VirtualRegister(0))), packet, m_heaps.ShadowChicken_Packet_callerFrame);
-        m_out.storePtr(m_out.loadPtr(payloadFor(VirtualRegister(CallFrameSlot::callee))), packet, m_heaps.ShadowChicken_Packet_callee);
+        m_out.storePtr(m_out.loadPtr(addressFor(VirtualRegister(CallFrameSlot::callee))), packet, m_heaps.ShadowChicken_Packet_callee);
         m_out.storePtr(scope, packet, m_heaps.ShadowChicken_Packet_scope);
     }
 
@@ -20731,8 +20732,8 @@ IGNORE_CLANG_WARNINGS_END
         LValue rope = allocateCell(m_out.constIntPtr(allocator.localAllocator()), vm().stringStructure.get(), substringRopeSlowAlloc);
         LValue baseIs8BitFlag = m_out.bitAnd(m_out.load32(stringImpl, m_heaps.StringImpl_hashAndFlags), m_out.constInt32(StringImpl::flagIs8Bit()));
         m_out.storePtr(m_out.bitOr(m_out.constIntPtr(JSString::isRopeInPointer | JSRopeString::isSubstringInPointer), m_out.zeroExtPtr(baseIs8BitFlag)), rope, m_heaps.JSRopeString_fiber0);
-        m_out.storePtr(m_out.bitOr(m_out.zeroExtPtr(span), m_out.shl(string, m_out.constInt32(32))), rope, m_heaps.JSRopeString_fiber1);
-        m_out.storePtr(m_out.bitOr(m_out.lShr(string, m_out.constInt32(32)), m_out.shl(m_out.zeroExtPtr(from), m_out.constInt32(16))), rope, m_heaps.JSRopeString_fiber2);
+        m_out.storePtr(ropeFiber1Word(span, string), rope, m_heaps.JSRopeString_fiber1);
+        m_out.storePtr(ropeFiber2Word(string, m_out.zeroExtPtr(from)), rope, m_heaps.JSRopeString_fiber2);
         mutatorFence();
         results.append(m_out.anchor(rope));
         m_out.jump(continuation);
@@ -21449,6 +21450,17 @@ IGNORE_CLANG_WARNINGS_END
 
         DataViewData data = m_node->dataViewData();
 
+        // The accesses below are in the host's byte order and swap for the other one, so on a
+        // big-endian host the "little-endian" cases are the ones that swap.
+#if CPU(BIG_ENDIAN)
+        if (data.isLittleEndian == TriState::True)
+            data.isLittleEndian = TriState::False;
+        else if (data.isLittleEndian == TriState::False)
+            data.isLittleEndian = TriState::True;
+        if (isLittleEndian)
+            isLittleEndian = m_out.bitXor(isLittleEndian, m_out.int32One);
+#endif
+
         LValue length = typedArrayLength(dataView, data.isResizable, TypeDataView, m_node->child1());
 
 #if USE(LARGE_TYPED_ARRAYS)
@@ -21643,6 +21655,17 @@ IGNORE_CLANG_WARNINGS_END
             isLittleEndian = lowBoolean(m_graph.varArgChild(m_node, 3));
 
         DataViewData data = m_node->dataViewData();
+
+        // The accesses below are in the host's byte order and swap for the other one, so on a
+        // big-endian host the "little-endian" cases are the ones that swap.
+#if CPU(BIG_ENDIAN)
+        if (data.isLittleEndian == TriState::True)
+            data.isLittleEndian = TriState::False;
+        else if (data.isLittleEndian == TriState::False)
+            data.isLittleEndian = TriState::True;
+        if (isLittleEndian)
+            isLittleEndian = m_out.bitXor(isLittleEndian, m_out.int32One);
+#endif
 
         LValue length = typedArrayLength(dataView, data.isResizable, TypeDataView, m_graph.varArgChild(m_node, 0));
 
@@ -22721,6 +22744,34 @@ IGNORE_CLANG_WARNINGS_END
 
         m_out.appendTo(continuation, lastNext);
         return patchpoint;
+    }
+
+    // The two 64-bit words of JSRopeString::CompactFibers, { u32 length; u32 fiber1Lower;
+    // u16 fiber1Upper; u16 fiber2Lower; u32 fiber2Upper }, from a 32-bit length and 64-bit
+    // fibers. fiber2 is null for a two-fiber rope.
+    LValue ropeFiber1Word(LValue length, LValue fiber1)
+    {
+#if CPU(BIG_ENDIAN)
+        return m_out.bitOr(m_out.shl(m_out.zeroExtPtr(length), m_out.constInt32(32)), m_out.bitAnd(fiber1, m_out.constIntPtr(0xffffffff)));
+#else
+        return m_out.bitOr(m_out.zeroExtPtr(length), m_out.shl(fiber1, m_out.constInt32(32)));
+#endif
+    }
+
+    LValue ropeFiber2Word(LValue fiber1, LValue fiber2)
+    {
+#if CPU(BIG_ENDIAN)
+        LValue word = m_out.shl(m_out.lShr(fiber1, m_out.constInt32(32)), m_out.constInt32(48));
+        if (!fiber2)
+            return word;
+        word = m_out.bitOr(word, m_out.shl(m_out.bitAnd(fiber2, m_out.constIntPtr(0xffff)), m_out.constInt32(32)));
+        return m_out.bitOr(word, m_out.lShr(fiber2, m_out.constInt32(16)));
+#else
+        LValue word = m_out.lShr(fiber1, m_out.constInt32(32));
+        if (!fiber2)
+            return word;
+        return m_out.bitOr(word, m_out.shl(fiber2, m_out.constInt32(16)));
+#endif
     }
 
     void storeStructure(LValue object, Structure* structure)
@@ -24860,7 +24911,11 @@ IGNORE_CLANG_WARNINGS_END
         LValue bigInt = allocateCell(m_out.constIntPtr(allocatorValue.localAllocator()), structure, slowCase);
 
         // Initialize m_length = 1 and m_hash = 0 with a single 64-bit store.
+#if CPU(BIG_ENDIAN)
+        m_out.store64(m_out.constInt64(1ULL << 32), bigInt, m_heaps.JSBigInt_length);
+#else
         m_out.store64(m_out.constInt64(1), bigInt, m_heaps.JSBigInt_length);
+#endif
 
         LValue magnitude = value;
         if (isSigned) {

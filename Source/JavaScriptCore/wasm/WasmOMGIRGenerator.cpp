@@ -109,6 +109,13 @@ void dumpProcedure(void* ptr)
 
 namespace JSC { namespace Wasm {
 
+// A 32-bit value is the payload of its 8-byte slot.
+static constexpr int32_t narrowSlotOffset(B3::Type type)
+{
+    return (type == B3::Int32 || type == B3::Float) ? PayloadOffset : 0;
+}
+
+
 using namespace B3;
 
 namespace {
@@ -961,6 +968,16 @@ private:
     B3::Kind memoryKind(B3::Opcode memoryOp);
     Value* emitLoadOp(LoadOpType, Value* pointer, uint64_t offset);
     void emitStoreOp(StoreOpType, Value* pointer, Value*, uint64_t offset);
+#if CPU(BIG_ENDIAN)
+    // Wasm memory is little-endian. B3 has no byte-reversed memory operations,
+    // so on a big-endian host every access wider than a byte is a patchpoint
+    // around the macro assembler's little-endian accesses.
+    B3::PatchpointValue* littleEndianMemoryPatchpoint(B3::Type, bool writes, bool fence);
+    Value* emitLittleEndianLoad(B3::Type, Width, bool isSigned, Value* pointer, int32_t offset);
+    void emitLittleEndianStore(Width, Value* pointer, Value*, int32_t offset);
+    Value* emitLittleEndianAtomicRMW(B3::Opcode, Width, Value* pointer, Value*);
+    Value* emitLittleEndianAtomicCAS(Width, Value* pointer, Value* expected, Value*);
+#endif
 
     Value* sanitizeAtomicResult(ExtAtomicOpType, Type, Value* result);
     Value* emitAtomicLoadOp(ExtAtomicOpType, Type, Value* pointer, uint64_t offset);
@@ -1711,7 +1728,7 @@ auto OMGIRGenerator::addArguments(const RTT& signature) -> PartialResult
         } else {
             ASSERT(rep.location.isStack());
             B3::Value* address = m_currentBlock->appendNew<B3::Value>(m_proc, B3::Add, Origin(), framePointer(),
-                m_currentBlock->appendNew<B3::ConstPtrValue>(m_proc, Origin(), rep.location.offsetFromFP()));
+                m_currentBlock->appendNew<B3::ConstPtrValue>(m_proc, Origin(), rep.location.offsetFromFP() + narrowSlotOffset(type)));
             argument = m_currentBlock->appendNew<B3::MemoryValue>(m_proc, B3::Load, type, Origin(), address);
         }
 
@@ -1944,12 +1961,12 @@ static void emitWasmCallStackResultsAndSPRestore(CCallHelpers& jit,
         auto wasmType = signature.returnType(i);
         if (rep.isGPR()) {
             if (wasmType.isI32())
-                jit.load32(src, rep.gpr());
+                jit.load32(src.withOffset(PayloadOffset), rep.gpr());
             else
                 jit.load64(src, rep.gpr());
         } else if (rep.isFPR()) {
             if (wasmType.isF32())
-                jit.loadFloat(src, rep.fpr());
+                jit.loadFloat(src.withOffset(PayloadOffset), rep.fpr());
             else if (wasmType.isF64())
                 jit.loadDouble(src, rep.fpr());
             else {
@@ -1958,8 +1975,17 @@ static void emitWasmCallStackResultsAndSPRestore(CCallHelpers& jit,
             }
         } else {
             ASSERT(rep.isStack());
+            // A result pinned to its canonical slot (see createCallPatchpoint) is still copied, since the
+            // callee may have returned with a different SP; for an i32 the pin names the payload half.
+            bool isPinnedPayload = narrowSlotOffset(toB3Type(wasmType))
+                && rep.offsetFromFP() == checkedSum<int32_t>(loc.location.offsetFromSP(), -static_cast<int32_t>(frameSize), PayloadOffset).value();
             if (wasmType.isV128())
                 jit.transferVector(src, CCallHelpers::Address(GPRInfo::callFrameRegister, rep.offsetFromFP()));
+            else if (wasmType.isF32()) {
+                // Air keeps a Float in a 4-byte spill slot; a GP spill slot takes the whole word.
+                jit.transfer32(src.withOffset(PayloadOffset), CCallHelpers::Address(GPRInfo::callFrameRegister, rep.offsetFromFP()));
+            } else if (isPinnedPayload)
+                jit.transfer32(src.withOffset(PayloadOffset), CCallHelpers::Address(GPRInfo::callFrameRegister, rep.offsetFromFP()));
             else
                 jit.transfer64(src, CCallHelpers::Address(GPRInfo::callFrameRegister, rep.offsetFromFP()));
         }
@@ -2375,7 +2401,7 @@ auto OMGIRGenerator::getGlobal(uint32_t index, ExpressionType& result) -> Partia
     const Wasm::GlobalInformation& global = m_info.globals[index];
     switch (global.bindingMode) {
     case Wasm::GlobalInformation::BindingMode::EmbeddedInInstance: {
-        auto* value = m_currentBlock->appendNew<MemoryValue>(m_proc, Load, toB3Type(global.type), origin(), instanceValue(), safeCast<int32_t>(JSWebAssemblyInstance::offsetOfGlobal(m_info, index)));
+        auto* value = m_currentBlock->appendNew<MemoryValue>(m_proc, Load, toB3Type(global.type), origin(), instanceValue(), safeCast<int32_t>(JSWebAssemblyInstance::offsetOfGlobal(m_info, index)) + narrowSlotOffset(toB3Type(global.type)));
         switch (global.type.kind) {
         case TypeKind::I32:
             m_heaps.decorateMemory(&m_heaps.JSWebAssemblyInstance_embeddedGlobals_i32[index], value);
@@ -2410,7 +2436,7 @@ auto OMGIRGenerator::getGlobal(uint32_t index, ExpressionType& result) -> Partia
         pointer->setReadsMutability(B3::Mutability::Immutable);
         pointer->setControlDependent(false);
 
-        auto* load = m_currentBlock->appendNew<MemoryValue>(m_proc, Load, toB3Type(global.type), origin(), pointer, safeCast<int32_t>(Wasm::Global::Value::offsetOfValue()));
+        auto* load = m_currentBlock->appendNew<MemoryValue>(m_proc, Load, toB3Type(global.type), origin(), pointer, safeCast<int32_t>(Wasm::Global::Value::offsetOfValue()) + narrowSlotOffset(toB3Type(global.type)));
         m_heaps.decorateMemory(&m_heaps.WasmGlobalValue_value, load);
 
         result = push(load);
@@ -2430,7 +2456,7 @@ auto OMGIRGenerator::setGlobal(uint32_t index, ExpressionType value) -> PartialR
 
     switch (global.bindingMode) {
     case Wasm::GlobalInformation::BindingMode::EmbeddedInInstance: {
-        auto* store = m_currentBlock->appendNew<MemoryValue>(m_proc, Store, origin(), get(value), instanceValue(), safeCast<int32_t>(JSWebAssemblyInstance::offsetOfGlobal(m_info, index)));
+        auto* store = m_currentBlock->appendNew<MemoryValue>(m_proc, Store, origin(), get(value), instanceValue(), safeCast<int32_t>(JSWebAssemblyInstance::offsetOfGlobal(m_info, index)) + narrowSlotOffset(toB3Type(global.type)));
         switch (global.type.kind) {
         case TypeKind::I32:
             m_heaps.decorateMemory(&m_heaps.JSWebAssemblyInstance_embeddedGlobals_i32[index], store);
@@ -2462,7 +2488,7 @@ auto OMGIRGenerator::setGlobal(uint32_t index, ExpressionType value) -> PartialR
         pointer->setReadsMutability(B3::Mutability::Immutable);
         pointer->setControlDependent(false);
 
-        auto* store = m_currentBlock->appendNew<MemoryValue>(m_proc, Store, origin(), get(value), static_cast<Value*>(pointer), safeCast<int32_t>(Wasm::Global::Value::offsetOfValue()));
+        auto* store = m_currentBlock->appendNew<MemoryValue>(m_proc, Store, origin(), get(value), static_cast<Value*>(pointer), safeCast<int32_t>(Wasm::Global::Value::offsetOfValue()) + narrowSlotOffset(toB3Type(global.type)));
         m_heaps.decorateMemory(&m_heaps.WasmGlobalValue_value, store);
 
         // We emit a write-barrier onto JSWebAssemblyGlobal, not JSWebAssemblyInstance.
@@ -2659,9 +2685,253 @@ inline B3::Kind OMGIRGenerator::memoryKind(B3::Opcode memoryOp)
     return memoryOp;
 }
 
+#if CPU(BIG_ENDIAN)
+static void byteSwapForWasmMemory(CCallHelpers& jit, Width width, GPRReg gpr)
+{
+    switch (width) {
+    case Width8:
+        break;
+    case Width16:
+        jit.byteSwap16(gpr);
+        break;
+    case Width32:
+        jit.byteSwap32(gpr);
+        break;
+    case Width64:
+        jit.byteSwap64(gpr);
+        break;
+    case Width128:
+        RELEASE_ASSERT_NOT_REACHED();
+    }
+}
+
+B3::PatchpointValue* OMGIRGenerator::littleEndianMemoryPatchpoint(B3::Type type, bool writes, bool fence)
+{
+    auto* patchpoint = m_currentBlock->appendNew<B3::PatchpointValue>(m_proc, type, origin());
+    Effects effects = Effects::none();
+    effects.reads = HeapRange::top();
+    if (writes)
+        effects.writes = HeapRange::top();
+    effects.fence = fence;
+    effects.exitsSideways = useSignalingMemory0() || m_info.memory(0).isShared();
+    patchpoint->effects = effects;
+    m_heaps.decoratePatchpointRead(&m_heaps.WebAssemblyMemory, patchpoint);
+    if (writes)
+        m_heaps.decoratePatchpointWrite(&m_heaps.WebAssemblyMemory, patchpoint);
+    if (type != B3::Void)
+        patchpoint->resultConstraints = { ValueRep::SomeEarlyRegister };
+    return patchpoint;
+}
+
+Value* OMGIRGenerator::emitLittleEndianLoad(B3::Type type, Width width, bool isSigned, Value* pointer, int32_t offset)
+{
+    auto* patchpoint = littleEndianMemoryPatchpoint(type, false, false);
+    patchpoint->append(pointer, ValueRep::SomeRegister);
+    patchpoint->setGenerator([=](CCallHelpers& jit, const B3::StackmapGenerationParams& params) {
+        CCallHelpers::Address address(params[1].gpr(), offset);
+        switch (type.kind()) {
+        case B3::Float:
+            jit.loadFloatLittleEndian(address, params[0].fpr());
+            return;
+        case B3::Double:
+            jit.loadDoubleLittleEndian(address, params[0].fpr());
+            return;
+        default:
+            break;
+        }
+        switch (width) {
+        case Width16:
+            if (isSigned)
+                jit.load16SignedExtendTo32LittleEndian(address, params[0].gpr());
+            else
+                jit.load16LittleEndian(address, params[0].gpr());
+            break;
+        case Width32:
+            jit.load32LittleEndian(address, params[0].gpr());
+            break;
+        case Width64:
+            jit.load64LittleEndian(address, params[0].gpr());
+            break;
+        default:
+            RELEASE_ASSERT_NOT_REACHED();
+        }
+    });
+    return patchpoint;
+}
+
+void OMGIRGenerator::emitLittleEndianStore(Width width, Value* pointer, Value* value, int32_t offset)
+{
+    B3::Type type = value->type();
+    auto* patchpoint = littleEndianMemoryPatchpoint(B3::Void, true, false);
+    patchpoint->append(pointer, ValueRep::SomeRegister);
+    patchpoint->append(value, ValueRep::SomeRegister);
+    patchpoint->setGenerator([=](CCallHelpers& jit, const B3::StackmapGenerationParams& params) {
+        CCallHelpers::Address address(params[0].gpr(), offset);
+        switch (type.kind()) {
+        case B3::Float:
+            jit.storeFloatLittleEndian(params[1].fpr(), address);
+            return;
+        case B3::Double:
+            jit.storeDoubleLittleEndian(params[1].fpr(), address);
+            return;
+        default:
+            break;
+        }
+        switch (width) {
+        case Width16:
+            jit.store16LittleEndian(params[1].gpr(), address);
+            break;
+        case Width32:
+            jit.store32LittleEndian(params[1].gpr(), address);
+            break;
+        case Width64:
+            jit.store64LittleEndian(params[1].gpr(), address);
+            break;
+        default:
+            RELEASE_ASSERT_NOT_REACHED();
+        }
+    });
+}
+
+// An LL/SC loop; the old value comes back in host order.
+Value* OMGIRGenerator::emitLittleEndianAtomicRMW(B3::Opcode opcode, Width width, Value* pointer, Value* value)
+{
+    B3::Type type = width == Width64 ? Int64 : Int32;
+    auto* patchpoint = littleEndianMemoryPatchpoint(type, true, true);
+    patchpoint->append(pointer, ValueRep::SomeRegister);
+    patchpoint->append(value, ValueRep::SomeRegister);
+    patchpoint->numGPScratchRegisters = 2;
+    patchpoint->setGenerator([=](CCallHelpers& jit, const B3::StackmapGenerationParams& params) {
+        GPRReg result = params[0].gpr();
+        GPRReg valueGPR = params[2].gpr();
+        GPRReg newValue = params.gpScratch(0);
+        GPRReg status = params.gpScratch(1);
+        CCallHelpers::Address address(params[1].gpr());
+        auto loop = jit.label();
+        switch (width) {
+        case Width8:
+            jit.loadLinkAcq8(address, result);
+            break;
+        case Width16:
+            jit.loadLinkAcq16(address, result);
+            break;
+        case Width32:
+            jit.loadLinkAcq32(address, result);
+            break;
+        default:
+            jit.loadLinkAcq64(address, result);
+            break;
+        }
+        byteSwapForWasmMemory(jit, width, result);
+        jit.move(result, newValue);
+        bool is64 = width == Width64;
+        switch (opcode) {
+        case AtomicXchgAdd:
+            is64 ? jit.add64(valueGPR, newValue) : jit.add32(valueGPR, newValue);
+            break;
+        case AtomicXchgSub:
+            is64 ? jit.sub64(valueGPR, newValue) : jit.sub32(valueGPR, newValue);
+            break;
+        case AtomicXchgAnd:
+            is64 ? jit.and64(valueGPR, newValue) : jit.and32(valueGPR, newValue);
+            break;
+        case AtomicXchgOr:
+            is64 ? jit.or64(valueGPR, newValue) : jit.or32(valueGPR, newValue);
+            break;
+        case AtomicXchgXor:
+            is64 ? jit.xor64(valueGPR, newValue) : jit.xor32(valueGPR, newValue);
+            break;
+        case AtomicXchg:
+            jit.move(valueGPR, newValue);
+            break;
+        default:
+            RELEASE_ASSERT_NOT_REACHED();
+        }
+        byteSwapForWasmMemory(jit, width, newValue);
+        switch (width) {
+        case Width8:
+            jit.storeCondRel8(newValue, address, status);
+            break;
+        case Width16:
+            jit.storeCondRel16(newValue, address, status);
+            break;
+        case Width32:
+            jit.storeCondRel32(newValue, address, status);
+            break;
+        default:
+            jit.storeCondRel64(newValue, address, status);
+            break;
+        }
+        jit.branchTest32(CCallHelpers::NonZero, status).linkTo(loop, &jit);
+    });
+    return patchpoint;
+}
+
+Value* OMGIRGenerator::emitLittleEndianAtomicCAS(Width width, Value* pointer, Value* expected, Value* value)
+{
+    B3::Type type = width == Width64 ? Int64 : Int32;
+    auto* patchpoint = littleEndianMemoryPatchpoint(type, true, true);
+    patchpoint->append(pointer, ValueRep::SomeRegister);
+    patchpoint->append(expected, ValueRep::SomeRegister);
+    patchpoint->append(value, ValueRep::SomeRegister);
+    patchpoint->numGPScratchRegisters = 1;
+    patchpoint->setGenerator([=](CCallHelpers& jit, const B3::StackmapGenerationParams& params) {
+        GPRReg result = params[0].gpr();
+        GPRReg newValue = params.gpScratch(0);
+        CCallHelpers::Address address(params[1].gpr());
+        jit.move(params[2].gpr(), result);
+        jit.move(params[3].gpr(), newValue);
+        byteSwapForWasmMemory(jit, width, result);
+        byteSwapForWasmMemory(jit, width, newValue);
+        switch (width) {
+        case Width8:
+            jit.atomicStrongCAS8(result, newValue, address);
+            break;
+        case Width16:
+            jit.atomicStrongCAS16(result, newValue, address);
+            break;
+        case Width32:
+            jit.atomicStrongCAS32(result, newValue, address);
+            break;
+        default:
+            jit.atomicStrongCAS64(result, newValue, address);
+            break;
+        }
+        byteSwapForWasmMemory(jit, width, result);
+    });
+    return patchpoint;
+}
+#endif
+
 inline Value* OMGIRGenerator::emitLoadOp(LoadOpType op, Value* pointer, uint64_t uoffset)
 {
     int32_t offset = fixupPointerPlusOffset(pointer, uoffset);
+#if CPU(BIG_ENDIAN)
+    switch (op) {
+    case LoadOpType::I32Load16S:
+        return emitLittleEndianLoad(Int32, Width16, true, pointer, offset);
+    case LoadOpType::I64Load16S:
+        return m_currentBlock->appendNew<Value>(m_proc, SExt32, origin(), emitLittleEndianLoad(Int32, Width16, true, pointer, offset));
+    case LoadOpType::I32Load16U:
+        return emitLittleEndianLoad(Int32, Width16, false, pointer, offset);
+    case LoadOpType::I64Load16U:
+        return m_currentBlock->appendNew<Value>(m_proc, ZExt32, origin(), emitLittleEndianLoad(Int32, Width16, false, pointer, offset));
+    case LoadOpType::I32Load:
+        return emitLittleEndianLoad(Int32, Width32, false, pointer, offset);
+    case LoadOpType::I64Load32U:
+        return m_currentBlock->appendNew<Value>(m_proc, ZExt32, origin(), emitLittleEndianLoad(Int32, Width32, false, pointer, offset));
+    case LoadOpType::I64Load32S:
+        return m_currentBlock->appendNew<Value>(m_proc, SExt32, origin(), emitLittleEndianLoad(Int32, Width32, false, pointer, offset));
+    case LoadOpType::I64Load:
+        return emitLittleEndianLoad(Int64, Width64, false, pointer, offset);
+    case LoadOpType::F32Load:
+        return emitLittleEndianLoad(B3::Float, Width32, false, pointer, offset);
+    case LoadOpType::F64Load:
+        return emitLittleEndianLoad(B3::Double, Width64, false, pointer, offset);
+    default:
+        break;
+    }
+#endif
 
     switch (op) {
     case LoadOpType::I32Load8S: {
@@ -2822,6 +3092,29 @@ inline uint32_t sizeOfStoreOp(StoreOpType op)
 inline void OMGIRGenerator::emitStoreOp(StoreOpType op, Value* pointer, Value* value, uint64_t uoffset)
 {
     int32_t offset = fixupPointerPlusOffset(pointer, uoffset);
+#if CPU(BIG_ENDIAN)
+    switch (op) {
+    case StoreOpType::I64Store16:
+        value = m_currentBlock->appendNew<Value>(m_proc, Trunc, origin(), value);
+        [[fallthrough]];
+    case StoreOpType::I32Store16:
+        emitLittleEndianStore(Width16, pointer, value, offset);
+        return;
+    case StoreOpType::I64Store32:
+        value = m_currentBlock->appendNew<Value>(m_proc, Trunc, origin(), value);
+        [[fallthrough]];
+    case StoreOpType::I32Store:
+    case StoreOpType::F32Store:
+        emitLittleEndianStore(Width32, pointer, value, offset);
+        return;
+    case StoreOpType::I64Store:
+    case StoreOpType::F64Store:
+        emitLittleEndianStore(Width64, pointer, value, offset);
+        return;
+    default:
+        break;
+    }
+#endif
 
     switch (op) {
     case StoreOpType::I64Store8:
@@ -2951,6 +3244,10 @@ inline Value* OMGIRGenerator::emitAtomicLoadOp(ExtAtomicOpType op, Type valueTyp
         break;
     }
 
+#if CPU(BIG_ENDIAN)
+    if (accessWidth(op) != Width8)
+        return sanitizeAtomicResult(op, valueType, emitLittleEndianAtomicRMW(AtomicXchgAdd, accessWidth(op), pointer, value));
+#endif
     auto* atomic = m_currentBlock->appendNew<AtomicValue>(m_proc, memoryKind(AtomicXchgAdd), origin(), accessWidth(op), value, pointer);
     m_heaps.decorateMemory(&m_heaps.WebAssemblyMemory, atomic);
     m_heaps.decorateFencedAccess(&m_heaps.WebAssemblyMemory, atomic);
@@ -2997,6 +3294,12 @@ inline void OMGIRGenerator::emitAtomicStoreOp(ExtAtomicOpType op, Type valueType
 
     if (valueType.isI64() && accessWidth(op) != Width64)
         value = m_currentBlock->appendNew<B3::Value>(m_proc, B3::Trunc, Origin(), value);
+#if CPU(BIG_ENDIAN)
+    if (accessWidth(op) != Width8) {
+        emitLittleEndianAtomicRMW(AtomicXchg, accessWidth(op), pointer, value);
+        return;
+    }
+#endif
     auto* atomic = m_currentBlock->appendNew<AtomicValue>(m_proc, memoryKind(AtomicXchg), origin(), accessWidth(op), value, pointer);
     m_heaps.decorateMemory(&m_heaps.WebAssemblyMemory, atomic);
     m_heaps.decorateFencedAccess(&m_heaps.WebAssemblyMemory, atomic);
@@ -3091,6 +3394,10 @@ inline Value* OMGIRGenerator::emitAtomicBinaryRMWOp(ExtAtomicOpType op, Type val
     if (valueType.isI64() && accessWidth(op) != Width64)
         value = m_currentBlock->appendNew<B3::Value>(m_proc, B3::Trunc, Origin(), value);
 
+#if CPU(BIG_ENDIAN)
+    if (accessWidth(op) != Width8)
+        return sanitizeAtomicResult(op, valueType, emitLittleEndianAtomicRMW(opcode, accessWidth(op), pointer, value));
+#endif
     auto* atomic = m_currentBlock->appendNew<AtomicValue>(m_proc, memoryKind(opcode), origin(), accessWidth(op), value, pointer);
     m_heaps.decorateMemory(&m_heaps.WebAssemblyMemory, atomic);
     m_heaps.decorateFencedAccess(&m_heaps.WebAssemblyMemory, atomic);
@@ -3138,6 +3445,9 @@ Value* OMGIRGenerator::emitAtomicCompareExchange(ExtAtomicOpType op, Type valueT
     Width accessWidth = Wasm::accessWidth(op);
 
     if (widthForType(toB3Type(valueType)) == accessWidth) {
+#if CPU(BIG_ENDIAN)
+        return sanitizeAtomicResult(op, valueType, emitLittleEndianAtomicCAS(accessWidth, pointer, expected, value));
+#endif
         auto* atomic = m_currentBlock->appendNew<AtomicValue>(m_proc, memoryKind(AtomicStrongCAS), origin(), accessWidth, expected, value, pointer);
         m_heaps.decorateMemory(&m_heaps.WebAssemblyMemory, atomic);
         m_heaps.decorateFencedAccess(&m_heaps.WebAssemblyMemory, atomic);
@@ -3191,6 +3501,10 @@ Value* OMGIRGenerator::emitAtomicCompareExchange(ExtAtomicOpType op, Type valueT
         truncatedValue = m_currentBlock->appendNew<B3::Value>(m_proc, B3::Trunc, Origin(), value);
     }
 
+#if CPU(BIG_ENDIAN)
+    if (accessWidth != Width8)
+        return sanitizeAtomicResult(op, valueType, emitLittleEndianAtomicCAS(accessWidth, pointer, truncatedExpected, truncatedValue));
+#endif
     auto* atomic = m_currentBlock->appendNew<AtomicValue>(m_proc, memoryKind(AtomicStrongCAS), origin(), accessWidth, truncatedExpected, truncatedValue, pointer);
     m_heaps.decorateMemory(&m_heaps.WebAssemblyMemory, atomic);
     m_heaps.decorateFencedAccess(&m_heaps.WebAssemblyMemory, atomic);
@@ -4574,7 +4888,7 @@ auto OMGIRGenerator::addSIMDLoadPad(SIMDLaneOperation op, ExpressionType pointer
 
 Value* OMGIRGenerator::loadFromScratchBuffer(unsigned& indexInBuffer, Value* pointer, B3::Type type)
 {
-    int32_t offset = safeCast<int32_t>(sizeof(Wasm::Context::ScratchBufferEntry) * (indexInBuffer++));
+    int32_t offset = safeCast<int32_t>(sizeof(Wasm::Context::ScratchBufferEntry) * (indexInBuffer++)) + narrowSlotOffset(type);
     RELEASE_ASSERT(type.isNumeric());
     return m_currentBlock->appendNew<MemoryValue>(m_proc, Load, type, origin(), pointer, offset);
 }
@@ -4944,7 +5258,7 @@ auto OMGIRGenerator::addCatchToUnreachable(unsigned exceptionIndex, const RTT& s
     unsigned offset = 0;
     for (unsigned i = 0; i < signature.argumentCount(); ++i) {
         Type type = signature.argumentType(i);
-        Value* value = m_currentBlock->appendNew<MemoryValue>(m_proc, Load, toB3Type(type), origin(), payload, safeCast<int32_t>(offset * sizeof(uint64_t)));
+        Value* value = m_currentBlock->appendNew<MemoryValue>(m_proc, Load, toB3Type(type), origin(), payload, safeCast<int32_t>(offset * sizeof(uint64_t)) + narrowSlotOffset(toB3Type(type)));
         results.append(push(value));
         offset += type.kind == TypeKind::V128 ? 2 : 1;
     }
@@ -5034,7 +5348,7 @@ auto OMGIRGenerator::emitCatchTableImpl(ControlData& data, const ControlData::Tr
         unsigned offset = 0;
         for (unsigned i = 0; i < signature->argumentCount(); ++i) {
             Type type = signature->argumentType(i);
-            Value* value = m_currentBlock->appendNew<MemoryValue>(m_proc, Load, toB3Type(type), origin(), buffer, safeCast<int32_t>(offset * sizeof(uint64_t)));
+            Value* value = m_currentBlock->appendNew<MemoryValue>(m_proc, Load, toB3Type(type), origin(), buffer, safeCast<int32_t>(offset * sizeof(uint64_t)) + narrowSlotOffset(toB3Type(type)));
             resultStack.constructAndAppend(type, value);
             offset += type.kind == TypeKind::V128 ? 2 : 1;
         }
@@ -5083,7 +5397,7 @@ auto OMGIRGenerator::addThrow(unsigned exceptionIndex, ArgumentList& args, std::
     patch->append(instanceValue(), ValueRep::reg(GPRInfo::argumentGPR0));
     unsigned offset = 0;
     for (auto arg : args) {
-        patch->append(get(arg), ValueRep::stackArgument(safeCast<int32_t>(offset * sizeof(EncodedJSValue))));
+        patch->append(get(arg), ValueRep::stackArgument(safeCast<int32_t>(offset * sizeof(EncodedJSValue) + narrowSlotOffset(get(arg)->type()))));
         offset += arg.value().type().isVector() ?  2 : 1;
     }
     m_maxNumJSCallArguments = std::max(m_maxNumJSCallArguments, offset);
@@ -5190,7 +5504,7 @@ auto OMGIRGenerator::addReturn(const ControlData&, std::span<const TypedExpressi
     for (unsigned i = 0; i < wasmCallInfo.results.size(); ++i) {
         B3::ValueRep rep = wasmCallInfo.results[i].location;
         if (rep.isStack()) {
-            B3::Value* address = m_currentBlock->appendNew<B3::Value>(m_proc, B3::Add, Origin(), framePointer(), constant(pointerType(), rep.offsetFromFP()));
+            B3::Value* address = m_currentBlock->appendNew<B3::Value>(m_proc, B3::Add, Origin(), framePointer(), constant(pointerType(), rep.offsetFromFP() + narrowSlotOffset(get(returnValues[offset + i])->type())));
             m_currentBlock->appendNew<B3::MemoryValue>(m_proc, B3::Store, Origin(), get(returnValues[offset + i]), address);
         } else {
             ASSERT(rep.isReg());
@@ -5376,8 +5690,11 @@ Vector<ConstrainedValue> OMGIRGenerator::createCallConstrainedArgs(BasicBlock* b
     Vector<ConstrainedValue> constrainedPatchArgs;
     constrainedPatchArgs.reserveCapacity(tmpArgs.size());
     for (unsigned i = 0; i < tmpArgs.size(); ++i) {
-        auto dstLocation = wasmCalleeInfo.params[i];
-        constrainedPatchArgs.append(B3::ConstrainedValue(get(block, tmpArgs[i]), dstLocation));
+        Value* value = get(block, tmpArgs[i]);
+        B3::ValueRep rep = wasmCalleeInfo.params[i].location;
+        if (rep.isStackArgument())
+            rep = B3::ValueRep::stackArgument(safeCast<int32_t>(rep.offsetFromSP() + narrowSlotOffset(value->type())));
+        constrainedPatchArgs.append(B3::ConstrainedValue(value, rep));
     }
 
     return constrainedPatchArgs;
@@ -5404,13 +5721,16 @@ auto OMGIRGenerator::createCallPatchpoint(BasicBlock* block, const RTT& signatur
     const Vector<ArgumentLocation, 1>& constrainedResultLocations = wasmCalleeInfo.results;
     if (returnType != B3::Void) {
         Vector<B3::ValueRep, 1> resultConstraints;
-        for (auto valueLocation : constrainedResultLocations) {
+        for (unsigned i = 0; i < constrainedResultLocations.size(); ++i) {
+            auto valueLocation = constrainedResultLocations[i];
             // FIXME: Graph Coloring has an issue where it runs out of "colors" (aka registers) when passing as an Any so instead place results where they would canonically go.
             // Even though the expected location is SP relative it still works with emitWasmCallStackResultsAndSPRestore because "SP" means FP - frameSize not the semi-random SP we got back from our callee.
             if (valueLocation.location.isStackArgument() && Options::airUseGreedyRegAlloc()) {
                 // FIXME: Should these results be ColdAny? The argument in favor of Warm is that we have to move the values anyway so we might as well put in a register if that's what B3 wants
                 resultConstraints.append(B3::ValueRep::WarmAny);
-            } else
+            } else if (valueLocation.location.isStackArgument())
+                resultConstraints.append(B3::ValueRep::stackArgument(safeCast<int32_t>(valueLocation.location.offsetFromSP() + narrowSlotOffset(toB3Type(signature.returnType(i))))));
+            else
                 resultConstraints.append(B3::ValueRep(valueLocation.location));
         }
         patchpoint->resultConstraints = WTF::move(resultConstraints);
@@ -5567,6 +5887,12 @@ static inline void prepareForTailCallImpl(unsigned functionIndex, CCallHelpers& 
         ShuffleLocation dst;
         std::optional<int64_t> constant;
         Width width { Width64 };
+        bool isFloat { false };
+        // A 32-bit value is the payload of its 8-byte slot: every stack destination is a
+        // calling-convention slot, and an Int32 stack source is an 8-byte spill slot. A
+        // Float spill slot is 4 bytes, so it has no payload half.
+        int32_t srcPayloadOffset() const { return width == Width32 && !isFloat ? PayloadOffset : 0; }
+        int32_t dstPayloadOffset() const { return width == Width32 ? PayloadOffset : 0; }
     };
 
     Vector<ShuffleEntry> entries;
@@ -5667,6 +5993,7 @@ static inline void prepareForTailCallImpl(unsigned functionIndex, CCallHelpers& 
         } else {
             ShuffleEntry entry;
             entry.width = dstType.width();
+            entry.isFloat = dstType.isF32() || dstType.isF64();
             ASSERT(dstType.width() <= Width64);
             entry.src = src;
             entry.dst = dst;
@@ -5741,8 +6068,8 @@ static inline void prepareForTailCallImpl(unsigned functionIndex, CCallHelpers& 
         }
         if (conflicts) {
             int scratchOffset = allocateSpill(Width64);
-            auto scratchAddr = CCallHelpers::Address(MacroAssembler::stackPointerRegister, scratchOffset);
-            auto srcAddr = CCallHelpers::Address(MacroAssembler::stackPointerRegister, entry.src.stackOffset);
+            auto scratchAddr = CCallHelpers::Address(MacroAssembler::stackPointerRegister, scratchOffset + entry.srcPayloadOffset());
+            auto srcAddr = CCallHelpers::Address(MacroAssembler::stackPointerRegister, entry.src.stackOffset + entry.srcPayloadOffset());
             jit.transfer32(srcAddr, scratchAddr);
             entry.src = ShuffleLocation::fromStack(scratchOffset);
         }
@@ -5766,7 +6093,7 @@ static inline void prepareForTailCallImpl(unsigned functionIndex, CCallHelpers& 
                     jit.move64ToDouble(MacroAssembler::TrustedImm64(*e.constant), dst.fpr);
             } else {
                 ASSERT(dst.kind == ShuffleLocation::Stack);
-                auto dstAddr = CCallHelpers::Address(MacroAssembler::stackPointerRegister, dst.stackOffset);
+                auto dstAddr = CCallHelpers::Address(MacroAssembler::stackPointerRegister, dst.stackOffset + e.dstPayloadOffset());
                 if (e.width == Width32) {
                     jit.move(MacroAssembler::TrustedImm32(static_cast<int32_t>(*e.constant)), tmp);
                     jit.store32(tmp, dstAddr);
@@ -5782,7 +6109,7 @@ static inline void prepareForTailCallImpl(unsigned functionIndex, CCallHelpers& 
                 jit.move(src.gpr, dst.gpr);
             else {
                 ASSERT(dst.kind == ShuffleLocation::Stack);
-                jit.storeWidth(e.width, src.gpr, CCallHelpers::Address(MacroAssembler::stackPointerRegister, dst.stackOffset));
+                jit.storeWidth(e.width, src.gpr, CCallHelpers::Address(MacroAssembler::stackPointerRegister, dst.stackOffset + e.dstPayloadOffset()));
             }
             return;
         }
@@ -5792,13 +6119,13 @@ static inline void prepareForTailCallImpl(unsigned functionIndex, CCallHelpers& 
                 jit.moveDouble(src.fpr, dst.fpr);
             } else {
                 ASSERT(dst.kind == ShuffleLocation::Stack);
-                jit.storeWidth(e.width, src.fpr, CCallHelpers::Address(MacroAssembler::stackPointerRegister, dst.stackOffset));
+                jit.storeWidth(e.width, src.fpr, CCallHelpers::Address(MacroAssembler::stackPointerRegister, dst.stackOffset + e.dstPayloadOffset()));
             }
             return;
         }
         case ShuffleLocation::Stack: {
             ASSERT(src.kind == ShuffleLocation::Stack);
-            auto srcAddr = CCallHelpers::Address(MacroAssembler::stackPointerRegister, src.stackOffset);
+            auto srcAddr = CCallHelpers::Address(MacroAssembler::stackPointerRegister, src.stackOffset + e.srcPayloadOffset());
             ASSERT_WITH_MESSAGE(e.width != Width128, "V128 values should have been split during setup.");
             if (dst.kind == ShuffleLocation::GPR)
                 jit.loadWidth(e.width, srcAddr, dst.gpr);
@@ -5806,7 +6133,7 @@ static inline void prepareForTailCallImpl(unsigned functionIndex, CCallHelpers& 
                 jit.loadWidth(e.width, srcAddr, dst.fpr);
             else {
                 ASSERT(dst.kind == ShuffleLocation::Stack);
-                auto dstAddr = CCallHelpers::Address(MacroAssembler::stackPointerRegister, dst.stackOffset);
+                auto dstAddr = CCallHelpers::Address(MacroAssembler::stackPointerRegister, dst.stackOffset + e.dstPayloadOffset());
                 jit.transferWidth(e.width, srcAddr, dstAddr);
             }
             return;
@@ -5825,15 +6152,19 @@ static inline void prepareForTailCallImpl(unsigned functionIndex, CCallHelpers& 
         int scratchOffset = allocateSpill(Width64);
         auto scratchAddr = CCallHelpers::Address(MacroAssembler::stackPointerRegister, scratchOffset);
 
+        // The scratch slot is read back like the source it replaces (see srcPayloadOffset).
         switch (e.src.kind) {
         case ShuffleLocation::GPR:
             jit.storePtr(e.src.gpr, scratchAddr);
             break;
         case ShuffleLocation::FPR:
-            jit.storeDouble(e.src.fpr, scratchAddr);
+            if (e.width == Width32)
+                jit.storeFloat(e.src.fpr, scratchAddr);
+            else
+                jit.storeDouble(e.src.fpr, scratchAddr);
             break;
         case ShuffleLocation::Stack: {
-            jit.transferWidth(e.width, CCallHelpers::Address(MacroAssembler::stackPointerRegister, e.src.stackOffset), scratchAddr);
+            jit.transferWidth(e.width, CCallHelpers::Address(MacroAssembler::stackPointerRegister, e.src.stackOffset + e.srcPayloadOffset()), scratchAddr.withOffset(e.srcPayloadOffset()));
             break;
         }
         default:

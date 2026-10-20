@@ -1701,11 +1701,20 @@ if WEBASSEMBLY
         convertJSCalleeToVM(vm)
         jmp .loaded
     .isWasmCallee:
-        loadp CodeBlock + PayloadOffset[cfr], vm
+        if JSVALUE64
+            loadp CodeBlock[cfr], vm
+        else
+            loadp CodeBlock + PayloadOffset[cfr], vm
+        end
         loadp JSWebAssemblyInstance::m_vm[vm], vm
     .loaded:
 else
-    loadp Callee + PayloadOffset[cfr], vm
+    # On 64-bit the pointer fills the slot; PayloadOffset is only 0 on little-endian.
+    if JSVALUE64
+        loadp Callee[cfr], vm
+    else
+        loadp Callee + PayloadOffset[cfr], vm
+    end
     convertJSCalleeToVM(vm)
 end
 end
@@ -2765,7 +2774,7 @@ commonCallOp(op_super_construct, OpSuperConstruct, prepareForRegularCall, invoke
         lshifti 3, t1
         negp t1
         addp cfr, t1
-        loadp ThisArgumentOffset + PayloadOffset[t1], t1
+        loadp ThisArgumentOffset[t1], t1
         loadp OpSuperConstruct::Metadata::m_cachedCallee[t5], t2
         bqeq t1, t2, .done
         btqz t2, .store

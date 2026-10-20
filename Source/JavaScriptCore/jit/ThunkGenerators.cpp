@@ -717,6 +717,11 @@ MacroAssemblerCodeRef<JITThunkPtrTag> stringEqualThunkGenerator(VM& vm)
 
         // Rope: must be substring rope (concat ropes go to slowCase).
         isRope.link(&jit);
+#if CPU(BIG_ENDIAN)
+        // The fiber loads below assume little-endian CompactFibers layout.
+        UNUSED_PARAM(flagsGPR);
+        slowCase.append(jit.jump());
+#else
         slowCase.append(jit.branchTest64(JIT::Zero, dataGPR, JIT::TrustedImm64(JSRopeString::isSubstringInPointer)));
 
         // Load substring base raw (low 48 bits of fiber1) and mask. and64(TrustedImm64) is one
@@ -738,6 +743,7 @@ MacroAssemblerCodeRef<JITThunkPtrTag> stringEqualThunkGenerator(VM& vm)
         is8Bit.link(&jit);
         jit.addPtr(lengthGPR, dataGPR);
         jit.load32(JIT::Address(jsStringGPR, JSRopeString::offsetOfLength()), lengthGPR);
+#endif
 
         done.link(&jit);
     };

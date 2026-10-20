@@ -9735,7 +9735,7 @@ void SpeculativeJIT::compileSpread(Node* node)
         zeroExtend32ToWord(lengthGPR, lengthGPR);
 
         // Load deletedEntryCount and check it's 0.
-        load32(Address(scratch1GPR, Helper::deletedEntryCountIndex() * sizeof(EncodedJSValue)), scratch2GPR);
+        load32(Address(scratch1GPR, Helper::deletedEntryCountIndex() * sizeof(EncodedJSValue) + PayloadOffset), scratch2GPR);
         slowPath.append(branchTest32(NonZero, scratch2GPR));
 
         // Guard aliveEntryCount <= MAX_STORAGE_VECTOR_LENGTH.
@@ -9756,7 +9756,7 @@ void SpeculativeJIT::compileSpread(Node* node)
         // Reload storage and recompute source base pointer (scratches were clobbered by allocation).
         loadPtr(Address(argument, JSSet::offsetOfStorage()), scratch1GPR);
         addPtr(TrustedImm32(JSCellButterfly::offsetOfData()), scratch1GPR);
-        load32(Address(scratch1GPR, Helper::capacityIndex() * sizeof(EncodedJSValue)), scratch2GPR);
+        load32(Address(scratch1GPR, Helper::capacityIndex() * sizeof(EncodedJSValue) + PayloadOffset), scratch2GPR);
         add32(TrustedImm32(Helper::hashTableStartIndex()), scratch2GPR);
         // scratch1GPR += dataTableStartIndex * sizeof(EncodedJSValue)
         lshiftPtr(TrustedImm32(3), scratch2GPR);
@@ -15082,13 +15082,13 @@ void SpeculativeJIT::compileMapIteratorKey(Node* node)
         static_assert(JSMap::Helper::EntrySize == 3);
         lshift32(entryGPR, TrustedImm32(1), scratchGPR2);
         add32(entryGPR, scratchGPR2);
-        load32(Address(storageGPR, JSCellButterfly::offsetOfData() + JSMap::Helper::capacityIndex() * sizeof(uint64_t)), scratchGPR1);
+        load32(Address(storageGPR, JSCellButterfly::offsetOfData() + JSMap::Helper::capacityIndex() * sizeof(uint64_t) + PayloadOffset), scratchGPR1);
         add32(scratchGPR1, scratchGPR2);
         add32(TrustedImm32(JSMap::Helper::hashTableStartIndex() - JSMap::Helper::EntrySize), scratchGPR2);
     } else {
         static_assert(JSSet::Helper::EntrySize == 2);
         add32(entryGPR, entryGPR, scratchGPR2);
-        load32(Address(storageGPR, JSCellButterfly::offsetOfData() + JSSet::Helper::capacityIndex() * sizeof(uint64_t)), scratchGPR1);
+        load32(Address(storageGPR, JSCellButterfly::offsetOfData() + JSSet::Helper::capacityIndex() * sizeof(uint64_t) + PayloadOffset), scratchGPR1);
         add32(scratchGPR1, scratchGPR2);
         add32(TrustedImm32(JSSet::Helper::hashTableStartIndex() - JSSet::Helper::EntrySize), scratchGPR2);
     }
@@ -15114,7 +15114,7 @@ void SpeculativeJIT::compileMapIteratorValue(Node* node)
     static_assert(JSMap::Helper::EntrySize == 3);
     lshift32(entryGPR, TrustedImm32(1), scratchGPR2);
     add32(entryGPR, scratchGPR2);
-    load32(Address(storageGPR, JSCellButterfly::offsetOfData() + JSMap::Helper::capacityIndex() * sizeof(uint64_t)), scratchGPR1);
+    load32(Address(storageGPR, JSCellButterfly::offsetOfData() + JSMap::Helper::capacityIndex() * sizeof(uint64_t) + PayloadOffset), scratchGPR1);
     add32(scratchGPR1, scratchGPR2);
     add32(TrustedImm32(JSMap::Helper::hashTableStartIndex() - JSMap::Helper::EntrySize + /* value offset */ 1), scratchGPR2);
 
@@ -15686,14 +15686,22 @@ void SpeculativeJIT::compileGetSetter(Node* node)
 void SpeculativeJIT::compileGetCallee(Node* node)
 {
     GPRTemporary result(this);
+#if USE(JSVALUE64)
+    loadPtr(addressFor(CallFrameSlot::callee), result.gpr());
+#else
     loadPtr(payloadFor(CallFrameSlot::callee), result.gpr());
+#endif
     cellResult(result.gpr(), node);
 }
 
 void SpeculativeJIT::compileSetCallee(Node* node)
 {
     SpeculateCellOperand callee(this, node->child1());
+#if USE(JSVALUE64)
+    storeCell(callee.gpr(), addressFor(CallFrameSlot::callee));
+#else
     storeCell(callee.gpr(), payloadFor(CallFrameSlot::callee));
+#endif
     noResult(node);
 }
 
@@ -16834,7 +16842,7 @@ void SpeculativeJIT::compileMapOrSetSize(Node* node)
     move(TrustedImm32(0), resultGPR);
     auto nullCase = branchTestPtr(Zero, storageGPR);
     // offsetOfAliveEntryCount() is the same for both JSSet::Helper and JSMap::Helper.
-    load32(Address(storageGPR, JSSet::Helper::offsetOfAliveEntryCount()), resultGPR);
+    load32(Address(storageGPR, JSSet::Helper::offsetOfAliveEntryCount() + PayloadOffset), resultGPR);
 
     nullCase.link(this);
     strictInt32Result(resultGPR, node);
@@ -17904,6 +17912,26 @@ void SpeculativeJIT::compileMakeRope(Node* node)
     orPtr(TrustedImmPtr(JSString::isRopeInPointer), scratchGPR);
     storePtr(scratchGPR, Address(resultGPR, JSRopeString::offsetOfFiber0()));
 
+#if CPU(BIG_ENDIAN)
+    // CompactFibers is { u32 length; u32 fiber1Lower; u16 fiber1Upper; u16 fiber2Lower;
+    // u32 fiber2Upper }. As big-endian words, the first field of each is the high half:
+    // word1 = length << 32 | low32(fiber1),
+    // word2 = upper16(fiber1) << 48 | low16(fiber2) << 32 | fiber2 >> 16.
+    lshiftPtr(allocatorGPR, TrustedImm32(32), scratchGPR);
+    zeroExtend32ToWord(opGPRs[1], scratch2GPR);
+    orPtr(scratch2GPR, scratchGPR);
+    storePtr(scratchGPR, Address(resultGPR, JSRopeString::offsetOfFiber1()));
+    urshift64(opGPRs[1], TrustedImm32(32), scratchGPR);
+    lshiftPtr(TrustedImm32(48), scratchGPR);
+    if (numOpGPRs == 3) {
+        zeroExtend16To32(opGPRs[2], scratch2GPR);
+        lshiftPtr(TrustedImm32(32), scratch2GPR);
+        orPtr(scratch2GPR, scratchGPR);
+        urshift64(opGPRs[2], TrustedImm32(16), scratch2GPR);
+        orPtr(scratch2GPR, scratchGPR);
+    }
+    storePtr(scratchGPR, Address(resultGPR, JSRopeString::offsetOfFiber2()));
+#else
 #if CPU(ARM64)
     orLeftShift64(allocatorGPR, opGPRs[1], TrustedImm32(32), scratchGPR);
 #else
@@ -17927,6 +17955,7 @@ void SpeculativeJIT::compileMakeRope(Node* node)
         storePtr(scratchGPR, Address(resultGPR, JSRopeString::offsetOfFiber2()));
 #endif
     }
+#endif
 
     auto isNonEmptyString = branchTest32(NonZero, allocatorGPR);
 
@@ -18460,9 +18489,15 @@ void SpeculativeJIT::compileStringStartsOrEndsWithConstant(Node* node, bool isSt
     // Encode the search bytes as little-endian immediates so the comparison is a few
     // wide loads + compares, with overlap when searchLength isn't a power of two.
     auto chunk = [&](unsigned offset, unsigned width) -> uint64_t {
+        // The characters as the word a load of them yields on this host.
         uint64_t value = 0;
-        for (unsigned i = 0; i < width; ++i)
+        for (unsigned i = 0; i < width; ++i) {
+#if CPU(BIG_ENDIAN)
+            value |= static_cast<uint64_t>(search[offset + i]) << ((width - 1 - i) * 8);
+#else
             value |= static_cast<uint64_t>(search[offset + i]) << (i * 8);
+#endif
+        }
         return value;
     };
 

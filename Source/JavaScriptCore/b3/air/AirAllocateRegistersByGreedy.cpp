@@ -3055,7 +3055,14 @@ private:
             ensureSpillSlotTableEntry(tmpData);
             StackSlot*& slot = m_spillSlotTable[tmpData.spillSlotTableIndex];
             if (!slot) {
-                slot = m_code.addStackSlot(stackSlotMinimumWidth(m_tmpWidth.requiredWidth(tmp)), StackSlotKind::Spill);
+                unsigned slotSize = stackSlotMinimumWidth(m_tmpWidth.requiredWidth(tmp));
+#if CPU(BIG_ENDIAN)
+                // Stackmaps and OSR exits read a spilled GP value with a 64-bit load at the slot, so a
+                // 32-bit value must sit in the low-order half of an 8-byte slot (see lowerStackArgs).
+                if (bank == GP)
+                    slotSize = std::max(slotSize, 8u);
+#endif
+                slot = m_code.addStackSlot(slotSize, StackSlotKind::Spill);
                 m_stats[bank].numSpillStackSlots++;
             }
             ASSERT(spillSlot<bank>(tmp));

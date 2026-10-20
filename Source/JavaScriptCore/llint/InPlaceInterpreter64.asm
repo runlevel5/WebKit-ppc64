@@ -128,6 +128,10 @@ end
 # Typed push/pop to make code pretty
 
 macro pushInt32(reg)
+if PPC64
+    # ELFv2 returns an int32 sign-extended; the slot holds it zero-extended.
+    zxi2q reg, reg
+end
     pushQuad(reg)
 end
 
@@ -147,7 +151,7 @@ end
 macro pushFloat32(reg)
     if PPC64
         subp V128ISize, sp
-        storef reg, [sp]
+        storef reg, PayloadOffset[sp]
     else
         pushv reg
     end
@@ -155,7 +159,7 @@ end
 
 macro popFloat32(reg)
     if PPC64
-        loadf [sp], reg
+        loadf PayloadOffset[sp], reg
         addp V128ISize, sp
     else
         popv reg
@@ -192,6 +196,99 @@ const argumINTDst = sc0
 const argumINTSrc = csr2
 const argumINTEnd = csr3
 const argumINTDsp = csr4
+
+# Wasm linear memory is little-endian whatever the host is.
+if BIG_ENDIAN
+    macro wasmLoadh(addr, dst)
+        loadhle addr, dst
+    end
+    macro wasmLoadhsi(addr, dst)
+        loadhsile addr, dst
+    end
+    macro wasmLoadhsq(addr, dst)
+        loadhsqle addr, dst
+    end
+    macro wasmLoadi(addr, dst)
+        loadile addr, dst
+    end
+    macro wasmLoadq(addr, dst)
+        loadqle addr, dst
+    end
+    macro wasmLoadf(addr, dst)
+        loadfle addr, dst
+    end
+    macro wasmLoadd(addr, dst)
+        loaddle addr, dst
+    end
+    macro wasmStoreh(src, addr)
+        storehle src, addr
+    end
+    macro wasmStorei(src, addr)
+        storeile src, addr
+    end
+    macro wasmStoreq(src, addr)
+        storeqle src, addr
+    end
+    macro wasmStoref(src, addr)
+        storefle src, addr
+    end
+    macro wasmStored(src, addr)
+        storedle src, addr
+    end
+    # Register values read from or written to wasm memory by the LL/SC loops.
+    macro wasmSwaph(reg)
+        bswaph reg
+    end
+    macro wasmSwapi(reg)
+        bswapi reg
+    end
+    macro wasmSwapq(reg)
+        bswapq reg
+    end
+else
+    macro wasmLoadh(addr, dst)
+        loadh addr, dst
+    end
+    macro wasmLoadhsi(addr, dst)
+        loadhsi addr, dst
+    end
+    macro wasmLoadhsq(addr, dst)
+        loadhsq addr, dst
+    end
+    macro wasmLoadi(addr, dst)
+        loadi addr, dst
+    end
+    macro wasmLoadq(addr, dst)
+        loadq addr, dst
+    end
+    macro wasmLoadf(addr, dst)
+        loadf addr, dst
+    end
+    macro wasmLoadd(addr, dst)
+        loadd addr, dst
+    end
+    macro wasmStoreh(src, addr)
+        storeh src, addr
+    end
+    macro wasmStorei(src, addr)
+        storei src, addr
+    end
+    macro wasmStoreq(src, addr)
+        storeq src, addr
+    end
+    macro wasmStoref(src, addr)
+        storef src, addr
+    end
+    macro wasmStored(src, addr)
+        stored src, addr
+    end
+    macro wasmSwaph(reg)
+    end
+    macro wasmSwapi(reg)
+    end
+    macro wasmSwapq(reg)
+    end
+end
 
 macro ipintEntry()
     const argumINTEndAsScratch = argumINTEnd
@@ -1025,7 +1122,7 @@ ipintOp(_i32_load_mem, macro()
     popMemoryIndex(t0)
     loadStoreMakePointerFast(1[PC], 2[PC], t0, 4, t1, t2, .ipint_i32_load_mem_slow_path)
     # load memory location
-    loadi [t0], t1
+    wasmLoadi([t0], t1)
     pushInt32(t1)
 
     advancePC(3)
@@ -1038,7 +1135,7 @@ ipintOp(_i64_load_mem, macro()
     popMemoryIndex(t0)
     loadStoreMakePointerFast(1[PC], 2[PC], t0, 8, t1, t2, .ipint_i64_load_mem_slow_path)
     # load memory location
-    loadq [t0], t1
+    wasmLoadq([t0], t1)
     pushInt64(t1)
 
     advancePC(3)
@@ -1051,7 +1148,7 @@ ipintOp(_f32_load_mem, macro()
     popMemoryIndex(t0)
     loadStoreMakePointerFast(1[PC], 2[PC], t0, 4, t1, t2, .ipint_f32_load_mem_slow_path)
     # load memory location
-    loadf [t0], ft0
+    wasmLoadf([t0], ft0)
     pushFloat32(ft0)
 
     advancePC(3)
@@ -1064,7 +1161,7 @@ ipintOp(_f64_load_mem, macro()
     popMemoryIndex(t0)
     loadStoreMakePointerFast(1[PC], 2[PC], t0, 8, t1, t2, .ipint_f64_load_mem_slow_path)
     # load memory location
-    loadd [t0], ft0
+    wasmLoadd([t0], ft0)
     pushFloat64(ft0)
 
     advancePC(3)
@@ -1100,7 +1197,7 @@ ipintOp(_i32_load16s_mem, macro()
     # pop index
     popMemoryIndex(t0)
     loadStoreMakePointerFast(1[PC], 2[PC], t0, 2, t1, t2, .ipint_i32_load16s_mem_slow_path)
-    loadhsi [t0], t1
+    wasmLoadhsi([t0], t1)
     pushInt32(t1)
 
     advancePC(3)
@@ -1112,7 +1209,7 @@ ipintOp(_i32_load16u_mem, macro()
     # pop index
     popMemoryIndex(t0)
     loadStoreMakePointerFast(1[PC], 2[PC], t0, 2, t1, t2, .ipint_i32_load16u_mem_slow_path)
-    loadh [t0], t1
+    wasmLoadh([t0], t1)
     pushInt32(t1)
 
     advancePC(3)
@@ -1148,7 +1245,7 @@ ipintOp(_i64_load16s_mem, macro()
     # pop index
     popMemoryIndex(t0)
     loadStoreMakePointerFast(1[PC], 2[PC], t0, 2, t1, t2, .ipint_i64_load16s_mem_slow_path)
-    loadhsq [t0], t1
+    wasmLoadhsq([t0], t1)
     pushInt64(t1)
 
     advancePC(3)
@@ -1160,7 +1257,7 @@ ipintOp(_i64_load16u_mem, macro()
     # pop index
     popMemoryIndex(t0)
     loadStoreMakePointerFast(1[PC], 2[PC], t0, 2, t1, t2, .ipint_i64_load16u_mem_slow_path)
-    loadh [t0], t1
+    wasmLoadh([t0], t1)
     pushInt64(t1)
 
     advancePC(3)
@@ -1172,7 +1269,7 @@ ipintOp(_i64_load32s_mem, macro()
     # pop index
     popMemoryIndex(t0)
     loadStoreMakePointerFast(1[PC], 2[PC], t0, 4, t1, t2, .ipint_i64_load32s_mem_slow_path)
-    loadi [t0], t1
+    wasmLoadi([t0], t1)
     sxi2q t1, t1
     pushInt64(t1)
 
@@ -1185,7 +1282,7 @@ ipintOp(_i64_load32u_mem, macro()
     # pop index
     popMemoryIndex(t0)
     loadStoreMakePointerFast(1[PC], 2[PC], t0, 4, t1, t2, .ipint_i64_load32u_mem_slow_path)
-    loadi [t0], t1
+    wasmLoadi([t0], t1)
     pushInt64(t1)
 
     advancePC(3)
@@ -1199,7 +1296,7 @@ ipintOp(_i32_store_mem, macro()
     # pop index
     popMemoryIndex(t0)
     loadStoreMakePointerFast(1[PC], 2[PC], t0, 4, t1, t2, .ipint_i32_store_mem_slow_path)
-    storei t3, [t0]
+    wasmStorei(t3, [t0])
     advancePC(3)
     nextIPIntInstruction()
 end)
@@ -1211,7 +1308,7 @@ ipintOp(_i64_store_mem, macro()
     # pop index
     popMemoryIndex(t0)
     loadStoreMakePointerFast(1[PC], 2[PC], t0, 8, t1, t2, .ipint_i64_store_mem_slow_path)
-    storeq t3, [t0]
+    wasmStoreq(t3, [t0])
     advancePC(3)
     nextIPIntInstruction()
 end)
@@ -1223,7 +1320,7 @@ ipintOp(_f32_store_mem, macro()
     # pop index
     popMemoryIndex(t0)
     loadStoreMakePointerFast(1[PC], 2[PC], t0, 4, t1, t2, .ipint_f32_store_mem_slow_path)
-    storef ft0, [t0]
+    wasmStoref(ft0, [t0])
     advancePC(3)
     nextIPIntInstruction()
 end)
@@ -1235,7 +1332,7 @@ ipintOp(_f64_store_mem, macro()
     # pop index
     popMemoryIndex(t0)
     loadStoreMakePointerFast(1[PC], 2[PC], t0, 8, t1, t2, .ipint_f64_store_mem_slow_path)
-    stored ft0, [t0]
+    wasmStored(ft0, [t0])
     advancePC(3)
     nextIPIntInstruction()
 end)
@@ -1259,7 +1356,7 @@ ipintOp(_i32_store16_mem, macro()
     # pop index
     popMemoryIndex(t0)
     loadStoreMakePointerFast(1[PC], 2[PC], t0, 2, t1, t2, .ipint_i32_store16_mem_slow_path)
-    storeh t3, [t0]
+    wasmStoreh(t3, [t0])
     advancePC(3)
     nextIPIntInstruction()
 end)
@@ -1283,7 +1380,7 @@ ipintOp(_i64_store16_mem, macro()
     # pop index
     popMemoryIndex(t0)
     loadStoreMakePointerFast(1[PC], 2[PC], t0, 2, t1, t2, .ipint_i64_store16_mem_slow_path)
-    storeh t3, [t0]
+    wasmStoreh(t3, [t0])
     advancePC(3)
     nextIPIntInstruction()
 end)
@@ -1295,7 +1392,7 @@ ipintOp(_i64_store32_mem, macro()
     # pop index
     popMemoryIndex(t0)
     loadStoreMakePointerFast(1[PC], 2[PC], t0, 4, t1, t2, .ipint_i64_store32_mem_slow_path)
-    storei t3, [t0]
+    wasmStorei(t3, [t0])
     advancePC(3)
     nextIPIntInstruction()
 end)
@@ -1323,7 +1420,7 @@ ipintOp(_memory_grow, macro()
     loadb IPInt::MemoryGrowMetadata::memoryIndex[MC], a2
     advanceMC(constexpr (sizeof(IPInt::MemoryGrowMetadata)))
     operationCall(macro() cCall3(_ipint_extern_memory_grow) end)
-    pushInt32(r0)
+    pushQuad(r0)
     ipintReloadMemory(t2)
     advancePC(2)
     nextIPIntInstruction()
@@ -1360,7 +1457,7 @@ end)
 ipintOp(_f32_const, macro()
     # f32.const
     # Load pre-computed value from metadata
-    loadf 1[PC], ft0
+    wasmLoadf(1[PC], ft0)
     pushFloat32(ft0)
 
     advancePC(5)
@@ -1370,7 +1467,7 @@ end)
 ipintOp(_f64_const, macro()
     # f64.const
     # Load pre-computed value from metadata
-    loadd 1[PC], ft0
+    wasmLoadd(1[PC], ft0)
     pushFloat64(ft0)
 
     advancePC(9)
@@ -3545,7 +3642,7 @@ ipintOp(_ref_cast, macro()
     popQuad(a3)
     operationCallMayThrow(macro() cCall3(_ipint_extern_ref_cast) end)
 
-    pushInt32(r0)
+    pushQuad(r0)
 
     loadb IPInt::RefTestCastMetadata::length[MC], t0
     advancePCByReg(t0)
@@ -3559,7 +3656,7 @@ ipintOp(_ref_cast_nullable, macro()
     popQuad(a3)
     operationCallMayThrow(macro() cCall3(_ipint_extern_ref_cast) end)
 
-    pushInt32(r0)
+    pushQuad(r0)
 
     loadb IPInt::RefTestCastMetadata::length[MC], t0
     advancePCByReg(t0)
@@ -9872,7 +9969,9 @@ macro weakCASLoopHalf(mem, value, scratch1AndOldValue, scratch2, fn)
     else
     .loop:
         loadlinkacqh [mem], scratch1AndOldValue
+        wasmSwaph(scratch1AndOldValue)
         fn(value, scratch1AndOldValue, scratch2)
+        wasmSwaph(scratch2)
         storecondrelh ws2, scratch2, [mem]
         bineq ws2, 0, .loop
     end
@@ -9889,7 +9988,9 @@ macro weakCASLoopInt(mem, value, scratch1AndOldValue, scratch2, fn)
     else
     .loop:
         loadlinkacqi [mem], scratch1AndOldValue
+        wasmSwapi(scratch1AndOldValue)
         fn(value, scratch1AndOldValue, scratch2)
+        wasmSwapi(scratch2)
         storecondreli ws2, scratch2, [mem]
         bineq ws2, 0, .loop
     end
@@ -9906,7 +10007,9 @@ macro weakCASLoopQuad(mem, value, scratch1AndOldValue, scratch2, fn)
     else
     .loop:
         loadlinkacqq [mem], scratch1AndOldValue
+        wasmSwapq(scratch1AndOldValue)
         fn(value, scratch1AndOldValue, scratch2)
+        wasmSwapq(scratch2)
         storecondrelq ws2, scratch2, [mem]
         bineq ws2, 0, .loop
     end
@@ -9946,7 +10049,7 @@ macro doI32AtomicLoad(mem, dst)
         atomicloadi [mem], dst
     elsif PPC64
         fence
-        loadi [mem], dst
+        wasmLoadi([mem], dst)
         fence
     else
         error
@@ -9959,7 +10062,7 @@ macro doI64AtomicLoad(mem, dst)
         atomicloadq [mem], dst
     elsif PPC64
         fence
-        loadq [mem], dst
+        wasmLoadq([mem], dst)
         fence
     else
         error
@@ -9985,7 +10088,7 @@ macro doI32AtomicLoad16(mem, dst)
         atomicloadh [mem], dst
     elsif PPC64
         fence
-        loadh [mem], dst
+        wasmLoadh([mem], dst)
         fence
     else
         error
@@ -10011,7 +10114,7 @@ macro doI64AtomicLoad16(mem, dst)
         atomicloadh [mem], dst
     elsif PPC64
         fence
-        loadh [mem], dst
+        wasmLoadh([mem], dst)
         fence
     else
         error
@@ -10024,7 +10127,7 @@ macro doI64AtomicLoad32(mem, dst)
         atomicloadi [mem], dst
     elsif PPC64
         fence
-        loadi [mem], dst
+        wasmLoadi([mem], dst)
         fence
     else
         error
@@ -11688,6 +11791,8 @@ end
 macro weakCASExchangeHalf(mem, value, expected, scratch, scratch2)
     if ARM64 or PPC64
     validateOpcodeConfig(scratch2)
+    wasmSwaph(expected)
+    wasmSwaph(value)
     .loop:
         loadlinkacqh [mem], scratch2
         bqneq expected, scratch2, .fail
@@ -11700,6 +11805,7 @@ macro weakCASExchangeHalf(mem, value, expected, scratch, scratch2)
         jmp .loop
     .done:
         move scratch2, expected
+        wasmSwaph(expected)
     else
         error
     end
@@ -11708,6 +11814,8 @@ end
 macro weakCASExchangeInt(mem, value, expected, scratch, scratch2)
     if ARM64 or PPC64
     validateOpcodeConfig(scratch2)
+    wasmSwapi(expected)
+    wasmSwapi(value)
     .loop:
         loadlinkacqi [mem], scratch2
         bqneq expected, scratch2, .fail
@@ -11720,6 +11828,7 @@ macro weakCASExchangeInt(mem, value, expected, scratch, scratch2)
         jmp .loop
     .done:
         move scratch2, expected
+        wasmSwapi(expected)
     else
         error
     end
@@ -11728,6 +11837,8 @@ end
 macro weakCASExchangeQuad(mem, value, expected, scratch, scratch2)
     if ARM64 or PPC64
     validateOpcodeConfig(scratch2)
+    wasmSwapq(expected)
+    wasmSwapq(value)
     .loop:
         loadlinkacqq [mem], scratch2
         bqneq expected, scratch2, .fail
@@ -11740,6 +11851,7 @@ macro weakCASExchangeQuad(mem, value, expected, scratch, scratch2)
         jmp .loop
     .done:
         move scratch2, expected
+        wasmSwapq(expected)
     else
         error
     end
@@ -11880,7 +11992,7 @@ end)
 .ipint_i32_load_mem_slow_path:
     leap 1[PC], t4
     loadStoreMakePointerSlow(t4, t0, 4, t1, t2, t5, t6)
-    loadi [t0], t1
+    wasmLoadi([t0], t1)
     pushInt32(t1)
     move t4, PC
     nextIPIntInstruction()
@@ -11888,7 +12000,7 @@ end)
 .ipint_i64_load_mem_slow_path:
     leap 1[PC], t4
     loadStoreMakePointerSlow(t4, t0, 8, t1, t2, t5, t6)
-    loadq [t0], t1
+    wasmLoadq([t0], t1)
     pushInt64(t1)
     move t4, PC
     nextIPIntInstruction()
@@ -11896,7 +12008,7 @@ end)
 .ipint_f32_load_mem_slow_path:
     leap 1[PC], t4
     loadStoreMakePointerSlow(t4, t0, 4, t1, t2, t5, t6)
-    loadf [t0], ft0
+    wasmLoadf([t0], ft0)
     pushFloat32(ft0)
     move t4, PC
     nextIPIntInstruction()
@@ -11904,7 +12016,7 @@ end)
 .ipint_f64_load_mem_slow_path:
     leap 1[PC], t4
     loadStoreMakePointerSlow(t4, t0, 8, t1, t2, t5, t6)
-    loadd [t0], ft0
+    wasmLoadd([t0], ft0)
     pushFloat64(ft0)
     move t4, PC
     nextIPIntInstruction()
@@ -11928,7 +12040,7 @@ end)
 .ipint_i32_load16s_mem_slow_path:
     leap 1[PC], t4
     loadStoreMakePointerSlow(t4, t0, 2, t1, t2, t5, t6)
-    loadhsi [t0], t1
+    wasmLoadhsi([t0], t1)
     pushInt32(t1)
     move t4, PC
     nextIPIntInstruction()
@@ -11936,7 +12048,7 @@ end)
 .ipint_i32_load16u_mem_slow_path:
     leap 1[PC], t4
     loadStoreMakePointerSlow(t4, t0, 2, t1, t2, t5, t6)
-    loadh [t0], t1
+    wasmLoadh([t0], t1)
     pushInt32(t1)
     move t4, PC
     nextIPIntInstruction()
@@ -11960,7 +12072,7 @@ end)
 .ipint_i64_load16s_mem_slow_path:
     leap 1[PC], t4
     loadStoreMakePointerSlow(t4, t0, 2, t1, t2, t5, t6)
-    loadhsq [t0], t1
+    wasmLoadhsq([t0], t1)
     pushInt64(t1)
     move t4, PC
     nextIPIntInstruction()
@@ -11968,7 +12080,7 @@ end)
 .ipint_i64_load16u_mem_slow_path:
     leap 1[PC], t4
     loadStoreMakePointerSlow(t4, t0, 2, t1, t2, t5, t6)
-    loadh [t0], t1
+    wasmLoadh([t0], t1)
     pushInt64(t1)
     move t4, PC
     nextIPIntInstruction()
@@ -11976,7 +12088,7 @@ end)
 .ipint_i64_load32s_mem_slow_path:
     leap 1[PC], t4
     loadStoreMakePointerSlow(t4, t0, 4, t1, t2, t5, t6)
-    loadi [t0], t1
+    wasmLoadi([t0], t1)
     sxi2q t1, t1
     pushInt64(t1)
     move t4, PC
@@ -11985,7 +12097,7 @@ end)
 .ipint_i64_load32u_mem_slow_path:
     leap 1[PC], t4
     loadStoreMakePointerSlow(t4, t0, 4, t1, t2, t5, t6)
-    loadi [t0], t1
+    wasmLoadi([t0], t1)
     pushInt64(t1)
     move t4, PC
     nextIPIntInstruction()
@@ -11993,28 +12105,28 @@ end)
 .ipint_i32_store_mem_slow_path:
     leap 1[PC], t4
     loadStoreMakePointerSlow(t4, t0, 4, t1, t2, t5, t6)
-    storei t3, [t0]
+    wasmStorei(t3, [t0])
     move t4, PC
     nextIPIntInstruction()
 
 .ipint_i64_store_mem_slow_path:
     leap 1[PC], t4
     loadStoreMakePointerSlow(t4, t0, 8, t1, t2, t5, t6)
-    storeq t3, [t0]
+    wasmStoreq(t3, [t0])
     move t4, PC
     nextIPIntInstruction()
 
 .ipint_f32_store_mem_slow_path:
     leap 1[PC], t4
     loadStoreMakePointerSlow(t4, t0, 4, t1, t2, t5, t6)
-    storef ft0, [t0]
+    wasmStoref(ft0, [t0])
     move t4, PC
     nextIPIntInstruction()
 
 .ipint_f64_store_mem_slow_path:
     leap 1[PC], t4
     loadStoreMakePointerSlow(t4, t0, 8, t1, t2, t5, t6)
-    stored ft0, [t0]
+    wasmStored(ft0, [t0])
     move t4, PC
     nextIPIntInstruction()
 
@@ -12028,7 +12140,7 @@ end)
 .ipint_i32_store16_mem_slow_path:
     leap 1[PC], t4
     loadStoreMakePointerSlow(t4, t0, 2, t1, t2, t5, t6)
-    storeh t3, [t0]
+    wasmStoreh(t3, [t0])
     move t4, PC
     nextIPIntInstruction()
 
@@ -12042,14 +12154,14 @@ end)
 .ipint_i64_store16_mem_slow_path:
     leap 1[PC], t4
     loadStoreMakePointerSlow(t4, t0, 2, t1, t2, t5, t6)
-    storeh t3, [t0]
+    wasmStoreh(t3, [t0])
     move t4, PC
     nextIPIntInstruction()
 
 .ipint_i64_store32_mem_slow_path:
     leap 1[PC], t4
     loadStoreMakePointerSlow(t4, t0, 4, t1, t2, t5, t6)
-    storei t3, [t0]
+    wasmStorei(t3, [t0])
     move t4, PC
     nextIPIntInstruction()
 
@@ -13264,42 +13376,42 @@ if PPC64
     # the plain FPR slots copy all 16 bytes.
 
 mintAlign(_ffa0)
-    loadf [mintSS], wfa0
+    loadf PayloadOffset[mintSS], wfa0
     addq V128ISize, mintSS
     mintArgDispatch()
 
 mintAlign(_ffa1)
-    loadf [mintSS], wfa1
+    loadf PayloadOffset[mintSS], wfa1
     addq V128ISize, mintSS
     mintArgDispatch()
 
 mintAlign(_ffa2)
-    loadf [mintSS], wfa2
+    loadf PayloadOffset[mintSS], wfa2
     addq V128ISize, mintSS
     mintArgDispatch()
 
 mintAlign(_ffa3)
-    loadf [mintSS], wfa3
+    loadf PayloadOffset[mintSS], wfa3
     addq V128ISize, mintSS
     mintArgDispatch()
 
 mintAlign(_ffa4)
-    loadf [mintSS], wfa4
+    loadf PayloadOffset[mintSS], wfa4
     addq V128ISize, mintSS
     mintArgDispatch()
 
 mintAlign(_ffa5)
-    loadf [mintSS], wfa5
+    loadf PayloadOffset[mintSS], wfa5
     addq V128ISize, mintSS
     mintArgDispatch()
 
 mintAlign(_ffa6)
-    loadf [mintSS], wfa6
+    loadf PayloadOffset[mintSS], wfa6
     addq V128ISize, mintSS
     mintArgDispatch()
 
 mintAlign(_ffa7)
-    loadf [mintSS], wfa7
+    loadf PayloadOffset[mintSS], wfa7
     addq V128ISize, mintSS
     mintArgDispatch()
 
@@ -13500,42 +13612,42 @@ if PPC64
 
 mintAlign(_ffr0)
     subp StackValueSize, mintRetDst
-    storef wfa0, [mintRetDst]
+    storef wfa0, PayloadOffset[mintRetDst]
     mintRetDispatch()
 
 mintAlign(_ffr1)
     subp StackValueSize, mintRetDst
-    storef wfa1, [mintRetDst]
+    storef wfa1, PayloadOffset[mintRetDst]
     mintRetDispatch()
 
 mintAlign(_ffr2)
     subp StackValueSize, mintRetDst
-    storef wfa2, [mintRetDst]
+    storef wfa2, PayloadOffset[mintRetDst]
     mintRetDispatch()
 
 mintAlign(_ffr3)
     subp StackValueSize, mintRetDst
-    storef wfa3, [mintRetDst]
+    storef wfa3, PayloadOffset[mintRetDst]
     mintRetDispatch()
 
 mintAlign(_ffr4)
     subp StackValueSize, mintRetDst
-    storef wfa4, [mintRetDst]
+    storef wfa4, PayloadOffset[mintRetDst]
     mintRetDispatch()
 
 mintAlign(_ffr5)
     subp StackValueSize, mintRetDst
-    storef wfa5, [mintRetDst]
+    storef wfa5, PayloadOffset[mintRetDst]
     mintRetDispatch()
 
 mintAlign(_ffr6)
     subp StackValueSize, mintRetDst
-    storef wfa6, [mintRetDst]
+    storef wfa6, PayloadOffset[mintRetDst]
     mintRetDispatch()
 
 mintAlign(_ffr7)
     subp StackValueSize, mintRetDst
-    storef wfa7, [mintRetDst]
+    storef wfa7, PayloadOffset[mintRetDst]
     mintRetDispatch()
 
 .ipint_mint_end:
@@ -14036,42 +14148,42 @@ if PPC64
     # the plain FPR slots copy all 16 bytes.
 
 argumINTAlign(_ffa0)
-    storef wfa0, [argumINTDst]
+    storef wfa0, PayloadOffset[argumINTDst]
     subp LocalSize, argumINTDst
     argumINTDispatch()
 
 argumINTAlign(_ffa1)
-    storef wfa1, [argumINTDst]
+    storef wfa1, PayloadOffset[argumINTDst]
     subp LocalSize, argumINTDst
     argumINTDispatch()
 
 argumINTAlign(_ffa2)
-    storef wfa2, [argumINTDst]
+    storef wfa2, PayloadOffset[argumINTDst]
     subp LocalSize, argumINTDst
     argumINTDispatch()
 
 argumINTAlign(_ffa3)
-    storef wfa3, [argumINTDst]
+    storef wfa3, PayloadOffset[argumINTDst]
     subp LocalSize, argumINTDst
     argumINTDispatch()
 
 argumINTAlign(_ffa4)
-    storef wfa4, [argumINTDst]
+    storef wfa4, PayloadOffset[argumINTDst]
     subp LocalSize, argumINTDst
     argumINTDispatch()
 
 argumINTAlign(_ffa5)
-    storef wfa5, [argumINTDst]
+    storef wfa5, PayloadOffset[argumINTDst]
     subp LocalSize, argumINTDst
     argumINTDispatch()
 
 argumINTAlign(_ffa6)
-    storef wfa6, [argumINTDst]
+    storef wfa6, PayloadOffset[argumINTDst]
     subp LocalSize, argumINTDst
     argumINTDispatch()
 
 argumINTAlign(_ffa7)
-    storef wfa7, [argumINTDst]
+    storef wfa7, PayloadOffset[argumINTDst]
     subp LocalSize, argumINTDst
     argumINTDispatch()
 end
