@@ -13,6 +13,7 @@
 #include "include/core/SkUnPreMultiply.h"
 #include "include/private/SkFloatingPoint.h"
 #include "include/private/SkTPin.h"
+#include "src/core/SkEndian.h"
 #include "src/core/SkColorData.h"
 #include "src/core/SkColorPriv.h"
 #include "src/core/SkConvertPixels.h"
@@ -194,6 +195,14 @@ SkColor SkPixmap::getColor(int x, int y) const {
     SkASSERT((unsigned)y < (unsigned)this->height());
 
     const bool needsUnpremul = (kPremul_SkAlphaType == fInfo.alphaType());
+    // 32-bit pixel formats are defined as little-endian words.
+    auto load32 = [this](int x, int y) {
+        uint32_t value = *this->addr32(x, y);
+#ifdef SK_CPU_BENDIAN
+        value = SkEndianSwap32(value);
+#endif
+        return value;
+    };
     auto toColor = [needsUnpremul](uint32_t maybePremulColor) {
         return needsUnpremul ? SkUnPreMultiply::PMColorToColor(maybePremulColor)
                              : SkSwizzle_BGRA_to_PMColor(maybePremulColor);
@@ -235,31 +244,31 @@ SkColor SkPixmap::getColor(int x, int y) const {
             return SkColorSetRGB(value * (255 / 65535.0f), 0, 0);
         }
         case kR16G16_unorm_SkColorType: {
-            uint32_t value = *this->addr32(x, y);
+            uint32_t value = load32(x, y);
             uint8_t r = ((value >>  0) & 0xffff) * (255.0f / 65535.0f),
                     g = ((value >> 16) & 0xffff) * (255.0f / 65535.0f);
             return SkColorSetRGB(r, g, 0);
         }
         case kR16G16_float_SkColorType: {
-            uint32_t value = *this->addr32(x, y);
+            uint32_t value = load32(x, y);
             float r = SkHalfToFloat((uint16_t)(value >>  0) & 0xffff),
                   g = SkHalfToFloat((uint16_t)(value >> 16) & 0xffff);
             return SkColorSetRGB((uint8_t)(255 * r), (uint8_t)(255 * g), 0);
         }
         case kRGB_888x_SkColorType: {
-            uint32_t value = *this->addr32(x, y);
+            uint32_t value = load32(x, y);
             return SkSwizzle_RB(value | 0xff000000);
         }
         case kBGRA_8888_SkColorType: {
-            uint32_t value = *this->addr32(x, y);
+            uint32_t value = load32(x, y);
             return toColor(SkSwizzle_BGRA_to_PMColor(value));
         }
         case kRGBA_8888_SkColorType: {
-            uint32_t value = *this->addr32(x, y);
+            uint32_t value = load32(x, y);
             return toColor(SkSwizzle_RGBA_to_PMColor(value));
         }
         case kSRGBA_8888_SkColorType: {
-            uint32_t value = *this->addr32(x, y);
+            uint32_t value = load32(x, y);
             float r = ((value >>  0) & 0xff) * (1/255.0f),
                   g = ((value >>  8) & 0xff) * (1/255.0f),
                   b = ((value >> 16) & 0xff) * (1/255.0f),
@@ -284,7 +293,7 @@ SkColor SkPixmap::getColor(int x, int y) const {
             return SkColorSetARGB(a, r, g, b);
         }
         case kRGB_101010x_SkColorType: {
-            uint32_t value = *this->addr32(x, y);
+            uint32_t value = load32(x, y);
             // Convert 10-bit rgb to 8-bit rgb
             return SkColorSetRGB(((value >>  0) & 0x3ff) * (255/1023.0f),
                                  ((value >> 10) & 0x3ff) * (255/1023.0f),
@@ -295,7 +304,7 @@ SkColor SkPixmap::getColor(int x, int y) const {
             return 0;
         }
         case kBGR_101010x_SkColorType: {
-            uint32_t value = *this->addr32(x, y);
+            uint32_t value = load32(x, y);
             // Convert 10-bit bgr to 8-bit rgb
             return SkColorSetRGB(((value >> 20) & 0x3ff) * (255/1023.0f),
                                  ((value >> 10) & 0x3ff) * (255/1023.0f),
@@ -303,7 +312,7 @@ SkColor SkPixmap::getColor(int x, int y) const {
         }
         case kBGRA_1010102_SkColorType:
         case kRGBA_1010102_SkColorType: {
-            uint32_t value = *this->addr32(x, y);
+            uint32_t value = load32(x, y);
             float r = ((value >>  0) & 0x3ff) * (1/1023.0f),
                   g = ((value >> 10) & 0x3ff) * (1/1023.0f),
                   b = ((value >> 20) & 0x3ff) * (1/1023.0f),
@@ -356,7 +365,7 @@ SkColor SkPixmap::getColor(int x, int y) const {
             skvx::float4 p4 = from_half(skvx::half4::Load(addr));
             p4[3] = 1.0f;
             // p4 is RGBA, but we want BGRA, so we need to swap next
-            return Sk4f_toL32(swizzle_rb(p4));
+            return Sk4f_toColorValue(swizzle_rb(p4));
         }
         case kRGBA_F16Norm_SkColorType:
         case kRGBA_F16_SkColorType: {
@@ -368,7 +377,7 @@ SkColor SkPixmap::getColor(int x, int y) const {
                 p4 = p4 * skvx::float4(inva, inva, inva, 1);
             }
             // p4 is RGBA, but we want BGRA, so we need to swap next
-            return Sk4f_toL32(swizzle_rb(p4));
+            return Sk4f_toColorValue(swizzle_rb(p4));
         }
         case kRGBA_F32_SkColorType: {
             const float* rgba =
@@ -380,7 +389,7 @@ SkColor SkPixmap::getColor(int x, int y) const {
                 p4 = p4 * skvx::float4(inva, inva, inva, 1);
             }
             // p4 is RGBA, but we want BGRA, so we need to swap next
-            return Sk4f_toL32(swizzle_rb(p4));
+            return Sk4f_toColorValue(swizzle_rb(p4));
         }
         case kUnknown_SkColorType:
             break;
@@ -397,6 +406,14 @@ SkColor4f SkPixmap::getColor4f(int x, int y) const {
     SkASSERT((unsigned)y < (unsigned)this->height());
 
     const bool needsUnpremul = (kPremul_SkAlphaType == fInfo.alphaType());
+    // 32-bit pixel formats are defined as little-endian words.
+    auto load32 = [this](int x, int y) {
+        uint32_t value = *this->addr32(x, y);
+#ifdef SK_CPU_BENDIAN
+        value = SkEndianSwap32(value);
+#endif
+        return value;
+    };
     auto toColor = [needsUnpremul](uint32_t maybePremulColor) {
         return needsUnpremul ? SkUnPreMultiply::PMColorToColor(maybePremulColor)
                              : SkSwizzle_BGRA_to_PMColor(maybePremulColor);
@@ -437,27 +454,27 @@ SkColor4f SkPixmap::getColor4f(int x, int y) const {
             return SkColor4f::FromColor(SkColorSetRGB((uint8_t)(value), (uint8_t)(value >> 8), 0));
         }
         case kR16G16_unorm_SkColorType: {
-            uint32_t value = *this->addr32(x, y);
+            uint32_t value = load32(x, y);
             float r = ((value >>  0) & 0xffff) * (1.0f / 65535.0f),
                   g = ((value >> 16) & 0xffff) * (1.0f / 65535.0f);
             return SkColor4f{r, g, 0.0, 1.0};
         }
         case kR16G16_float_SkColorType: {
-            uint32_t value = *this->addr32(x, y);
+            uint32_t value = load32(x, y);
             float r = SkHalfToFloat((value >> 0 ) & 0xffff);
             float g = SkHalfToFloat((value >> 16) & 0xffff);
             return SkColor4f{r, g, 0.0, 1.0};
         }
         case kRGB_888x_SkColorType: {
-            SkColor c = SkSwizzle_RB(*this->addr32(x, y) | 0xff000000);
+            SkColor c = SkSwizzle_RB(load32(x, y) | 0xff000000);
             return SkColor4f::FromColor(c);
         }
         case kBGRA_8888_SkColorType: {
-            SkPMColor c = SkSwizzle_BGRA_to_PMColor(*this->addr32(x, y));
+            SkPMColor c = SkSwizzle_BGRA_to_PMColor(load32(x, y));
             return SkColor4f::FromColor(toColor(c));
         }
         case kRGBA_8888_SkColorType: {
-            SkPMColor c = SkSwizzle_RGBA_to_PMColor(*this->addr32(x, y));
+            SkPMColor c = SkSwizzle_RGBA_to_PMColor(load32(x, y));
             return SkColor4f::FromColor(toColor(c));
         }
         case kSRGBA_8888_SkColorType: {
@@ -466,7 +483,7 @@ SkColor4f SkPixmap::getColor4f(int x, int y) const {
                                        : std::pow(x * (1 / 1.055f) + (0.055f / 1.055f), 2.4f);
             };
 
-            uint32_t value = *this->addr32(x, y);
+            uint32_t value = load32(x, y);
             float r = ((value >>  0) & 0xff) * (1 / 255.0f),
                   g = ((value >>  8) & 0xff) * (1 / 255.0f),
                   b = ((value >> 16) & 0xff) * (1 / 255.0f),
@@ -486,7 +503,7 @@ SkColor4f SkPixmap::getColor4f(int x, int y) const {
             return {};
         }
         case kRGB_101010x_SkColorType: {
-            uint32_t value = *this->addr32(x, y);
+            uint32_t value = load32(x, y);
             // Convert 10-bit RGB to floats
             return SkColor4f{((value >>  0) & 0x3ff) / (1023.0f),
                              ((value >> 10) & 0x3ff) / (1023.0f),
@@ -494,7 +511,7 @@ SkColor4f SkPixmap::getColor4f(int x, int y) const {
                              1.0f};
         }
         case kBGR_101010x_SkColorType: {
-            uint32_t value = *this->addr32(x, y);
+            uint32_t value = load32(x, y);
             // Convert 10-bit BGR color values to RGBA floats
             return SkColor4f{((value >> 20) & 0x3ff) / (1023.0f),
                              ((value >> 10) & 0x3ff) / (1023.0f),
@@ -503,7 +520,7 @@ SkColor4f SkPixmap::getColor4f(int x, int y) const {
         }
         case kRGBA_1010102_SkColorType:
         case kBGRA_1010102_SkColorType: {
-            uint32_t value = *this->addr32(x, y);
+            uint32_t value = load32(x, y);
             // Convert 10-bit color values to floats
             float b = ((value >>  0) & 0x3ff) * (1 / 1023.0f),
                   g = ((value >> 10) & 0x3ff) * (1 / 1023.0f),
@@ -652,7 +669,11 @@ bool SkPixmap::computeIsOpaque() const {
                 for (int x = 0; x < width; ++x) {
                     c &= row[x];
                 }
-                if (0xFF != SkGetPackedA32(c)) {
+                SkPMColor packed = c;
+#ifdef SK_CPU_BENDIAN
+                packed = SkEndianSwap32(packed);  // Pixels are little-endian words.
+#endif
+                if (0xFF != SkGetPackedA32(packed)) {
                     return false;
                 }
             }
@@ -691,7 +712,11 @@ bool SkPixmap::computeIsOpaque() const {
                 for (int x = 0; x < width; ++x) {
                     c &= row[x];
                 }
-                if (0b11 != c >> 30) {
+                uint32_t packed = c;
+#ifdef SK_CPU_BENDIAN
+                packed = SkEndianSwap32(packed);  // Pixels are little-endian words.
+#endif
+                if (0b11 != packed >> 30) {
                     return false;
                 }
             }
