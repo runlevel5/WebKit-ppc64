@@ -738,15 +738,23 @@ ALWAYS_INLINE const CharacterType* findInterleaved(std::span<const CharacterType
 {
     constexpr size_t stride = SIMD::stride<CharacterType> * 2;
     static_assert(threshold >= stride);
+    // vectorMatch expects val[0] to hold each character's low byte and val[1] its high byte.
+    auto load = [](const CharacterType* pointer) ALWAYS_INLINE_LAMBDA {
+        auto pair = simde_vld2q_u8(std::bit_cast<const uint8_t*>(pointer));
+#if CPU(BIG_ENDIAN)
+        std::swap(pair.val[0], pair.val[1]);
+#endif
+        return pair;
+    };
     const auto* cursor = span.data();
     const auto* end = std::to_address(span.end());
     if (span.size() >= threshold) {
         for (; cursor + stride <= end; cursor += stride) {
-            if (auto index = vectorMatch(simde_vld2q_u8(std::bit_cast<const uint8_t*>(cursor))))
+            if (auto index = vectorMatch(load(cursor)))
                 return cursor + index.value();
         }
         if (cursor < end) {
-            if (auto index = vectorMatch(simde_vld2q_u8(std::bit_cast<const uint8_t*>(end - stride))))
+            if (auto index = vectorMatch(load(end - stride)))
                 return end - stride + index.value();
         }
         return end;

@@ -1196,6 +1196,13 @@ bool gstElementFactoryEquals(GstElement* element, ASCIILiteral name)
 GstElement* /* (transfer floating) */ createAutoAudioSink(const String& role)
 {
     auto* audioSink = makeGStreamerElement("autoaudiosink"_s);
+    if (!audioSink) {
+        // autoaudiosink comes from gst-plugins-good. Without it, play silently rather than abort;
+        // sync keeps media paced to the clock.
+        audioSink = makeGStreamerElement("fakesink"_s);
+        g_object_set(audioSink, "sync", TRUE, nullptr);
+        return audioSink;
+    }
     g_signal_connect_data(audioSink, "child-added", G_CALLBACK(+[](GstChildProxy*, GObject* object, gchar*, gpointer userData) {
         auto* role = reinterpret_cast<StringImpl*>(userData);
         auto* objectClass = G_OBJECT_GET_CLASS(object);

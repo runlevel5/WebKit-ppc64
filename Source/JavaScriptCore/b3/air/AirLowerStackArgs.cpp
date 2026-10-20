@@ -32,6 +32,7 @@
 #include "AirInsertionSet.h"
 #include "AirInstInlines.h"
 #include "AirPhaseScope.h"
+#include "MaxFrameExtentForSlowPathCall.h"
 
 namespace JSC { namespace B3 { namespace Air {
 
@@ -52,6 +53,14 @@ void lowerStackArgs(Code& code)
             }
         }
     }
+
+#if CPU(PPC64)
+    // An ELFv2 C callee saves CR, LR and the TOC at sp + 8..31 of its caller's frame.
+    // Patchpoints also reach C through thunks that build no frame of their own, and
+    // with no CCall and no spill slots sp == fp, so always keep that area below the
+    // frame, as the baseline JIT and DFG do.
+    code.requestCallArgAreaSizeInBytes(maxFrameExtentForSlowPathCall);
+#endif
 
     code.setFrameSize(code.frameSize() + code.callArgAreaSizeInBytes());
 
@@ -103,9 +112,11 @@ void lowerStackArgs(Code& code)
                 // We solve this in AirAllocateRegistersAndStackAndGenerateCode.cpp.
                 UNUSED_PARAM(insertionIndex);
                 return result;
-#elif CPU(X86_64)
+#elif CPU(X86_64) || CPU(PPC64)
                 UNUSED_PARAM(insertionIndex);
                 // Can't happen on x86: immediates are always big enough for frame size.
+                // Same on PPC64: isValidAddrForm() accepts any offset (the
+                // MacroAssembler folds large displacements via scratch registers).
                 RELEASE_ASSERT_NOT_REACHED();
 #else
 #error Unhandled architecture.
@@ -187,12 +198,23 @@ void lowerStackArgs(Code& code)
             }
 
             inst.forEachArg(
-                [&] (Arg& arg, Arg::Role role, Bank, Width width) {
+                [&] (Arg& arg, Arg::Role role, Bank bank, Width width) {
                     switch (arg.kind()) {
                     case Arg::Stack: {
                         StackSlot* slot = arg.stackSlot();
                         if (inst.kind.opcode == Move && slot->kind() == StackSlotKind::Spill)
                             inst.kind.spill = true;
+                        // A narrower access to a spill slot means its low-order bytes, which are
+                        // at the end of the slot on big-endian. A stackmap (Patch) argument is the
+                        // exception: its rep is read back with a load of the whole slot, which
+                        // finds a narrow value in the low-order bytes by itself.
+                        Value::OffsetType narrowOffset = 0;
+#if CPU(BIG_ENDIAN)
+                        if (bank == GP && inst.kind.opcode != Patch && slot->kind() == StackSlotKind::Spill && !arg.offset() && bytesForWidth(width) < slot->byteSize())
+                            narrowOffset = slot->byteSize() - bytesForWidth(width);
+#else
+                        UNUSED_PARAM(bank);
+#endif
                         if (Arg::isZDef(role)
                             && slot->kind() == StackSlotKind::Spill
                             && slot->byteSize() > bytesForWidth(width)) {
@@ -207,7 +229,7 @@ void lowerStackArgs(Code& code)
                             Air::Opcode storeOpcode = Move32;
                             Air::Arg::Kind operandKind = Arg::ZeroReg;
                             Air::Arg operand = Arg::zeroReg();
-#elif CPU(X86_64) || CPU(ARM)
+#elif CPU(X86_64) || CPU(ARM) || CPU(PPC64)
                             Air::Opcode storeOpcode = Move32;
                             Air::Arg::Kind operandKind = Arg::Imm;
                             Air::Arg operand = Arg::imm(0);
@@ -217,10 +239,10 @@ void lowerStackArgs(Code& code)
                             RELEASE_ASSERT(isValidForm(storeOpcode, operandKind, Arg::Stack));
                             insertionSet.insert(
                                 instIndex + 1, storeOpcode, inst.origin, operand,
-                                stackAddr(instIndex + 1, arg, width, arg.offset() + 4 + slot->offsetFromFP()));
+                                stackAddr(instIndex + 1, arg, width, arg.offset() + (4 - narrowOffset) + slot->offsetFromFP()));
                             extendedOffsetAddrRegInUse = false;
                         }
-                        arg = stackAddr(instIndex, arg, width, arg.offset() + slot->offsetFromFP());
+                        arg = stackAddr(instIndex, arg, width, arg.offset() + narrowOffset + slot->offsetFromFP());
                         break;
                     }
                     case Arg::CallArg:

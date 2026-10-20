@@ -5551,7 +5551,9 @@ JSC_DEFINE_JIT_OPERATION(operationStringFromCodePointUntyped, EncodedJSValue, (J
     double codePointAsDouble = value.toNumber(globalObject);
     OPERATION_RETURN_IF_EXCEPTION(scope, encodedJSValue());
 
-    uint32_t codePoint = static_cast<uint32_t>(codePointAsDouble);
+    // Not static_cast: converting a negative or out-of-range double to uint32_t is undefined, and
+    // Clang uses that to fold away the check below.
+    uint32_t codePoint = truncateDoubleToUint32(codePointAsDouble);
     if (codePoint != codePointAsDouble || codePoint > UCHAR_MAX_VALUE) [[unlikely]] {
         throwRangeError(globalObject, scope, "Arguments contain a value that is out of range of code points"_s);
         OPERATION_RETURN(scope, encodedJSValue());

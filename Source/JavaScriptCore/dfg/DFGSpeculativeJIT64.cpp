@@ -31,6 +31,7 @@ WTF_ALLOW_UNSAFE_BUFFER_USAGE_BEGIN
 #if ENABLE(DFG_JIT)
 
 #include "AtomicsObject.h"
+#include "MaxFrameExtentForSlowPathCall.h"
 #include "BaselineJITRegisters.h"
 #include "CallFrameShuffler.h"
 #include "ClonedArguments.h"
@@ -103,7 +104,7 @@ GPRReg SpeculativeJIT::fillJSValue(Edge edge)
             m_gprs.retain(gpr, virtualRegister, SpillOrderSpilled);
             switch (spillFormat) {
             case DataFormatInt32: {
-                load32(addressFor(virtualRegister), gpr);
+                load32(payloadFor(virtualRegister), gpr);
                 or64(GPRInfo::numberTagRegister, gpr);
                 spillFormat = DataFormatJSInt32;
                 break;
@@ -984,7 +985,14 @@ void SpeculativeJIT::emitCall(Node* node)
         // - The caller frame and PC of a call to operationCallDirectEvalSloppy/operationCallDirectEvalStrict.
         // - Potentially two arguments on the stack.
         CodeBlock* baselineCodeBlock = m_graph.baselineCodeBlockFor(staticOrigin);
+#if CPU(PPC64)
+        // An ELFv2 C callee writes into [sp, sp + maxFrameExtentForSlowPathCall).
+        // The eval callee frame's CallerFrameAndPC is at sp - 16, so reserve the
+        // C-call area below it.
+        unsigned requiredBytes = sizeof(CallerFrameAndPC) + maxFrameExtentForSlowPathCall;
+#else
         unsigned requiredBytes = sizeof(CallerFrameAndPC) + sizeof(CallFrame*) * 2;
+#endif
         requiredBytes = WTF::roundUpToMultipleOf<stackAlignmentBytes()>(requiredBytes);
         subPtr(TrustedImm32(requiredBytes), stackPointerRegister);
         setupArguments<decltype(operationCallDirectEvalSloppy)>(calleeFrameGPR, evalScopeGPR, evalThisValueGPR, CCallHelpers::TrustedImmPtr(baselineCodeBlock), TrustedImm32(staticOrigin.bytecodeIndex().asBits()));
@@ -1034,11 +1042,20 @@ void SpeculativeJIT::emitCall(Node* node)
                     loadPtr(Address(GPRInfo::argumentGPR2, JSCallee::offsetOfScopeChain()), GPRInfo::argumentGPR0);
                 }
                 move(GPRInfo::callFrameRegister, GPRInfo::argumentGPR1);
+#if CPU(PPC64)
+                // An ELFv2 C callee saves CR/LR/TOC at sp + 8..31, in its caller's
+                // frame, and sp == cfr here, so those saves would overwrite this
+                // frame's header.
+                makeSpaceOnStackForCCall();
+#endif
                 if (Options::useJITCage()) {
                     move(TrustedImmPtr(nativeFunction.taggedPtr()), GPRInfo::argumentGPR2);
                     CCallHelpers::callOperation<OperationPtrTag>(vmEntryHostFunction);
                 } else
                     CCallHelpers::callOperation<HostFunctionPtrTag>(nativeFunction);
+                // sp stays lowered through the exception check: the HandleException
+                // thunk's own C call would otherwise clobber the callee slot that
+                // genericUnwind reads. The epilogue restores sp from cfr.
                 loadPtr(vm().addressOfException(), GPRInfo::regT2);
                 branchTestPtr(NonZero, GPRInfo::regT2).linkThunk(CodeLocationLabel(vm().getCTIStub(CommonJITThunkID::HandleException).retaggedCode<NoPtrTag>()), this);
                 emitFunctionEpilogue();
@@ -1109,7 +1126,21 @@ void SpeculativeJIT::emitCall(Node* node)
             if (isX86())
                 pop(selectScratchGPR(calleeGPR));
 
+#if CPU(PPC64)
+            // calleeGPR is dead once the callee is stored into the staged frame, so on a relink
+            // it may hold something else. Reload the callee from its slot.
+            load64(calleeFrameSlot(CallFrameSlot::callee), calleeGPR);
+            // The staged callee frame is at sp, and an ELFv2 C callee saves LR/TOC at
+            // 16(sp)/24(sp), its argumentCountIncludingThis and thisArgument slots. mainPath
+            // re-enters after those stores, so reserve the linkage area below the frame.
+            if (maxFrameExtentForSlowPathCall)
+                addPtr(TrustedImm32(-static_cast<int32_t>(maxFrameExtentForSlowPathCall)), stackPointerRegister);
             callOperation(operationLinkDirectCall, CCallHelpers::TrustedImmPtr(callLinkInfo), calleeGPR);
+            if (maxFrameExtentForSlowPathCall)
+                addPtr(TrustedImm32(maxFrameExtentForSlowPathCall), stackPointerRegister);
+#else
+            callOperation(operationLinkDirectCall, CCallHelpers::TrustedImmPtr(callLinkInfo), calleeGPR);
+#endif
             jump().linkTo(mainPath, this);
 
             done.link(this);
@@ -1191,13 +1222,13 @@ GPRReg SpeculativeJIT::fillSpeculateInt32Internal(Edge edge, DataFormat& returnF
         if (spillFormat == DataFormatJSInt32 || spillFormat == DataFormatInt32) {
             // If we know this was spilled as an integer we can fill without checking.
             if (strict) {
-                load32(addressFor(virtualRegister), gpr);
+                load32(payloadFor(virtualRegister), gpr);
                 info.fillInt32(m_stream, gpr);
                 returnFormat = DataFormatInt32;
                 return gpr;
             }
             if (spillFormat == DataFormatInt32) {
-                load32(addressFor(virtualRegister), gpr);
+                load32(payloadFor(virtualRegister), gpr);
                 info.fillInt32(m_stream, gpr);
                 returnFormat = DataFormatInt32;
             } else {
@@ -2559,7 +2590,7 @@ void SpeculativeJIT::compileMapGetImpl(Node* node)
 
     JIT_COMMENT(*this, "Compute the bucketCount = Capacity and bucketIndex = hashTableStartIndex + (hash & bucketCount - 1).");
     addPtr(TrustedImm32(JSCellButterfly::offsetOfData()), mapStorageOrDataGPR);
-    load32(Address(mapStorageOrDataGPR, MapOrSet::Helper::capacityIndex() * sizeof(uint64_t)), bucketCountGPR);
+    load32(Address(mapStorageOrDataGPR, MapOrSet::Helper::capacityIndex() * sizeof(uint64_t) + PayloadOffset), bucketCountGPR);
     sub32(bucketCountGPR, TrustedImm32(1), bucketIndexOrDeletedValueGPR);
     and32(hashGPR, bucketIndexOrDeletedValueGPR);
     add32(TrustedImm32(MapOrSet::Helper::hashTableStartIndex()), bucketIndexOrDeletedValueGPR);
@@ -6367,6 +6398,20 @@ void SpeculativeJIT::compile(Node* node)
         if (node->child3())
             isLittleEndianOperand.emplace(this, node->child3());
         GPRReg isLittleEndianGPR = isLittleEndianOperand ? isLittleEndianOperand->gpr() : InvalidGPRReg;
+#if CPU(BIG_ENDIAN)
+        // The accesses below are in the host's byte order and swap for the other one, so on a
+        // big-endian host the "little-endian" cases are the ones that swap.
+        std::optional<GPRTemporary> swappedIsLittleEndian;
+        if (data.isLittleEndian == TriState::True)
+            data.isLittleEndian = TriState::False;
+        else if (data.isLittleEndian == TriState::False)
+            data.isLittleEndian = TriState::True;
+        if (isLittleEndianGPR != InvalidGPRReg) {
+            swappedIsLittleEndian.emplace(this);
+            xor32(TrustedImm32(1), isLittleEndianGPR, swappedIsLittleEndian->gpr());
+            isLittleEndianGPR = swappedIsLittleEndian->gpr();
+        }
+#endif
 
         if (data.isResizable)
             loadTypedArrayLength(dataViewGPR, t1, t2, t1, TypeDataView);
@@ -6664,6 +6709,19 @@ void SpeculativeJIT::compile(Node* node)
         if (m_graph.varArgChild(node, 3))
             isLittleEndianOperand.emplace(this, m_graph.varArgChild(node, 3));
         GPRReg isLittleEndianGPR = isLittleEndianOperand ? isLittleEndianOperand->gpr() : InvalidGPRReg;
+#if CPU(BIG_ENDIAN)
+        // As in DataViewGet: on a big-endian host the "little-endian" cases are the ones that swap.
+        std::optional<GPRTemporary> swappedIsLittleEndian;
+        if (data.isLittleEndian == TriState::True)
+            data.isLittleEndian = TriState::False;
+        else if (data.isLittleEndian == TriState::False)
+            data.isLittleEndian = TriState::True;
+        if (isLittleEndianGPR != InvalidGPRReg) {
+            swappedIsLittleEndian.emplace(this);
+            xor32(TrustedImm32(1), isLittleEndianGPR, swappedIsLittleEndian->gpr());
+            isLittleEndianGPR = swappedIsLittleEndian->gpr();
+        }
+#endif
 
         if (data.isResizable)
             loadTypedArrayLength(dataViewGPR, t1, t2, t1, TypeDataView);
@@ -9046,7 +9104,7 @@ void SpeculativeJIT::compileMapIteratorNext(Node* node)
 
     // Fast path: iterate to find next non-deleted entry.
     move(currentEntryGPR, newEntryGPR);
-    load32(Address(storageGPR, JSCellButterfly::offsetOfData() + capacityIndex * sizeof(uint64_t)), scratchGPR1);
+    load32(Address(storageGPR, JSCellButterfly::offsetOfData() + capacityIndex * sizeof(uint64_t) + PayloadOffset), scratchGPR1);
     add32(TrustedImm32(hashTableStartIndex), scratchGPR1);
     if (entrySize == 3) {
         lshift32(newEntryGPR, TrustedImm32(1), scratchGPR2);

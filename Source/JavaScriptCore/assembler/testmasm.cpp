@@ -36,6 +36,7 @@
 #include <limits>
 #include <wtf/Compiler.h>
 #include <wtf/DataLog.h>
+#include <wtf/Float16.h>
 #include <wtf/Function.h>
 #include <wtf/Lock.h>
 #include <wtf/NumberOfCores.h>
@@ -141,7 +142,7 @@ static UNUSED_FUNCTION Vector<int8_t> int8Operands()
     };
 }
 
-#if CPU(X86_64) || CPU(ARM64)
+#if CPU(X86_64) || CPU(ARM64) || CPU(PPC64)
 static Vector<int64_t> int64Operands()
 {
     return Vector<int64_t> {
@@ -252,6 +253,11 @@ bool NODELETE isSpecialGPR(MacroAssembler::RegisterID id)
 #elif CPU(RISCV64)
     if (id == RISCV64Registers::zero || id == RISCV64Registers::ra || id == RISCV64Registers::gp || id == RISCV64Registers::tp)
         return true;
+#elif CPU(PPC64)
+    // r2 = TOC pointer, r13 = thread pointer: both must stay valid for the
+    // C++ code that runs once the probe resumes and returns.
+    if (id == PPC64Registers::r2 || id == PPC64Registers::r13)
+        return true;
 #endif
     return false;
 }
@@ -325,6 +331,112 @@ void testSimple()
         jit.ret();
     }), 42);
 }
+
+#if CPU(PPC64)
+// A C call through CCallHelpers::setupArguments with more arguments than the
+// argument registers hold, integer and floating point interleaved. ELFv2 puts
+// an argument that is not in a register at sp + 32 + 8 * its position in the
+// whole list, and passes doubles in f1-f13, so this checks the positions of
+// both banks, the FP register count, and a 32-bit immediate in memory.
+// Positions:  0 g0   1 d0   2 g1   3 d1   4 g2   5 d2   6 g3   7 d3   (r3-r10, f1-f4)
+//             8 g4*  9 d4  10 g5* 11 d5  12 g6* 13 d6  14 g7* 15 d7  (f5-f8)
+//            16 g8* 17 d8  18 g9* 19 d9  20 d10 21 d11 22 d12 23 d13* (f9-f13)
+//            24 g10* 25 g11*                       (* = in memory, at 32 + 8 * position)
+struct ManyCArguments {
+    int64_t g[12];
+    double d[14];
+};
+static ManyCArguments manyCArgumentsSeen;
+
+static int64_t SYSV_ABI recordManyCArguments(int64_t g0, double d0, int64_t g1, double d1, int32_t g2, double d2, void* g3, double d3,
+    int64_t g4, double d4, int32_t g5, double d5, int64_t g6, double d6, int64_t g7, double d7,
+    int64_t g8, double d8, int64_t g9, double d9, double d10, double d11, double d12, double d13,
+    int64_t g10, int32_t g11)
+{
+    manyCArgumentsSeen = { { g0, g1, g2, std::bit_cast<int64_t>(g3), g4, g5, g6, g7, g8, g9, g10, g11 },
+        { d0, d1, d2, d3, d4, d5, d6, d7, d8, d9, d10, d11, d12, d13 } };
+    return 0x600dca11;
+}
+
+void testCCallManyMixedArguments()
+{
+    using Op = decltype(recordManyCArguments);
+    // 32-byte linkage area + one doubleword per position, 16-byte aligned.
+    constexpr unsigned argumentAreaBytes = 32 + 8 * 26;
+    static_assert(CCallHelpers::outgoingArgumentAreaBytes<Op>() == argumentAreaBytes);
+    static_assert(!(argumentAreaBytes % 16));
+    constexpr unsigned frameBytes = argumentAreaBytes + 16; // + the saved f14
+
+    static constexpr ManyCArguments expected = {
+        { 0x0102030405060708, -0x1112131415161718, -7, 0x2122232425262728, 0x3132333435363738, -123456,
+            0x4142434445464748, -0x5152535455565758, 0x6162636465666768, 0x7172737475767778, -0x0a0b0c0d0e0f1011, 0x7fffff00 },
+        { 1.5, -2.25, 3.125, 4.0625, -5.5, 6.75, 7.875, -8.5, 9.25, 10.125, -11.0625, 12.5, 13.75, -14.875 }
+    };
+
+    auto fpr = [] (unsigned n) { return static_cast<FPRReg>(PPC64Registers::f0 + n); };
+    // d0-d12 come from f1-f13 permuted (d[i] from f[1 + 5i mod 13]), so the shuffle
+    // has real work and every destination f1-f13 is also some other argument's
+    // source; d13 comes from f14, a callee-save we preserve.
+    auto source = [&] (unsigned i) { return i == 13 ? fpr(14) : fpr(1 + (5 * i) % 13); };
+
+    manyCArgumentsSeen = { };
+    int64_t result = compileAndRun<int64_t>([&] (CCallHelpers& jit) {
+        emitFunctionPrologue(jit);
+        jit.subPtr(CCallHelpers::TrustedImm32(frameBytes), MacroAssembler::stackPointerRegister);
+        jit.storeDouble(fpr(14), MacroAssembler::Address(MacroAssembler::stackPointerRegister, argumentAreaBytes));
+        // Garbage in the whole argument area first, so a misplaced store is seen.
+        for (unsigned offset = 0; offset < argumentAreaBytes; offset += 8)
+            jit.store64(CCallHelpers::TrustedImm64(0x5a5a5a5a5a5a5a5a), MacroAssembler::Address(MacroAssembler::stackPointerRegister, offset));
+
+        for (unsigned i = 0; i < 14; ++i)
+            jit.loadDouble(CCallHelpers::TrustedImmPtr(&expected.d[i]), source(i));
+        // GP sources in argument registers that are not their destinations.
+        jit.move(CCallHelpers::TrustedImm64(expected.g[0]), GPRInfo::regT5);
+        jit.move(CCallHelpers::TrustedImm64(expected.g[2]), GPRInfo::regT0);
+        jit.move(CCallHelpers::TrustedImm64(expected.g[4]), GPRInfo::regT2);
+        jit.move(CCallHelpers::TrustedImm64(expected.g[6]), GPRInfo::regT7);
+        jit.move(CCallHelpers::TrustedImm64(expected.g[8]), GPRInfo::regT1);
+        jit.move(CCallHelpers::TrustedImm64(expected.g[9]), GPRInfo::regT4);
+        jit.move(CCallHelpers::TrustedImm64(expected.g[10]), GPRInfo::regT6);
+        jit.move(CCallHelpers::TrustedImm64(expected.g[11]), GPRInfo::regT3);
+
+        jit.setupArgumentsWithReservedArgumentArea<Op, argumentAreaBytes>(
+            GPRInfo::regT5, source(0),
+            CCallHelpers::TrustedImm64(expected.g[1]), source(1),
+            GPRInfo::regT0, source(2),
+            CCallHelpers::TrustedImmPtr(std::bit_cast<void*>(expected.g[3])), source(3),
+            GPRInfo::regT2, source(4),
+            CCallHelpers::TrustedImm32(static_cast<int32_t>(expected.g[5])), source(5),
+            GPRInfo::regT7, source(6),
+            CCallHelpers::TrustedImm64(expected.g[7]), source(7),
+            GPRInfo::regT1, source(8),
+            GPRInfo::regT4, source(9),
+            source(10), source(11), source(12), source(13),
+            GPRInfo::regT6, GPRInfo::regT3);
+        jit.move(CCallHelpers::TrustedImmPtr(tagCFunction<OperationPtrTag>(recordManyCArguments)), MacroAssembler::dataTempRegister);
+        jit.call(MacroAssembler::dataTempRegister, OperationPtrTag);
+
+        jit.loadDouble(MacroAssembler::Address(MacroAssembler::stackPointerRegister, argumentAreaBytes), fpr(14));
+        jit.addPtr(CCallHelpers::TrustedImm32(frameBytes), MacroAssembler::stackPointerRegister);
+        emitFunctionEpilogue(jit);
+        jit.ret();
+    });
+
+    for (unsigned i = 0; i < 12; ++i) {
+        if (manyCArgumentsSeen.g[i] != expected.g[i])
+            dataLogLn("integer argument g", i, ": expected ", expected.g[i], ", callee saw ", manyCArgumentsSeen.g[i]);
+    }
+    for (unsigned i = 0; i < 14; ++i) {
+        if (std::bit_cast<uint64_t>(manyCArgumentsSeen.d[i]) != std::bit_cast<uint64_t>(expected.d[i]))
+            dataLogLn("double argument d", i, ": expected ", expected.d[i], ", callee saw ", manyCArgumentsSeen.d[i]);
+    }
+    CHECK_EQ(result, 0x600dca11);
+    for (unsigned i = 0; i < 12; ++i)
+        CHECK_EQ(manyCArgumentsSeen.g[i], expected.g[i]);
+    for (unsigned i = 0; i < 14; ++i)
+        CHECK_EQ(std::bit_cast<uint64_t>(manyCArgumentsSeen.d[i]), std::bit_cast<uint64_t>(expected.d[i]));
+}
+#endif // CPU(PPC64)
 
 void testGetEffectiveAddress(size_t pointer, ptrdiff_t length, int32_t offset, CCallHelpers::Scale scale)
 {
@@ -436,7 +548,7 @@ static void testBranch32()
     }
 }
 
-#if CPU(X86_64) || CPU(ARM64)
+#if CPU(X86_64) || CPU(ARM64) || CPU(PPC64)
 static void testBranch64()
 {
     auto compare = [](CCallHelpers::RelationalCondition cond, int64_t v1, int64_t v2) -> int {
@@ -980,6 +1092,9 @@ void testShiftAndAdd()
     }
 }
 
+#endif // CPU(X86_64) || CPU(ARM64)
+
+#if CPU(X86_64) || CPU(ARM64) || CPU(PPC64)
 void testStore64Imm64AddressPointer()
 {
     auto doTest = [] (int64_t value) {
@@ -1004,7 +1119,7 @@ void testStore64Imm64AddressPointer()
     doTest(0xAAAA432198765555);
 }
 
-#endif // CPU(X86_64) || CPU(ARM64)
+#endif // CPU(X86_64) || CPU(ARM64) || CPU(PPC64)
 
 void testCompareDouble(MacroAssembler::DoubleCondition condition)
 {
@@ -1254,6 +1369,9 @@ void testMultiplyAddZeroExtend32()
     }
 }
 
+#endif // CPU(ARM64)
+
+#if CPU(ARM64) || CPU(PPC64)
 void testSub32Args()
 {
     for (auto value : int32Operands()) {
@@ -1359,6 +1477,9 @@ void testSub64ArgImm64()
     }
 }
 
+#endif // CPU(ARM64) || CPU(PPC64)
+
+#if CPU(ARM64)
 void testMultiplySubSignExtend32()
 {
     // d = a - SExt32(n) * SExt32(m)
@@ -3147,7 +3268,7 @@ void testZeroExtend48ToWord()
 }
 #endif
 
-#if CPU(X86_64) || CPU(ARM64) || CPU(RISCV64)
+#if CPU(X86_64) || CPU(ARM64) || CPU(RISCV64) || CPU(PPC64)
 void testCompareFloat(MacroAssembler::DoubleCondition condition)
 {
     float arg1 = 0;
@@ -3190,7 +3311,7 @@ void testCompareFloat(MacroAssembler::DoubleCondition condition)
 }
 #endif // CPU(X86_64) || CPU(ARM64)
 
-#if CPU(X86_64) || CPU(ARM64) || CPU(RISCV64)
+#if CPU(X86_64) || CPU(ARM64) || CPU(RISCV64) || CPU(PPC64)
 
 template<typename T, typename SelectionType>
 void testMoveConditionallyFloatingPoint(MacroAssembler::DoubleCondition condition, const MacroAssemblerCodeRef<JSEntryPtrTag>& testCode, T& arg1, T& arg2, const Vector<T> operands, SelectionType selectionA, SelectionType selectionB)
@@ -4475,7 +4596,7 @@ const SignedLoad16to32Scenario signedLoad16to32Scenarios[] = {
 // void loadAcq8SignedExtendTo32(Address address, RegisterID dest)
 void testLoadAcq8SignedExtendTo32_Address_RegisterID()
 {
-#if CPU(ARM64) || CPU(ARM)
+#if CPU(ARM64) || CPU(ARM) || CPU(PPC64)
     testLoadExtend_Address_RegisterID<int8_t, int32_t>(signedLoad8to32Scenarios, ARRAY_SIZE(signedLoad8to32Scenarios),
         [] (CCallHelpers& jit, int offset) {
             constexpr GPRReg resultAddressGPR = GPRInfo::argumentGPR0;
@@ -4520,7 +4641,7 @@ void testLoad8SignedExtendTo32_BaseIndex_RegisterID()
 // void load8SignedExtendTo32(const void* address, RegisterID dest)
 void testLoad8SignedExtendTo32_voidp_RegisterID()
 {
-#if CPU(ARM64) || CPU(RISCV64)
+#if CPU(ARM64) || CPU(RISCV64) || CPU(PPC64)
     testLoadExtend_voidp_RegisterID<int32_t>(signedLoad8to32Scenarios, ARRAY_SIZE(signedLoad8to32Scenarios),
         [] (CCallHelpers& jit, const void* src) {
             constexpr GPRReg resultAddressGPR = GPRInfo::argumentGPR0;
@@ -4535,7 +4656,7 @@ void testLoad8SignedExtendTo32_voidp_RegisterID()
 // void loadAcq16SignedExtendTo32(Address address, RegisterID dest)
 void testLoadAcq16SignedExtendTo32_Address_RegisterID()
 {
-#if CPU(ARM64) || CPU(ARM)
+#if CPU(ARM64) || CPU(ARM) || CPU(PPC64)
     testLoadExtend_Address_RegisterID<int16_t, int32_t>(signedLoad16to32Scenarios, ARRAY_SIZE(signedLoad16to32Scenarios),
         [] (CCallHelpers& jit, int offset) {
             constexpr GPRReg resultAddressGPR = GPRInfo::argumentGPR0;
@@ -4580,7 +4701,7 @@ void testLoad16SignedExtendTo32_BaseIndex_RegisterID()
 // void load16SignedExtendTo32(const void* address, RegisterID dest)
 void testLoad16SignedExtendTo32_voidp_RegisterID()
 {
-#if CPU(ARM64) || CPU(RISCV64)
+#if CPU(ARM64) || CPU(RISCV64) || CPU(PPC64)
     testLoadExtend_voidp_RegisterID<int32_t>(signedLoad16to32Scenarios, ARRAY_SIZE(signedLoad16to32Scenarios),
         [] (CCallHelpers& jit, const void* src) {
             constexpr GPRReg resultAddressGPR = GPRInfo::argumentGPR0;
@@ -4824,7 +4945,7 @@ void testLoad32SignedExtendTo64_voidp_RegisterID()
 
 #endif // CPU(ADDRESS64)
 
-#if CPU(ARM64)
+#if CPU(ARM64) || CPU(PPC64)
 void testLoadStorePair64Int64()
 {
     constexpr uint64_t initialValue = 0x5555aaaabbbb8800ull;
@@ -5064,6 +5185,9 @@ void testLoadStorePair64Int64()
     CHECK_EQ(buffer[9], initialValue + 9);
 }
 
+#endif // CPU(ARM64) || CPU(PPC64)
+
+#if CPU(ARM64)
 void testLoadStorePair64Double()
 {
     constexpr double initialValue = 10000.275;
@@ -5509,6 +5633,11 @@ void testProbeModifiesStackPointer(WTF::Function<void*(Probe::Context&)> compute
 #elif CPU(ARM64)
     auto flagsSPR = ARM64Registers::nzcv;
     uintptr_t flagsMask = 0xf0000000;
+#elif CPU(PPC64)
+    // CR2 field: nonvolatile, and nothing between the probes emits dot-form
+    // (CR-writing) instructions.
+    auto flagsSPR = PPC64Registers::cr;
+    uintptr_t flagsMask = 0x00f00000;
 #endif
 
     compileAndRun<void>([&] (CCallHelpers& jit) {
@@ -5685,6 +5814,10 @@ void testProbeModifiesStackValues()
 #elif CPU(ARM64)
     MacroAssembler::SPRegisterID flagsSPR = ARM64Registers::nzcv;
     uintptr_t flagsMask = 0xf0000000;
+#elif CPU(PPC64)
+    // See the PPC64 note at the other flagsSPR definition above.
+    MacroAssembler::SPRegisterID flagsSPR = PPC64Registers::cr;
+    uintptr_t flagsMask = 0x00f00000;
 #endif
 
     compileAndRun<void>([&] (CCallHelpers& jit) {
@@ -5944,7 +6077,7 @@ void testNegateFloat()
 
 void testByteSwap()
 {
-#if CPU(X86_64) || CPU(ARM64)
+#if CPU(X86_64) || CPU(ARM64) || CPU(PPC64)
     auto byteSwap16 = compile([] (CCallHelpers& jit) {
         emitFunctionPrologue(jit);
         jit.move(GPRInfo::argumentGPR0, GPRInfo::returnValueGPR);
@@ -5979,7 +6112,7 @@ void testByteSwap()
 
 void testMoveDoubleConditionally32()
 {
-#if CPU(X86_64) | CPU(ARM64)
+#if CPU(X86_64) || CPU(ARM64) || CPU(PPC64)
     double arg1 = 0;
     double arg2 = 0;
     const double zero = -0;
@@ -6013,7 +6146,7 @@ void testMoveDoubleConditionally32()
 
 void testMoveDoubleConditionally64()
 {
-#if CPU(X86_64) | CPU(ARM64)
+#if CPU(X86_64) || CPU(ARM64) || CPU(PPC64)
     double arg1 = 0;
     double arg2 = 0;
     const double zero = -0;
@@ -6045,7 +6178,7 @@ void testMoveDoubleConditionally64()
 #endif
 }
 
-#if CPU(X86_64) || CPU(ARM64)
+#if CPU(X86_64) || CPU(ARM64) || CPU(PPC64)
 template<typename SelectionType>
 static SelectionType NODELETE expectedResultForRelationalCondition(MacroAssembler::RelationalCondition cond, int32_t a, int32_t b, SelectionType thenValue, SelectionType elseValue)
 {
@@ -6148,6 +6281,9 @@ void testMoveConditionally32WithImmThenCase(MacroAssembler::RelationalCondition 
 }
 
 // Tests moveConditionallyTest32(cond, left, regMask, immThenCase, regElseCase, dest)
+#endif // CPU(X86_64) || CPU(ARM64) || CPU(PPC64)
+
+#if CPU(X86_64) || CPU(ARM64)
 void testMoveConditionallyTest32WithImmThenCaseRegMask(MacroAssembler::ResultCondition cond)
 {
     const int32_t thenValue = 42;
@@ -6271,7 +6407,7 @@ void testMoveConditionallyTest32WithImmThenCaseImmMask(MacroAssembler::ResultCon
 
 void testLoadBaseIndex()
 {
-#if CPU(ARM64) || CPU(X86_64) || CPU(RISCV64)
+#if CPU(ARM64) || CPU(X86_64) || CPU(RISCV64) || CPU(PPC64)
     // load64
     {
         auto test = compile([=](CCallHelpers& jit) {
@@ -6464,7 +6600,7 @@ void testLoadBaseIndex()
 
 void testStoreImmediateAddress()
 {
-#if CPU(ARM64) || CPU(X86_64)
+#if CPU(ARM64) || CPU(X86_64) || CPU(PPC64)
     // store64
     for (auto imm : int64Operands()) {
         {
@@ -6573,7 +6709,7 @@ void testStoreImmediateAddress()
 
 void testStoreBaseIndex()
 {
-#if CPU(ARM64) || CPU(X86_64) || CPU(RISCV64)
+#if CPU(ARM64) || CPU(X86_64) || CPU(RISCV64) || CPU(PPC64)
     // store64
     {
         auto test = compile([=](CCallHelpers& jit) {
@@ -6726,7 +6862,7 @@ void testStoreBaseIndex()
 
 void testStoreImmediateBaseIndex()
 {
-#if CPU(ARM64) || CPU(X86_64)
+#if CPU(ARM64) || CPU(X86_64) || CPU(PPC64)
     // store64
     for (auto imm : int64Operands()) {
         {
@@ -6901,7 +7037,7 @@ static void testBranchIfNotType()
     CHECK_EQ(invoke<bool>(isNotType, &cell), true);
 }
 
-#if CPU(X86_64) || CPU(ARM64)
+#if CPU(X86_64) || CPU(ARM64) || CPU(PPC64)
 static void testBranchConvertDoubleToInt52()
 {
     auto toInt52 = compile([](CCallHelpers& jit) {
@@ -7158,7 +7294,7 @@ static void testAtomicAndEmitsCode()
 }
 #endif
 
-#if CPU(ARM64) || CPU(X86_64)
+#if CPU(ARM64) || CPU(X86_64) || CPU(PPC64)
 static void testMove32ToFloatMovi()
 {
     // Test movi-encodable patterns
@@ -8367,6 +8503,592 @@ static void testMove64ToDoubleX64()
 }
 #endif
 
+#if CPU(ARM64) || CPU(PPC64)
+// Memory-model litmus tests for the weakly ordered ports. Each runs a few
+// instructions of JIT code on two or more threads many times over and checks
+// that no outcome the API's ordering guarantees forbid ever shows up.
+
+struct alignas(128) LitmusCell {
+    uint32_t value { 0 };
+};
+
+// The CPU's free-running timestamp counter: both threads of a litmus
+// iteration spin until the same timestamp before running their code, which
+// starts them within a few nanoseconds of each other. Handing the start over
+// through memory leaves them too far apart for a reordering to be seen at all.
+static ALWAYS_INLINE uint64_t litmusTimestamp()
+{
+#if CPU(PPC64)
+    return __builtin_ppc_get_timebase();
+#else
+    uint64_t value;
+    asm volatile("mrs %0, cntvct_el0" : "=r"(value));
+    return value;
+#endif
+}
+
+// Runs thread0 here and thread1 on a helper thread, `iterations` times, the
+// two started at the same timestamp each time; reset() runs before each
+// iteration and check() after both threads have finished it.
+static void runLitmusPair(unsigned iterations, const Function<void()>& reset, const Function<void()>& thread0, const Function<void()>& thread1, const Function<void()>& check)
+{
+    // A start far enough ahead for the helper to see it and be spinning.
+    static constexpr uint64_t startDelay = 4096;
+    std::atomic<unsigned> go { 0 };
+    std::atomic<unsigned> done { 0 };
+    std::atomic<uint64_t> start { 0 };
+    Ref<Thread> helper = Thread::create("testmasm litmus"_s, [&] {
+        for (unsigned i = 1; i <= iterations; ++i) {
+            while (go.load(std::memory_order_acquire) != i) { }
+            uint64_t startAt = start.load(std::memory_order_relaxed);
+            while (litmusTimestamp() < startAt) { }
+            thread1();
+            done.store(i, std::memory_order_release);
+        }
+    });
+    for (unsigned i = 1; i <= iterations; ++i) {
+        reset();
+        uint64_t startAt = litmusTimestamp() + startDelay;
+        start.store(startAt, std::memory_order_relaxed);
+        go.store(i, std::memory_order_release);
+        while (litmusTimestamp() < startAt) { }
+        thread0();
+        while (done.load(std::memory_order_acquire) != i) { }
+        check();
+    }
+    helper->waitForCompletion();
+}
+
+// Runs every body on its own thread, all released at once.
+static void runConcurrently(Vector<Function<void()>>& bodies)
+{
+    std::atomic<unsigned> ready { 0 };
+    unsigned count = bodies.size();
+    Vector<Ref<Thread>> threads;
+    for (auto& body : bodies) {
+        threads.append(Thread::create("testmasm litmus"_s, [&ready, count, body = &body] {
+            ready.fetch_add(1);
+            while (ready.load() < count) { }
+            (*body)();
+        }));
+    }
+    for (auto& thread : threads)
+        thread->waitForCompletion();
+}
+
+static constexpr unsigned litmusIterations = 100000;
+
+// MP. T0: data = 1; flag = 1.  T1: r0 = flag; r1 = data.
+// With the stores ordered (storeFence, or a store-release of flag) and the
+// loads ordered (loadFence, or a load-acquire of flag), r0 == 1 && r1 == 0 is
+// forbidden.
+static void testLitmusMessagePassing(bool releaseAcquire)
+{
+    auto writer = compile([=] (CCallHelpers& jit) {
+        emitFunctionPrologue(jit);
+        jit.move(CCallHelpers::TrustedImm32(1), GPRInfo::argumentGPR2);
+        jit.store32(GPRInfo::argumentGPR2, CCallHelpers::Address(GPRInfo::argumentGPR0));
+        if (releaseAcquire)
+            jit.storeRel32(GPRInfo::argumentGPR2, CCallHelpers::Address(GPRInfo::argumentGPR1));
+        else {
+            jit.storeFence();
+            jit.store32(GPRInfo::argumentGPR2, CCallHelpers::Address(GPRInfo::argumentGPR1));
+        }
+        emitFunctionEpilogue(jit);
+        jit.ret();
+    });
+    auto reader = compile([=] (CCallHelpers& jit) {
+        emitFunctionPrologue(jit);
+        if (releaseAcquire)
+            jit.loadAcq32(CCallHelpers::Address(GPRInfo::argumentGPR1), GPRInfo::argumentGPR2);
+        else {
+            jit.load32(CCallHelpers::Address(GPRInfo::argumentGPR1), GPRInfo::argumentGPR2);
+            jit.loadFence();
+        }
+        jit.load32(CCallHelpers::Address(GPRInfo::argumentGPR0), GPRInfo::argumentGPR3);
+        jit.lshift32(CCallHelpers::TrustedImm32(1), GPRInfo::argumentGPR2);
+        jit.or32(GPRInfo::argumentGPR3, GPRInfo::argumentGPR2, GPRInfo::returnValueGPR); // flag * 2 + data
+        emitFunctionEpilogue(jit);
+        jit.ret();
+    });
+
+    LitmusCell data;
+    LitmusCell flag;
+    uint32_t observed = 0;
+    unsigned forbidden = 0;
+    runLitmusPair(litmusIterations,
+        [&] { data.value = 0; flag.value = 0; },
+        [&] { invoke<uint32_t>(writer, &data.value, &flag.value); },
+        [&] { observed = invoke<uint32_t>(reader, &data.value, &flag.value); },
+        [&] { forbidden += observed == 2; });
+    CHECK_EQ(forbidden, 0U);
+}
+
+enum class LitmusOrdering : uint8_t { None, MemoryFence, AcquireRelease };
+
+// SB. Ti: mine = 1; r = other. Ordering the store before the load (a full
+// fence, or a store-release followed by a load-acquire, which ARM64's
+// stlr/ldar make sequentially consistent) forbids r0 == 0 && r1 == 0.
+// LitmusOrdering::None is the control: the outcome is allowed and is only
+// counted, to show that the harness can see a reordering at all.
+static void testLitmusStoreBuffering(LitmusOrdering ordering)
+{
+    auto side = compile([=] (CCallHelpers& jit) {
+        emitFunctionPrologue(jit);
+        jit.move(CCallHelpers::TrustedImm32(1), GPRInfo::argumentGPR2);
+        switch (ordering) {
+        case LitmusOrdering::None:
+            jit.store32(GPRInfo::argumentGPR2, CCallHelpers::Address(GPRInfo::argumentGPR0));
+            jit.load32(CCallHelpers::Address(GPRInfo::argumentGPR1), GPRInfo::returnValueGPR);
+            break;
+        case LitmusOrdering::MemoryFence:
+            jit.store32(GPRInfo::argumentGPR2, CCallHelpers::Address(GPRInfo::argumentGPR0));
+            jit.memoryFence();
+            jit.load32(CCallHelpers::Address(GPRInfo::argumentGPR1), GPRInfo::returnValueGPR);
+            break;
+        case LitmusOrdering::AcquireRelease:
+            jit.storeRel32(GPRInfo::argumentGPR2, CCallHelpers::Address(GPRInfo::argumentGPR0));
+            jit.loadAcq32(CCallHelpers::Address(GPRInfo::argumentGPR1), GPRInfo::returnValueGPR);
+            break;
+        }
+        emitFunctionEpilogue(jit);
+        jit.ret();
+    });
+
+    LitmusCell x;
+    LitmusCell y;
+    uint32_t r0 = 0;
+    uint32_t r1 = 0;
+    unsigned bothZero = 0;
+    runLitmusPair(litmusIterations,
+        [&] { x.value = 0; y.value = 0; },
+        [&] { r0 = invoke<uint32_t>(side, &x.value, &y.value); },
+        [&] { r1 = invoke<uint32_t>(side, &y.value, &x.value); },
+        [&] { bothZero += !r0 && !r1; });
+    if (ordering == LitmusOrdering::None)
+        dataLogLn("testLitmusStoreBuffering(None): store buffering observed ", bothZero, " / ", litmusIterations, " times (allowed)");
+    else
+        CHECK_EQ(bothZero, 0U);
+}
+
+// R. T0: x = 1; y = 1.  T1: y = 2; r = x.  All store-release / load-acquire.
+// Sequential consistency (ARM64's stlr/ldar) forbids y == 2 && r == 0: T1's
+// store of y landing last means T0's y = 1, and so its x = 1, came first.
+static void testLitmusR()
+{
+    auto thread0 = compile([=] (CCallHelpers& jit) {
+        emitFunctionPrologue(jit);
+        jit.move(CCallHelpers::TrustedImm32(1), GPRInfo::argumentGPR2);
+        jit.storeRel32(GPRInfo::argumentGPR2, CCallHelpers::Address(GPRInfo::argumentGPR0));
+        jit.storeRel32(GPRInfo::argumentGPR2, CCallHelpers::Address(GPRInfo::argumentGPR1));
+        emitFunctionEpilogue(jit);
+        jit.ret();
+    });
+    auto thread1 = compile([=] (CCallHelpers& jit) {
+        emitFunctionPrologue(jit);
+        jit.move(CCallHelpers::TrustedImm32(2), GPRInfo::argumentGPR2);
+        jit.storeRel32(GPRInfo::argumentGPR2, CCallHelpers::Address(GPRInfo::argumentGPR1));
+        jit.loadAcq32(CCallHelpers::Address(GPRInfo::argumentGPR0), GPRInfo::returnValueGPR);
+        emitFunctionEpilogue(jit);
+        jit.ret();
+    });
+
+    LitmusCell x;
+    LitmusCell y;
+    uint32_t r = 0;
+    unsigned forbidden = 0;
+    runLitmusPair(litmusIterations,
+        [&] { x.value = 0; y.value = 0; },
+        [&] { invoke<uint32_t>(thread0, &x.value, &y.value); },
+        [&] { r = invoke<uint32_t>(thread1, &x.value, &y.value); },
+        [&] { forbidden += y.value == 2 && !r; });
+    CHECK_EQ(forbidden, 0U);
+}
+
+// Compiles `void(T* location, uint64_t count)` that adds 1 to *location
+// `count` times through a weak-CAS retry loop.
+template<unsigned width>
+static MacroAssemblerCodeRef<JSEntryPtrTag> compileWeakCASIncrementLoop()
+{
+    return compile([=] (CCallHelpers& jit) {
+        emitFunctionPrologue(jit);
+        CCallHelpers::Address location(GPRInfo::argumentGPR0);
+        CCallHelpers::Label loop = jit.label();
+        if constexpr (width == 8)
+            jit.load8(location, GPRInfo::argumentGPR2);
+        else
+            jit.load32(location, GPRInfo::argumentGPR2);
+        jit.add32(CCallHelpers::TrustedImm32(1), GPRInfo::argumentGPR2, GPRInfo::argumentGPR3);
+        if constexpr (width == 8)
+            jit.branchAtomicWeakCAS8(CCallHelpers::Failure, GPRInfo::argumentGPR2, GPRInfo::argumentGPR3, location).linkTo(loop, &jit);
+        else
+            jit.branchAtomicWeakCAS32(CCallHelpers::Failure, GPRInfo::argumentGPR2, GPRInfo::argumentGPR3, location).linkTo(loop, &jit);
+        jit.sub64(CCallHelpers::TrustedImm32(1), GPRInfo::argumentGPR1);
+        jit.branchTest64(CCallHelpers::NonZero, GPRInfo::argumentGPR1).linkTo(loop, &jit);
+        emitFunctionEpilogue(jit);
+        jit.ret();
+    });
+}
+
+// Four threads increment one 32-bit counter through weak CAS: no update may be
+// lost.
+static void testLitmusWeakCASCounter32()
+{
+    static constexpr unsigned threadCount = 4;
+    static constexpr uint64_t increments = 200000;
+    auto increment = compileWeakCASIncrementLoop<32>();
+    LitmusCell counter;
+    Vector<Function<void()>> bodies;
+    for (unsigned i = 0; i < threadCount; ++i)
+        bodies.append([&] { invoke<uint32_t>(increment, &counter.value, increments); });
+    runConcurrently(bodies);
+    CHECK_EQ(counter.value, static_cast<uint32_t>(threadCount * increments));
+}
+
+// Four threads each increment their own byte of one word through 8-bit weak
+// CAS: every byte ends at its own count (mod 256), so a sub-word
+// store-conditional that disturbs its neighbours, or a lost update, shows.
+static void testLitmusWeakCASCounter8()
+{
+    static constexpr unsigned threadCount = 4;
+    static constexpr uint64_t increments = 100000;
+    auto increment = compileWeakCASIncrementLoop<8>();
+    struct alignas(128) Bytes {
+        uint8_t values[threadCount] { };
+    } bytes;
+    Vector<Function<void()>> bodies;
+    for (unsigned i = 0; i < threadCount; ++i)
+        bodies.append([&, i] { invoke<uint32_t>(increment, &bytes.values[i], increments); });
+    runConcurrently(bodies);
+    for (unsigned i = 0; i < threadCount; ++i)
+        CHECK_EQ(static_cast<unsigned>(bytes.values[i]), static_cast<unsigned>(increments % 256));
+}
+
+// One thread runs a strong CAS whose expected value never occurs while another
+// increments the location: a failed strong CAS must never store, so the
+// counter ends exactly at the increment count.
+static void testLitmusStrongCASMismatchNeverWrites()
+{
+    static constexpr uint64_t increments = 200000;
+    static constexpr uint64_t attempts = 200000;
+    auto increment = compileWeakCASIncrementLoop<32>();
+    auto failingCAS = compile([=] (CCallHelpers& jit) {
+        emitFunctionPrologue(jit);
+        CCallHelpers::Label loop = jit.label();
+        jit.move(CCallHelpers::TrustedImm32(0x7eadbeef), GPRInfo::argumentGPR2); // never reached by the counter
+        jit.move(CCallHelpers::TrustedImm32(0x7ad00000), GPRInfo::argumentGPR3);
+        jit.atomicStrongCAS32(CCallHelpers::Success, GPRInfo::argumentGPR2, GPRInfo::argumentGPR3, CCallHelpers::Address(GPRInfo::argumentGPR0), GPRInfo::argumentGPR4);
+        jit.sub64(CCallHelpers::TrustedImm32(1), GPRInfo::argumentGPR1);
+        jit.branchTest64(CCallHelpers::NonZero, GPRInfo::argumentGPR1).linkTo(loop, &jit);
+        emitFunctionEpilogue(jit);
+        jit.ret();
+    });
+    LitmusCell counter;
+    Vector<Function<void()>> bodies;
+    bodies.append([&] { invoke<uint32_t>(increment, &counter.value, increments); });
+    bodies.append([&] { invoke<uint32_t>(failingCAS, &counter.value, attempts); });
+    runConcurrently(bodies);
+    CHECK_EQ(counter.value, static_cast<uint32_t>(increments));
+}
+#if ENABLE(JUMP_ISLANDS)
+// Cross-modifying code. One thread calls through a thread-safe patchable near
+// call (or tail call) in a loop while another retargets it, the way wasm
+// tier-up does (prepareForAtomicRepatchNearCallConcurrently, then
+// repatchNearCall), between two targets in branch reach and one beyond it,
+// reached through a jump island. Every call must land on one of the targets.
+static void testCrossModifyingNearCall(bool tailCall)
+{
+    auto returnConstant = [] (uint32_t value) {
+        return compile([=] (CCallHelpers& jit) {
+            emitFunctionPrologue(jit);
+            jit.move(CCallHelpers::TrustedImm32(value), GPRInfo::returnValueGPR);
+            emitFunctionEpilogue(jit);
+            jit.ret();
+        });
+    };
+    auto target1 = returnConstant(1);
+    auto target2 = returnConstant(2);
+
+    CodeLocationNearCall<JSEntryPtrTag> callLocation;
+    auto caller = compile([&] (CCallHelpers& jit) {
+        CCallHelpers::Call call;
+        if (tailCall)
+            call = jit.threadSafePatchableNearTailCall(); // target returns to our caller
+        else {
+            emitFunctionPrologue(jit);
+            call = jit.threadSafePatchableNearCall();
+            emitFunctionEpilogue(jit);
+            jit.ret();
+        }
+        jit.addLinkTask([&, call] (LinkBuffer& linkBuffer) {
+            linkBuffer.link(call, CodeLocationLabel<JSEntryPtrTag>(target1.code()));
+            callLocation = linkBuffer.locationOfNearCall<JSEntryPtrTag>(call);
+        });
+    });
+
+    // Push the third target out of direct branch reach where the reach is
+    // small enough to fill (PPC64: 32 MB). The allocator places code as low as
+    // it can, so take every piece of executable memory still within reach of
+    // the call, in shrinking sizes, before compiling the target.
+    Vector<MacroAssemblerCodeRef<JSEntryPtrTag>> filler;
+    bool farTargetNeedsIsland = false;
+    uintptr_t callAddress = std::bit_cast<uintptr_t>(callLocation.dataLocation());
+    auto inReach = [&] (const void* address) {
+        uintptr_t to = std::bit_cast<uintptr_t>(address);
+        return (callAddress > to ? callAddress - to : to - callAddress) < MacroAssembler::nearJumpRange + MB;
+    };
+    if constexpr (MacroAssembler::nearJumpRange <= 64 * MB) {
+        for (size_t size = 4 * MB; size >= 64; size /= 4) {
+            for (;;) {
+                auto code = compile([=] (CCallHelpers& jit) {
+                    for (size_t i = 0; i < size / 4; ++i)
+                        jit.nop();
+                });
+                bool near = inReach(code.code().untaggedPtr());
+                filler.append(WTF::move(code));
+                if (!near)
+                    break;
+            }
+        }
+        farTargetNeedsIsland = true;
+    }
+    auto target3 = returnConstant(3);
+    if (farTargetNeedsIsland)
+        CHECK_EQ(inReach(target3.code().untaggedPtr()), false);
+
+    // Retarget at least `retargets` times, and until the runner has made
+    // `overlappingCalls` calls while retargeting is under way: on a loaded
+    // machine the runner may not get a CPU for the first few thousand.
+    static constexpr unsigned retargets = 3000;
+    static constexpr unsigned overlappingCalls = 1000;
+    std::atomic<bool> stop { false };
+    std::atomic<unsigned> calls { 0 };
+    unsigned bad = 0;
+    Ref<Thread> runner = Thread::create("testmasm cross-modifying code"_s, [&] {
+        while (!stop.load(std::memory_order_relaxed)) {
+            uint32_t result = invoke<uint32_t>(caller);
+            bad += result < 1 || result > 3;
+            calls.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+    while (!calls.load(std::memory_order_relaxed))
+        Thread::yield();
+
+    const MacroAssemblerCodeRef<JSEntryPtrTag>* targets[] = { &target2, &target3, &target1 };
+    unsigned callsBeforeRetargeting = calls.load(std::memory_order_relaxed);
+    unsigned i = 0;
+    for (; i < retargets || calls.load(std::memory_order_relaxed) - callsBeforeRetargeting < overlappingCalls; ++i) {
+        auto& target = *targets[i % std::size(targets)];
+        CodeLocationLabel<JSEntryPtrTag> destination(target.code());
+        CodeLocationLabel<JSEntryPtrTag> prepared = MacroAssembler::prepareForAtomicRepatchNearCallConcurrently(callLocation, destination);
+        if (&target == &target3 && farTargetNeedsIsland)
+            CHECK_EQ(prepared.untaggedPtr() != destination.untaggedPtr(), true); // went through an island
+        MacroAssembler::repatchNearCall(callLocation, prepared);
+        for (unsigned spin = 0; spin < 2000; ++spin)
+            WTF::compilerFence();
+    }
+    unsigned overlapping = calls.load() - callsBeforeRetargeting;
+    stop.store(true);
+    runner->waitForCompletion();
+    dataLogLn("testCrossModifyingNearCall(", tailCall, "): ", overlapping, " calls during ", i, " retargets");
+    CHECK_EQ(bad, 0U);
+    CHECK_EQ(overlapping >= overlappingCalls, true);
+}
+#endif // ENABLE(JUMP_ISLANDS)
+#endif // CPU(ARM64) || CPU(PPC64)
+
+#if CPU(PPC64)
+// The POWER9/POWER10 sequences (remainders, JS min/max, count trailing zeros,
+// compare to bool) against C++. Run once per ISA level the CPU reaches, with
+// JSC_maximumPPC64ISALevel=207/300 covering the older sequences.
+static void testPPC64ISALevelSequences()
+{
+    dataLogLn("testPPC64ISALevelSequences: ISA level ", MacroAssembler::isaLevel());
+
+    auto ctz32 = compile([] (CCallHelpers& jit) {
+        emitFunctionPrologue(jit);
+        jit.countTrailingZeros32(GPRInfo::argumentGPR0, GPRInfo::returnValueGPR);
+        emitFunctionEpilogue(jit);
+        jit.ret();
+    });
+    for (auto value : int64Operands()) {
+        uint32_t low = static_cast<uint32_t>(value);
+        CHECK_EQ(invoke<uint64_t>(ctz32, value), static_cast<uint64_t>(low ? std::countr_zero(low) : 32));
+    }
+
+    auto compareToBool = [] (MacroAssembler::RelationalCondition cond) {
+        return compile([=] (CCallHelpers& jit) {
+            emitFunctionPrologue(jit);
+            jit.compare64(cond, GPRInfo::argumentGPR0, GPRInfo::argumentGPR1, GPRInfo::returnValueGPR);
+            emitFunctionEpilogue(jit);
+            jit.ret();
+        });
+    };
+    auto lessThan = compareToBool(MacroAssembler::LessThan);
+    auto notEqual = compareToBool(MacroAssembler::NotEqual);
+    for (auto a : int64Operands()) {
+        for (auto b : int64Operands()) {
+            CHECK_EQ(invoke<uint64_t>(lessThan, a, b), static_cast<uint64_t>(a < b));
+            CHECK_EQ(invoke<uint64_t>(notEqual, a, b), static_cast<uint64_t>(a != b));
+        }
+    }
+
+    if (!MacroAssembler::supportsISA3_00()) {
+        dataLogLn("testPPC64ISALevelSequences: no ISA 3.0 remainder or min/max on this CPU; skipped");
+        return;
+    }
+
+    auto remainder = [] (auto emit) {
+        return compile([=] (CCallHelpers& jit) {
+            emitFunctionPrologue(jit);
+            (jit.*emit)(GPRInfo::argumentGPR0, GPRInfo::argumentGPR1, GPRInfo::returnValueGPR);
+            emitFunctionEpilogue(jit);
+            jit.ret();
+        });
+    };
+    auto mod32 = remainder(&MacroAssembler::mod32);
+    auto uMod32 = remainder(&MacroAssembler::uMod32);
+    auto mod64 = remainder(&MacroAssembler::mod64);
+    auto uMod64 = remainder(&MacroAssembler::uMod64);
+    for (auto a : int64Operands()) {
+        for (auto b : int64Operands()) {
+            int32_t a32 = static_cast<int32_t>(a);
+            int32_t b32 = static_cast<int32_t>(b);
+            if (b32 && !(a32 == std::numeric_limits<int32_t>::min() && b32 == -1)) {
+                CHECK_EQ(invoke<uint64_t>(mod32, a, b), static_cast<uint64_t>(static_cast<uint32_t>(a32 % b32)));
+                CHECK_EQ(invoke<uint64_t>(uMod32, a, b), static_cast<uint64_t>(static_cast<uint32_t>(a32) % static_cast<uint32_t>(b32)));
+            }
+            if (b && !(a == std::numeric_limits<int64_t>::min() && b == -1)) {
+                CHECK_EQ(invoke<int64_t>(mod64, a, b), a % b);
+                CHECK_EQ(invoke<uint64_t>(uMod64, a, b), static_cast<uint64_t>(a) % static_cast<uint64_t>(b));
+            }
+        }
+    }
+
+    auto minOrMax = [] (bool isMax) {
+        return compile([=] (CCallHelpers& jit) {
+            emitFunctionPrologue(jit);
+            if (isMax)
+                jit.doubleMax(FPRInfo::argumentFPR0, FPRInfo::argumentFPR1, FPRInfo::returnValueFPR);
+            else
+                jit.doubleMin(FPRInfo::argumentFPR0, FPRInfo::argumentFPR1, FPRInfo::returnValueFPR);
+            emitFunctionEpilogue(jit);
+            jit.ret();
+        });
+    };
+    auto doubleMax = minOrMax(true);
+    auto doubleMin = minOrMax(false);
+    auto sameDouble = [] (double a, double b) {
+        if (std::isnan(a) || std::isnan(b))
+            return std::isnan(a) && std::isnan(b);
+        return std::bit_cast<uint64_t>(a) == std::bit_cast<uint64_t>(b);
+    };
+    // JS Math.max/Math.min: a NaN operand gives NaN, and +0 > -0.
+    auto jsMax = [] (double a, double b) {
+        if (std::isnan(a) || std::isnan(b))
+            return PNaN;
+        if (!a && !b)
+            return std::signbit(a) ? b : a;
+        return a > b ? a : b;
+    };
+    auto jsMin = [] (double a, double b) {
+        if (std::isnan(a) || std::isnan(b))
+            return PNaN;
+        if (!a && !b)
+            return std::signbit(a) ? a : b;
+        return a < b ? a : b;
+    };
+    auto operands = doubleOperands();
+    operands.append(-0.0); // doubleOperands()'s -0 is the integer, so +0.0
+    for (auto a : operands) {
+        for (auto b : operands) {
+            CHECK_EQ(sameDouble(invoke<double>(doubleMax, a, b), jsMax(a, b)), true);
+            CHECK_EQ(sameDouble(invoke<double>(doubleMin, a, b), jsMin(a, b)), true);
+        }
+    }
+}
+
+// Float16 against WTF's software conversions: every binary16 bit pattern to
+// double, doubles at and around every half's rounding boundaries back to
+// binary16, and the bit-pattern moves.
+static void testFloat16Conversions()
+{
+    if (!MacroAssembler::supportsFloat16()) {
+        dataLogLn("testFloat16Conversions: no ISA 3.0 binary16 conversions on this CPU; skipped");
+        return;
+    }
+
+    auto halfToDouble = compile([] (CCallHelpers& jit) {
+        emitFunctionPrologue(jit);
+        jit.loadFloat16(CCallHelpers::Address(GPRInfo::argumentGPR0), FPRInfo::fpRegT0);
+        jit.convertFloat16ToDouble(FPRInfo::fpRegT0, FPRInfo::returnValueFPR);
+        emitFunctionEpilogue(jit);
+        jit.ret();
+    });
+    auto doubleToHalf = compile([] (CCallHelpers& jit) {
+        emitFunctionPrologue(jit);
+        jit.convertDoubleToFloat16(FPRInfo::argumentFPR0, FPRInfo::fpRegT0);
+        jit.storeFloat16(FPRInfo::fpRegT0, CCallHelpers::BaseIndex(GPRInfo::argumentGPR0, GPRInfo::argumentGPR1, CCallHelpers::TimesTwo, 2));
+        emitFunctionEpilogue(jit);
+        jit.ret();
+    });
+    auto roundTripBits = compile([] (CCallHelpers& jit) {
+        emitFunctionPrologue(jit);
+        jit.move16ToFloat16(GPRInfo::argumentGPR0, FPRInfo::fpRegT0);
+        jit.move(CCallHelpers::TrustedImm32(-1), GPRInfo::argumentGPR0);
+        jit.moveFloat16To16(FPRInfo::fpRegT0, GPRInfo::returnValueGPR);
+        emitFunctionEpilogue(jit);
+        jit.ret();
+    });
+
+    auto sameDouble = [] (double a, double b) {
+        if (std::isnan(a) || std::isnan(b))
+            return std::isnan(a) && std::isnan(b);
+        return std::bit_cast<uint64_t>(a) == std::bit_cast<uint64_t>(b);
+    };
+    auto sameHalf = [] (uint16_t a, uint16_t b) {
+        auto isNaN = [] (uint16_t h) { return (h & 0x7c00) == 0x7c00 && (h & 0x3ff); };
+        if (isNaN(a) || isNaN(b))
+            return isNaN(a) && isNaN(b);
+        return a == b;
+    };
+
+    uint16_t buffer[4] = { };
+    auto jitDoubleToHalf = [&] (double value) {
+        buffer[1] = 0xdead;
+        buffer[0] = buffer[2] = 0x5555;
+        invoke<void>(doubleToHalf, buffer, static_cast<uintptr_t>(0), value); // stores to buffer[1]
+        CHECK_EQ(buffer[0], 0x5555);
+        CHECK_EQ(buffer[2], 0x5555);
+        return buffer[1];
+    };
+
+    for (unsigned bits = 0; bits < 0x10000; ++bits) {
+        uint16_t half = bits;
+        double expected = WTF::convertFloat16ToFloat64(half);
+        CHECK_EQ(sameDouble(invoke<double>(halfToDouble, &half), expected), true);
+        CHECK_EQ(invoke<uint32_t>(roundTripBits, static_cast<uintptr_t>(0xabcd0000u | bits)), bits);
+
+        // The value itself, the midpoint to the next half up (a tie, which
+        // rounds to even), and the doubles either side of that midpoint.
+        if (std::isnan(expected))
+            continue;
+        CHECK_EQ(sameHalf(jitDoubleToHalf(expected), WTF::convertFloat64ToFloat16(expected)), true);
+        uint16_t nextBits = bits + 1;
+        if ((bits & 0x7fff) >= 0x7c00 || (nextBits & 0x7fff) > 0x7c00)
+            continue;
+        double next = WTF::convertFloat16ToFloat64(nextBits);
+        if (!std::isfinite(next))
+            next = std::copysign(65520.0, expected); // the first value that rounds to infinity
+        double midpoint = (expected + next) / 2;
+        for (double value : { midpoint, std::nextafter(midpoint, 0.0), std::nextafter(midpoint, midpoint * 2) })
+            CHECK_EQ(sameHalf(jitDoubleToHalf(value), WTF::convertFloat64ToFloat16(value)), true);
+    }
+    for (double value : { 1e300, -1e300, 65519.99, 65520.0, 1e-30, -1e-30, 5.9604644775390625e-8 / 2, 5.9604644775390625e-8 * 0.75, std::numeric_limits<double>::infinity(), -0.0 })
+        CHECK_EQ(sameHalf(jitDoubleToHalf(value), WTF::convertFloat64ToFloat16(value)), true);
+}
+#endif // CPU(PPC64)
+
 static void testGPRInfoConsistency()
 {
     for (unsigned index = 0; index < GPRInfo::numberOfRegisters; ++index) {
@@ -8413,6 +9135,9 @@ void run(const char* filter) WTF_IGNORES_THREAD_SAFETY_ANALYSIS
     };
 
     RUN(testSimple());
+#if CPU(PPC64)
+    RUN(testCCallManyMixedArguments());
+#endif
     RUN(testGetEffectiveAddress(0xff00, 42, 8, CCallHelpers::TimesEight));
     RUN(testGetEffectiveAddress(0xff00, -200, -300, CCallHelpers::TimesEight));
     RUN(testBranchTruncateDoubleToInt32(0, 0));
@@ -8481,15 +9206,18 @@ void run(const char* filter) WTF_IGNORES_THREAD_SAFETY_ANALYSIS
     RUN(testBranchTestBit64AddrImm());
 #endif
 
-#if CPU(X86_64) || CPU(ARM64)
+#if CPU(X86_64) || CPU(ARM64) || CPU(PPC64)
     RUN(testBranch64());
+    RUN(testStore64Imm64AddressPointer());
+#endif
+
+#if CPU(X86_64) || CPU(ARM64)
     RUN(testClearBit64());
     RUN(testClearBits64WithMask());
     RUN(testClearBits64WithMaskTernary());
     RUN(testCountTrailingZeros64());
     RUN(testCountTrailingZeros64WithoutNullCheck());
     RUN(testShiftAndAdd());
-    RUN(testStore64Imm64AddressPointer());
 #endif
 
     RUN(testLoadAcq8SignedExtendTo32_Address_RegisterID());
@@ -8521,18 +9249,24 @@ void run(const char* filter) WTF_IGNORES_THREAD_SAFETY_ANALYSIS
     RUN(testLoad32SignedExtendTo64_voidp_RegisterID());
 #endif
 
-#if CPU(ARM64)
-    RUN(testLoadStorePair64Int64());
-    RUN(testLoadStorePair64Double());
-    RUN(testMultiplySignExtend32());
-    RUN(testMultiplyZeroExtend32());
-
+#if CPU(ARM64) || CPU(PPC64)
     RUN(testSub32Args());
     RUN(testSub32Imm());
     RUN(testSub64Imm32());
     RUN(testSub64ArgImm32());
     RUN(testSub64Imm64());
     RUN(testSub64ArgImm64());
+
+    RUN(testLoadStorePair64Int64());
+#endif
+
+#if CPU(ARM64)
+    RUN(testLoadStorePair64Double());
+#endif
+
+#if CPU(ARM64)
+    RUN(testMultiplySignExtend32());
+    RUN(testMultiplyZeroExtend32());
 
     RUN(testMultiplyAddSignExtend32());
     RUN(testMultiplyAddZeroExtend32());
@@ -8621,11 +9355,11 @@ void run(const char* filter) WTF_IGNORES_THREAD_SAFETY_ANALYSIS
     }
 #endif
 
-#if CPU(X86_64) || CPU(ARM64) || CPU(RISCV64)
+#if CPU(X86_64) || CPU(ARM64) || CPU(RISCV64) || CPU(PPC64)
     FOR_EACH_DOUBLE_CONDITION_RUN(testCompareFloat);
 #endif
 
-#if CPU(X86_64) || CPU(ARM64) || CPU(RISCV64)
+#if CPU(X86_64) || CPU(ARM64) || CPU(RISCV64) || CPU(PPC64)
     // Comparing 2 different registers.
     FOR_EACH_DOUBLE_CONDITION_RUN(testMoveConditionallyDouble2);
     FOR_EACH_DOUBLE_CONDITION_RUN(testMoveConditionallyDouble3);
@@ -8651,10 +9385,12 @@ void run(const char* filter) WTF_IGNORES_THREAD_SAFETY_ANALYSIS
     FOR_EACH_DOUBLE_CONDITION_RUN(testMoveDoubleConditionallyFloatSameArg);
 #endif
 
-#if CPU(X86_64) || CPU(ARM64)
+#if CPU(X86_64) || CPU(ARM64) || CPU(PPC64)
     // Tests for moveConditionally32 and moveConditionallyTest32 with immediate thenCase.
     FOR_EACH_RELATIONAL_CONDITION_RUN(testMoveConditionally32WithImmThenCase);
+#endif
 
+#if CPU(X86_64) || CPU(ARM64)
     // For test32 variants, only use Zero and NonZero (Overflow is not valid for TEST).
     RUN(testMoveConditionallyTest32WithImmThenCaseRegMask(MacroAssembler::Zero));
     RUN(testMoveConditionallyTest32WithImmThenCaseRegMask(MacroAssembler::NonZero));
@@ -8662,7 +9398,7 @@ void run(const char* filter) WTF_IGNORES_THREAD_SAFETY_ANALYSIS
     RUN(testMoveConditionallyTest32WithImmThenCaseImmMask(MacroAssembler::NonZero));
 #endif
 
-#if CPU(X86_64) || CPU(ARM64) || CPU(RISCV64)
+#if CPU(X86_64) || CPU(ARM64) || CPU(RISCV64) || CPU(PPC64)
     RUN(testSignExtend8To32());
     RUN(testSignExtend16To32());
     RUN(testSignExtend8To64());
@@ -8687,7 +9423,7 @@ void run(const char* filter) WTF_IGNORES_THREAD_SAFETY_ANALYSIS
 
     RUN(testBranchIfType());
     RUN(testBranchIfNotType());
-#if CPU(X86_64) || CPU(ARM64)
+#if CPU(X86_64) || CPU(ARM64) || CPU(PPC64)
     RUN(testBranchConvertDoubleToInt52());
 #endif
 
@@ -8703,7 +9439,7 @@ void run(const char* filter) WTF_IGNORES_THREAD_SAFETY_ANALYSIS
 
     RUN(testNegateFloat());
 
-#if CPU(ARM64) || CPU(X86_64)
+#if CPU(ARM64) || CPU(X86_64) || CPU(PPC64)
     RUN(testMove32ToFloatMovi());
     RUN(testMove64ToDoubleMovi());
     RUN(testMove64ToDoubleRepeated32BitPatternBug());
@@ -8723,6 +9459,27 @@ void run(const char* filter) WTF_IGNORES_THREAD_SAFETY_ANALYSIS
 #endif
 
     RUN(testGPRInfoConsistency());
+
+#if CPU(PPC64)
+    RUN(testPPC64ISALevelSequences());
+    RUN(testFloat16Conversions());
+#endif
+
+#if CPU(ARM64) || CPU(PPC64)
+    RUN(testLitmusMessagePassing(false));
+    RUN(testLitmusMessagePassing(true));
+    RUN(testLitmusStoreBuffering(LitmusOrdering::None));
+    RUN(testLitmusStoreBuffering(LitmusOrdering::MemoryFence));
+    RUN(testLitmusStoreBuffering(LitmusOrdering::AcquireRelease));
+    RUN(testLitmusR());
+    RUN(testLitmusWeakCASCounter32());
+    RUN(testLitmusWeakCASCounter8());
+    RUN(testLitmusStrongCASMismatchNeverWrites());
+#if ENABLE(JUMP_ISLANDS)
+    RUN(testCrossModifyingNearCall(false));
+    RUN(testCrossModifyingNearCall(true));
+#endif
+#endif
 
     if (tasks.isEmpty())
         usage();

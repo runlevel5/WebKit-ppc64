@@ -85,6 +85,9 @@ WTF_ALLOW_UNSAFE_BUFFER_USAGE_BEGIN
 #elif CPU(RISCV64)
 #define TARGET_ASSEMBLER RISCV64Assembler
 
+#elif CPU(PPC64)
+#define TARGET_ASSEMBLER PPC64Assembler
+
 #else
 #error "The MacroAssembler is not supported on this platform."
 #endif

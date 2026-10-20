@@ -127,7 +127,7 @@ RegisterSet RegisterSet::macroClobberedGPRs()
     RegisterSet result;
 #if CPU(X86_64)
     result.add(MacroAssembler::s_scratchRegister);
-#elif CPU(ARM64) || CPU(RISCV64)
+#elif CPU(ARM64) || CPU(RISCV64) || CPU(PPC64)
     result.add(MacroAssembler::dataTempRegister);
     result.add(MacroAssembler::memoryTempRegister);
 #elif CPU(ARM_THUMB2)
@@ -140,7 +140,7 @@ RegisterSet RegisterSet::macroClobberedGPRs()
 RegisterSet RegisterSet::macroClobberedFPRs()
 {
     RegisterSet result;
-#if CPU(X86_64) || CPU(ARM64) || CPU(ARM_THUMB2)
+#if CPU(X86_64) || CPU(ARM64) || CPU(ARM_THUMB2) || CPU(PPC64)
     result.add(MacroAssembler::fpTempRegister, IgnoreVectors);
 #elif CPU(RISCV64)
     result.add(MacroAssembler::fpTempRegister, IgnoreVectors);
@@ -228,6 +228,25 @@ RegisterSet RegisterSet::vmCalleeSaveRegisters()
     result.add(FPRInfo::fpRegCS9, IgnoreVectors);
     result.add(FPRInfo::fpRegCS10, IgnoreVectors);
     result.add(FPRInfo::fpRegCS11, IgnoreVectors);
+#elif CPU(PPC64)
+    result.add(GPRInfo::regCS0);
+    result.add(GPRInfo::regCS1);
+    result.add(GPRInfo::regCS2);
+    result.add(GPRInfo::regCS3);
+    result.add(GPRInfo::regCS4);
+    result.add(GPRInfo::regCS5);
+    result.add(GPRInfo::regCS6);
+    result.add(GPRInfo::regCS7);
+    result.add(GPRInfo::regCS8);
+    result.add(GPRInfo::regCS9);
+    result.add(FPRInfo::fpRegCS0, Width64);
+    result.add(FPRInfo::fpRegCS1, Width64);
+    result.add(FPRInfo::fpRegCS2, Width64);
+    result.add(FPRInfo::fpRegCS3, Width64);
+    result.add(FPRInfo::fpRegCS4, Width64);
+    result.add(FPRInfo::fpRegCS5, Width64);
+    result.add(FPRInfo::fpRegCS6, Width64);
+    result.add(FPRInfo::fpRegCS7, Width64);
 #endif
     return result;
 }
@@ -246,7 +265,7 @@ RegisterSet RegisterSet::llintBaselineCalleeSaveRegisters()
 #elif CPU(ARM_THUMB2)
     result.add(GPRInfo::regCS0);
     result.add(GPRInfo::regCS1);
-#elif CPU(ARM64) || CPU(RISCV64)
+#elif CPU(ARM64) || CPU(RISCV64) || CPU(PPC64)
     result.add(GPRInfo::regCS6);
     static_assert(GPRInfo::regCS7 == GPRInfo::jitDataRegister);
     static_assert(GPRInfo::regCS8 == GPRInfo::numberTagRegister);
@@ -276,6 +295,21 @@ RegisterSet RegisterSet::dfgCalleeSaveRegisters()
     result.add(GPRInfo::regCS0);
     result.add(GPRInfo::regCS1);
 #elif CPU(ARM64) || CPU(RISCV64)
+    static_assert(GPRInfo::regCS7 == GPRInfo::jitDataRegister);
+    static_assert(GPRInfo::regCS8 == GPRInfo::numberTagRegister);
+    static_assert(GPRInfo::regCS9 == GPRInfo::notCellMaskRegister);
+    result.add(GPRInfo::regCS7);
+    result.add(GPRInfo::regCS8);
+    result.add(GPRInfo::regCS9);
+#elif CPU(PPC64)
+    // The allocatable GPR pool includes regCS0-regCS5 (r14-r19), which are
+    // ELFv2 callee-saved, so the DFG prologue must save them.
+    result.add(GPRInfo::regCS0);
+    result.add(GPRInfo::regCS1);
+    result.add(GPRInfo::regCS2);
+    result.add(GPRInfo::regCS3);
+    result.add(GPRInfo::regCS4);
+    result.add(GPRInfo::regCS5);
     static_assert(GPRInfo::regCS7 == GPRInfo::jitDataRegister);
     static_assert(GPRInfo::regCS8 == GPRInfo::numberTagRegister);
     static_assert(GPRInfo::regCS9 == GPRInfo::notCellMaskRegister);
@@ -324,6 +358,30 @@ RegisterSet RegisterSet::ftlCalleeSaveRegisters()
     result.add(FPRInfo::fpRegCS5, Width64);
     result.add(FPRInfo::fpRegCS6, Width64);
     result.add(FPRInfo::fpRegCS7, Width64);
+#elif CPU(PPC64)
+    // B3 might save and use all callee saves specified in the ELFv2 ABI that
+    // JSC models (regCS0-9 = r14-r23, fpRegCS0-7 = f14-f21).
+    result.add(GPRInfo::regCS0);
+    result.add(GPRInfo::regCS1);
+    result.add(GPRInfo::regCS2);
+    result.add(GPRInfo::regCS3);
+    result.add(GPRInfo::regCS4);
+    result.add(GPRInfo::regCS5);
+    result.add(GPRInfo::regCS6);
+    static_assert(GPRInfo::regCS7 == GPRInfo::jitDataRegister);
+    static_assert(GPRInfo::regCS8 == GPRInfo::numberTagRegister);
+    static_assert(GPRInfo::regCS9 == GPRInfo::notCellMaskRegister);
+    result.add(GPRInfo::regCS7);
+    result.add(GPRInfo::regCS8);
+    result.add(GPRInfo::regCS9);
+    result.add(FPRInfo::fpRegCS0, Width64);
+    result.add(FPRInfo::fpRegCS1, Width64);
+    result.add(FPRInfo::fpRegCS2, Width64);
+    result.add(FPRInfo::fpRegCS3, Width64);
+    result.add(FPRInfo::fpRegCS4, Width64);
+    result.add(FPRInfo::fpRegCS5, Width64);
+    result.add(FPRInfo::fpRegCS6, Width64);
+    result.add(FPRInfo::fpRegCS7, Width64);
 #elif CPU(RISCV64)
     result.add(GPRInfo::regCS0);
     result.add(GPRInfo::regCS1);
@@ -351,6 +409,28 @@ RegisterSet RegisterSet::ftlCalleeSaveRegisters()
     result.add(FPRInfo::fpRegCS9, IgnoreVectors);
     result.add(FPRInfo::fpRegCS10, IgnoreVectors);
     result.add(FPRInfo::fpRegCS11, IgnoreVectors);
+#elif CPU(PPC64)
+    result.add(GPRInfo::regCS0);
+    result.add(GPRInfo::regCS1);
+    result.add(GPRInfo::regCS2);
+    result.add(GPRInfo::regCS3);
+    result.add(GPRInfo::regCS4);
+    result.add(GPRInfo::regCS5);
+    result.add(GPRInfo::regCS6);
+    static_assert(GPRInfo::regCS7 == GPRInfo::jitDataRegister);
+    static_assert(GPRInfo::regCS8 == GPRInfo::numberTagRegister);
+    static_assert(GPRInfo::regCS9 == GPRInfo::notCellMaskRegister);
+    result.add(GPRInfo::regCS7);
+    result.add(GPRInfo::regCS8);
+    result.add(GPRInfo::regCS9);
+    result.add(FPRInfo::fpRegCS0, Width64);
+    result.add(FPRInfo::fpRegCS1, Width64);
+    result.add(FPRInfo::fpRegCS2, Width64);
+    result.add(FPRInfo::fpRegCS3, Width64);
+    result.add(FPRInfo::fpRegCS4, Width64);
+    result.add(FPRInfo::fpRegCS5, Width64);
+    result.add(FPRInfo::fpRegCS6, Width64);
+    result.add(FPRInfo::fpRegCS7, Width64);
 #else
     UNREACHABLE_FOR_PLATFORM();
 #endif
@@ -446,7 +526,7 @@ RegisterSet RegisterSet::ipintCalleeSaveRegisters()
 #if CPU(X86_64)
     registers.add(GPRInfo::regCS1); // MC (pointer to metadata)
     registers.add(GPRInfo::regCS2); // PB
-#elif CPU(ARM64) || CPU(RISCV64)
+#elif CPU(ARM64) || CPU(RISCV64) || CPU(PPC64)
     registers.add(GPRInfo::regCS6); // MC
     registers.add(GPRInfo::regCS7); // PB
 #elif CPU(ARM)

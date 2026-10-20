@@ -63,6 +63,11 @@ void CCallHelpers::ensureShadowChickenPacket(VM& vm, GPRReg shadowPacket, GPRReg
     move(TrustedImmPtr(shadowChicken->addressOfLogCursor()), scratch1NonArgGPR);
     loadPtr(Address(scratch1NonArgGPR), shadowPacket);
     ok.link(this);
+#if CPU(PPC64)
+    // nonArgGPR0 is dataTempRegister on PPC64, which the branchPtr above clobbers
+    // when it materializes the 64-bit pointer. Reload it.
+    move(TrustedImmPtr(shadowChicken->addressOfLogCursor()), scratch1NonArgGPR);
+#endif
     addPtr(TrustedImm32(sizeof(ShadowChicken::Packet)), shadowPacket, scratch2);
     storePtr(scratch2, Address(scratch1NonArgGPR));
 }
@@ -93,6 +98,11 @@ void CCallHelpers::emitCTIThunkPrologue(bool returnAddressAlreadyTagged)
         tagReturnAddress();
 #if CPU(X86_64)
     push(X86Registers::ebp); // return address pushed by the call instruction
+#elif CPU(PPC64)
+    // linkRegister is only a placeholder on PPC64; the return address is in LR,
+    // which the nested operation call clobbers.
+    moveFromLR(dataTempRegister);
+    pushPair(framePointerRegister, dataTempRegister);
 #elif CPU(ARM64) || CPU(ARM_THUMB2) || CPU(RISCV64)
     pushPair(framePointerRegister, linkRegister);
 #else
@@ -111,6 +121,10 @@ void CCallHelpers::emitCTIThunkEpilogue()
     // Restore frame pointer and return address
 #if CPU(X86_64)
     pop(X86Registers::ebp); // Return address left on stack
+#elif CPU(PPC64)
+    // See emitCTIThunkPrologue.
+    popPair(framePointerRegister, dataTempRegister);
+    moveToLR(dataTempRegister);
 #elif CPU(ARM64) || CPU(ARM_THUMB2) || CPU(RISCV64)
     popPair(framePointerRegister, linkRegister);
 #else

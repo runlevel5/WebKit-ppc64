@@ -58,7 +58,13 @@ SlowPathCallContext::SlowPathCallContext(
         
     m_offsetToSavingArea =
         (std::max(m_numArgs, NUMBER_OF_ARGUMENT_REGISTERS) - NUMBER_OF_ARGUMENT_REGISTERS) * wordSize;
-    
+#if CPU(PPC64)
+    // ELFv2: sp + 0..31 is the linkage area, where the C callee saves CR/LR and
+    // the call sequence the TOC. Everything this context stores across the call
+    // must live above it.
+    m_offsetToSavingArea += 32;
+#endif
+
     RegisterSet callingConventionRegisters = m_callingConventionRegisters.toRegisterSet();
     for (unsigned i = std::min(NUMBER_OF_ARGUMENT_REGISTERS, numArgs); i--;)
         callingConventionRegisters.add(GPRInfo::toArgumentRegister(i), IgnoreVectors);

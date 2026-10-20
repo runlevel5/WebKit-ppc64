@@ -248,6 +248,10 @@ void SpeculativeJIT::compileFunction()
 
 #if CPU(X86_64)
         pop(GPRInfo::argumentGPR1);
+#elif CPU(PPC64)
+        // linkRegister is only a placeholder on PPC64; the return address is in LR,
+        // which nearCallThunk clobbers.
+        moveFromLR(GPRInfo::argumentGPR1);
 #else
         tagPtr(NoPtrTag, linkRegister);
         move(linkRegister, GPRInfo::argumentGPR1);
@@ -255,6 +259,8 @@ void SpeculativeJIT::compileFunction()
         nearCallThunk(CodeLocationLabel { LLInt::arityFixup() });
 #if CPU(X86_64)
         push(GPRInfo::argumentGPR1);
+#elif CPU(PPC64)
+        moveToLR(GPRInfo::argumentGPR1);
 #else
         move(GPRInfo::argumentGPR1, linkRegister);
         untagPtr(NoPtrTag, linkRegister);
@@ -6194,7 +6200,7 @@ void SpeculativeJIT::compileArithDiv(Node* node)
         
         done.link(this);
         strictInt32Result(eax.gpr(), node);
-#elif HAVE(ARM_IDIV_INSTRUCTIONS) || CPU(ARM64)
+#elif HAVE(ARM_IDIV_INSTRUCTIONS) || CPU(ARM64) || CPU(PPC64)
         SpeculateInt32Operand op1(this, node->child1());
         SpeculateInt32Operand op2(this, node->child2());
         GPRReg op1GPR = op1.gpr();
@@ -6214,7 +6220,25 @@ void SpeculativeJIT::compileArithDiv(Node* node)
             speculationCheck(ExitKind::Overflow, JSValueRegs(), nullptr, branchTest32(Zero, op2GPR));
 
         // Note that it is fine that sdiv with 0-divisor. The resulted value is zero (no trap).
+#if CPU(PPC64)
+        // divw's result is undefined for x / 0 and INT32_MIN / -1, where the code
+        // below relies on sdiv's 0 and INT32_MIN. x / -1 is -x, which wraps as sdiv does.
+        {
+            JumpList divisionDone;
+            Jump divisorNonZero = branchTest32(NonZero, op2GPR);
+            move(TrustedImm32(0), quotient.gpr());
+            divisionDone.append(jump());
+            divisorNonZero.link(this);
+            Jump divisorNotMinusOne = branch32(NotEqual, op2GPR, TrustedImm32(-1));
+            neg32(op1GPR, quotient.gpr());
+            divisionDone.append(jump());
+            divisorNotMinusOne.link(this);
+            div32(op1GPR, op2GPR, quotient.gpr());
+            divisionDone.link(this);
+        }
+#else
         assembler().sdiv<32>(quotient.gpr(), op1GPR, op2GPR);
+#endif
 
         // Check that there was no remainder. If there had been, then we'd be obligated to
         // produce a double result instead.
@@ -6528,7 +6552,7 @@ void SpeculativeJIT::compileArithMod(Node* node)
         done.link(this);
         strictInt32Result(edx.gpr(), node);
 
-#elif HAVE(ARM_IDIV_INSTRUCTIONS) || CPU(ARM64)
+#elif HAVE(ARM_IDIV_INSTRUCTIONS) || CPU(ARM64) || CPU(PPC64)
         GPRTemporary quotientThenRemainder(this);
         GPRReg dividendGPR = op1.gpr();
         GPRReg divisorGPR = op2.gpr();
@@ -6549,6 +6573,25 @@ void SpeculativeJIT::compileArithMod(Node* node)
         }
 
         // This is doing: x - ((x / y) * y)
+#if CPU(PPC64)
+        // divw's result is undefined for INT32_MIN / -1, so answer x % -1 = 0
+        // directly. The negative-zero check below still sees it.
+        JumpList afterDivision;
+        Jump divisorNotMinusOne = branch32(NotEqual, divisorGPR, TrustedImm32(-1));
+        move(TrustedImm32(0), quotientThenRemainderGPR);
+        afterDivision.append(jump());
+        divisorNotMinusOne.link(this);
+#endif
+#if CPU(PPC64)
+        if (supportsISA3_00())
+            mod32(dividendGPR, divisorGPR, quotientThenRemainderGPR);
+        else {
+            div32(dividendGPR, divisorGPR, quotientThenRemainderGPR);
+            mul32(quotientThenRemainderGPR, divisorGPR, quotientThenRemainderGPR);
+            sub32(dividendGPR, quotientThenRemainderGPR, quotientThenRemainderGPR);
+        }
+        afterDivision.link(this);
+#else
         div32(dividendGPR, divisorGPR, quotientThenRemainderGPR);
         // This should only overflow for INT32_MIN % -1 but that will end up with quotientThenRemainderGPR == 0, which will be handled as needed in the negative zero check.
 #if CPU(ARM64)
@@ -6556,6 +6599,7 @@ void SpeculativeJIT::compileArithMod(Node* node)
 #else
         mul32(quotientThenRemainderGPR, divisorGPR, quotientThenRemainderGPR);
         sub32(dividendGPR, quotientThenRemainderGPR, quotientThenRemainderGPR);
+#endif
 #endif
 
         // If the user cares about negative zero, then speculate that we're not about
@@ -6633,7 +6677,7 @@ void SpeculativeJIT::compileArithMod(Node* node)
             unlock(op2TempGPR);
 
         strictInt52Result(X86Registers::edx, node);
-#elif CPU(ARM64)
+#elif CPU(ARM64) || CPU(PPC64)
         GPRTemporary quotient(this);
         GPRTemporary result(this);
 
@@ -6654,9 +6698,17 @@ void SpeculativeJIT::compileArithMod(Node* node)
             notZero.link(this);
         }
 
-        div64(op1GPR, op2GPR, quotientGPR);
-        mul64(quotientGPR, op2GPR, resultGPR);
-        sub64(op1GPR, resultGPR, resultGPR);
+#if CPU(PPC64)
+        // Int52 values are far from INT64_MIN, so modsd is well defined here.
+        if (supportsISA3_00())
+            mod64(op1GPR, op2GPR, resultGPR);
+        else
+#endif
+        {
+            div64(op1GPR, op2GPR, quotientGPR);
+            mul64(quotientGPR, op2GPR, resultGPR);
+            sub64(op1GPR, resultGPR, resultGPR);
+        }
 
         if (shouldCheckNegativeZero(node->arithMode())) {
             Jump numeratorPositive = branch64(GreaterThanOrEqual, op1GPR, TrustedImm64(0));
@@ -6667,6 +6719,8 @@ void SpeculativeJIT::compileArithMod(Node* node)
         doneCases.link(this);
         strictInt52Result(resultGPR, node);
 #else
+        UNUSED_PARAM(op1GPR);
+        UNUSED_PARAM(op2GPR);
         RELEASE_ASSERT_NOT_REACHED();
 #endif
         return;
@@ -6959,6 +7013,16 @@ void SpeculativeJIT::compileArithMinMax(Node* node)
                 doubleMax(op1FPR, op2FPR, resultFPR);
             doubleResult(resultFPR, node);
 #else
+#if CPU(PPC64)
+            if (supportsFloatingPointMinMax()) {
+                if (node->op() == ArithMin)
+                    doubleMin(op1FPR, op2FPR, resultFPR);
+                else
+                    doubleMax(op1FPR, op2FPR, resultFPR);
+                doubleResult(resultFPR, node);
+                break;
+            }
+#endif
             JumpList done;
 
             Jump op1Less = branchDouble(node->op() == ArithMin ? DoubleLessThanAndOrdered : DoubleGreaterThanAndOrdered, op1FPR, op2FPR);
@@ -7019,6 +7083,29 @@ void SpeculativeJIT::compileArithMinMax(Node* node)
 
         doubleResult(resultFPR, node);
 #else
+#if CPU(PPC64)
+        if (supportsFloatingPointMinMax()) {
+            SpeculateDoubleOperand op1(this, m_graph.child(node, 0));
+            FPRTemporary result(this);
+
+            FPRReg op1FPR = op1.fpr();
+            FPRReg resultFPR = result.fpr();
+
+            moveDouble(op1FPR, resultFPR);
+
+            for (unsigned index = 1; index < node->numChildren(); ++index) {
+                SpeculateDoubleOperand op2(this, m_graph.child(node, index));
+                FPRReg op2FPR = op2.fpr();
+                if (node->op() == ArithMin)
+                    doubleMin(op2FPR, resultFPR, resultFPR);
+                else
+                    doubleMax(op2FPR, resultFPR, resultFPR);
+            }
+
+            doubleResult(resultFPR, node);
+            break;
+        }
+#endif
         GPRTemporary buffer(this);
 
         GPRReg bufferGPR = buffer.gpr();
@@ -9648,7 +9735,7 @@ void SpeculativeJIT::compileSpread(Node* node)
         zeroExtend32ToWord(lengthGPR, lengthGPR);
 
         // Load deletedEntryCount and check it's 0.
-        load32(Address(scratch1GPR, Helper::deletedEntryCountIndex() * sizeof(EncodedJSValue)), scratch2GPR);
+        load32(Address(scratch1GPR, Helper::deletedEntryCountIndex() * sizeof(EncodedJSValue) + PayloadOffset), scratch2GPR);
         slowPath.append(branchTest32(NonZero, scratch2GPR));
 
         // Guard aliveEntryCount <= MAX_STORAGE_VECTOR_LENGTH.
@@ -9669,7 +9756,7 @@ void SpeculativeJIT::compileSpread(Node* node)
         // Reload storage and recompute source base pointer (scratches were clobbered by allocation).
         loadPtr(Address(argument, JSSet::offsetOfStorage()), scratch1GPR);
         addPtr(TrustedImm32(JSCellButterfly::offsetOfData()), scratch1GPR);
-        load32(Address(scratch1GPR, Helper::capacityIndex() * sizeof(EncodedJSValue)), scratch2GPR);
+        load32(Address(scratch1GPR, Helper::capacityIndex() * sizeof(EncodedJSValue) + PayloadOffset), scratch2GPR);
         add32(TrustedImm32(Helper::hashTableStartIndex()), scratch2GPR);
         // scratch1GPR += dataTableStartIndex * sizeof(EncodedJSValue)
         lshiftPtr(TrustedImm32(3), scratch2GPR);
@@ -14995,13 +15082,13 @@ void SpeculativeJIT::compileMapIteratorKey(Node* node)
         static_assert(JSMap::Helper::EntrySize == 3);
         lshift32(entryGPR, TrustedImm32(1), scratchGPR2);
         add32(entryGPR, scratchGPR2);
-        load32(Address(storageGPR, JSCellButterfly::offsetOfData() + JSMap::Helper::capacityIndex() * sizeof(uint64_t)), scratchGPR1);
+        load32(Address(storageGPR, JSCellButterfly::offsetOfData() + JSMap::Helper::capacityIndex() * sizeof(uint64_t) + PayloadOffset), scratchGPR1);
         add32(scratchGPR1, scratchGPR2);
         add32(TrustedImm32(JSMap::Helper::hashTableStartIndex() - JSMap::Helper::EntrySize), scratchGPR2);
     } else {
         static_assert(JSSet::Helper::EntrySize == 2);
         add32(entryGPR, entryGPR, scratchGPR2);
-        load32(Address(storageGPR, JSCellButterfly::offsetOfData() + JSSet::Helper::capacityIndex() * sizeof(uint64_t)), scratchGPR1);
+        load32(Address(storageGPR, JSCellButterfly::offsetOfData() + JSSet::Helper::capacityIndex() * sizeof(uint64_t) + PayloadOffset), scratchGPR1);
         add32(scratchGPR1, scratchGPR2);
         add32(TrustedImm32(JSSet::Helper::hashTableStartIndex() - JSSet::Helper::EntrySize), scratchGPR2);
     }
@@ -15027,7 +15114,7 @@ void SpeculativeJIT::compileMapIteratorValue(Node* node)
     static_assert(JSMap::Helper::EntrySize == 3);
     lshift32(entryGPR, TrustedImm32(1), scratchGPR2);
     add32(entryGPR, scratchGPR2);
-    load32(Address(storageGPR, JSCellButterfly::offsetOfData() + JSMap::Helper::capacityIndex() * sizeof(uint64_t)), scratchGPR1);
+    load32(Address(storageGPR, JSCellButterfly::offsetOfData() + JSMap::Helper::capacityIndex() * sizeof(uint64_t) + PayloadOffset), scratchGPR1);
     add32(scratchGPR1, scratchGPR2);
     add32(TrustedImm32(JSMap::Helper::hashTableStartIndex() - JSMap::Helper::EntrySize + /* value offset */ 1), scratchGPR2);
 
@@ -15599,14 +15686,22 @@ void SpeculativeJIT::compileGetSetter(Node* node)
 void SpeculativeJIT::compileGetCallee(Node* node)
 {
     GPRTemporary result(this);
+#if USE(JSVALUE64)
+    loadPtr(addressFor(CallFrameSlot::callee), result.gpr());
+#else
     loadPtr(payloadFor(CallFrameSlot::callee), result.gpr());
+#endif
     cellResult(result.gpr(), node);
 }
 
 void SpeculativeJIT::compileSetCallee(Node* node)
 {
     SpeculateCellOperand callee(this, node->child1());
+#if USE(JSVALUE64)
+    storeCell(callee.gpr(), addressFor(CallFrameSlot::callee));
+#else
     storeCell(callee.gpr(), payloadFor(CallFrameSlot::callee));
+#endif
     noResult(node);
 }
 
@@ -16672,7 +16767,13 @@ void SpeculativeJIT::compileLogShadowChickenPrologue(Node* node)
     prepareForExternalCall();
     emitStoreCodeOrigin(node->origin.semantic);
 
+#if CPU(PPC64)
+    // nonArgGPR0 is dataTempRegister on PPC64, which the register allocator does
+    // not own. Any non-argument register will do.
+    GPRTemporary scratch1(this, GPRInfo::regCS0);
+#else
     GPRTemporary scratch1(this, GPRInfo::nonArgGPR0); // This must be a non-argument GPR.
+#endif
     GPRReg scratch1Reg = scratch1.gpr();
     GPRTemporary scratch2(this);
     GPRReg scratch2Reg = scratch2.gpr();
@@ -16694,7 +16795,13 @@ void SpeculativeJIT::compileLogShadowChickenTail(Node* node)
     prepareForExternalCall();
     CallSiteIndex callSiteIndex = emitStoreCodeOrigin(node->origin.semantic);
 
+#if CPU(PPC64)
+    // nonArgGPR0 is dataTempRegister on PPC64, which the register allocator does
+    // not own. Any non-argument register will do.
+    GPRTemporary scratch1(this, GPRInfo::regCS0);
+#else
     GPRTemporary scratch1(this, GPRInfo::nonArgGPR0); // This must be a non-argument GPR.
+#endif
     GPRReg scratch1Reg = scratch1.gpr();
     GPRTemporary scratch2(this);
     GPRReg scratch2Reg = scratch2.gpr();
@@ -16735,7 +16842,7 @@ void SpeculativeJIT::compileMapOrSetSize(Node* node)
     move(TrustedImm32(0), resultGPR);
     auto nullCase = branchTestPtr(Zero, storageGPR);
     // offsetOfAliveEntryCount() is the same for both JSSet::Helper and JSMap::Helper.
-    load32(Address(storageGPR, JSSet::Helper::offsetOfAliveEntryCount()), resultGPR);
+    load32(Address(storageGPR, JSSet::Helper::offsetOfAliveEntryCount() + PayloadOffset), resultGPR);
 
     nullCase.link(this);
     strictInt32Result(resultGPR, node);
@@ -17805,6 +17912,26 @@ void SpeculativeJIT::compileMakeRope(Node* node)
     orPtr(TrustedImmPtr(JSString::isRopeInPointer), scratchGPR);
     storePtr(scratchGPR, Address(resultGPR, JSRopeString::offsetOfFiber0()));
 
+#if CPU(BIG_ENDIAN)
+    // CompactFibers is { u32 length; u32 fiber1Lower; u16 fiber1Upper; u16 fiber2Lower;
+    // u32 fiber2Upper }. As big-endian words, the first field of each is the high half:
+    // word1 = length << 32 | low32(fiber1),
+    // word2 = upper16(fiber1) << 48 | low16(fiber2) << 32 | fiber2 >> 16.
+    lshiftPtr(allocatorGPR, TrustedImm32(32), scratchGPR);
+    zeroExtend32ToWord(opGPRs[1], scratch2GPR);
+    orPtr(scratch2GPR, scratchGPR);
+    storePtr(scratchGPR, Address(resultGPR, JSRopeString::offsetOfFiber1()));
+    urshift64(opGPRs[1], TrustedImm32(32), scratchGPR);
+    lshiftPtr(TrustedImm32(48), scratchGPR);
+    if (numOpGPRs == 3) {
+        zeroExtend16To32(opGPRs[2], scratch2GPR);
+        lshiftPtr(TrustedImm32(32), scratch2GPR);
+        orPtr(scratch2GPR, scratchGPR);
+        urshift64(opGPRs[2], TrustedImm32(16), scratch2GPR);
+        orPtr(scratch2GPR, scratchGPR);
+    }
+    storePtr(scratchGPR, Address(resultGPR, JSRopeString::offsetOfFiber2()));
+#else
 #if CPU(ARM64)
     orLeftShift64(allocatorGPR, opGPRs[1], TrustedImm32(32), scratchGPR);
 #else
@@ -17828,6 +17955,7 @@ void SpeculativeJIT::compileMakeRope(Node* node)
         storePtr(scratchGPR, Address(resultGPR, JSRopeString::offsetOfFiber2()));
 #endif
     }
+#endif
 
     auto isNonEmptyString = branchTest32(NonZero, allocatorGPR);
 
@@ -18361,9 +18489,15 @@ void SpeculativeJIT::compileStringStartsOrEndsWithConstant(Node* node, bool isSt
     // Encode the search bytes as little-endian immediates so the comparison is a few
     // wide loads + compares, with overlap when searchLength isn't a power of two.
     auto chunk = [&](unsigned offset, unsigned width) -> uint64_t {
+        // The characters as the word a load of them yields on this host.
         uint64_t value = 0;
-        for (unsigned i = 0; i < width; ++i)
+        for (unsigned i = 0; i < width; ++i) {
+#if CPU(BIG_ENDIAN)
+            value |= static_cast<uint64_t>(search[offset + i]) << ((width - 1 - i) * 8);
+#else
             value |= static_cast<uint64_t>(search[offset + i]) << (i * 8);
+#endif
+        }
         return value;
     };
 

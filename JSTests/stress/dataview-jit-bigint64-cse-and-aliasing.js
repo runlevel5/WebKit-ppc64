@@ -18,10 +18,13 @@ function getTwice(dv, offset) {
 }
 noInline(getTwice);
 
+// The typed array stores in the platform's byte order, so read it back that way.
+const littleEndian = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
+
 function getArrayStoreGet(dv, array, index, value) {
-    let before = dv.getBigUint64(index * 8, true);
+    let before = dv.getBigUint64(index * 8, littleEndian);
     array[index] = value;
-    let after = dv.getBigUint64(index * 8, true);
+    let after = dv.getBigUint64(index * 8, littleEndian);
     return [before, after];
 }
 noInline(getArrayStoreGet);

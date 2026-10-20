@@ -69,7 +69,7 @@ ArrayMode ArrayMode::fromObserved(const ConcurrentJSLocker& locker, ArrayProfile
     ArrayModes observed = profile->observedArrayModes(locker);
     switch (observed) {
     case 0:
-        return ArrayMode(Array::Unprofiled);
+        return ArrayMode(Array::Unprofiled, action);
     case asArrayModesIgnoringTypedArrays(NonArray):
         if (action == Array::Write && !profile->mayInterceptIndexedAccesses(locker))
             return ArrayMode(Array::SelectUsingArguments, nonArray, Array::OutOfBounds, Array::Convert, action);
@@ -158,7 +158,7 @@ ArrayMode ArrayMode::fromObserved(const ConcurrentJSLocker& locker, ArrayProfile
             return ArrayMode(Array::Generic, nonArray, Array::AsIs, action).withProfile(locker, profile, makeSafe);
 
         if ((observed & asArrayModesIgnoringTypedArrays(NonArray)) && profile->mayInterceptIndexedAccesses(locker))
-            return ArrayMode(Array::SelectUsingPredictions).withSpeculationFromProfile(locker, profile, makeSafe);
+            return ArrayMode(Array::SelectUsingPredictions, action).withSpeculationFromProfile(locker, profile, makeSafe);
         
         Array::Type type;
         Array::Class arrayClass;

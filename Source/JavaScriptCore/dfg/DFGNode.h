@@ -166,6 +166,18 @@ struct DataViewData {
         };
         uint64_t asQuadWord;
     };
+
+    // The fields as one integer in the low bits, independent of byte order. AbstractHeap keeps
+    // only the low 48 bits of a payload, which on big-endian would drop byteSize and isSigned
+    // from asQuadWord.
+    uint64_t key() const
+    {
+        return static_cast<uint64_t>(byteSize)
+            | static_cast<uint64_t>(isSigned) << 8
+            | static_cast<uint64_t>(isResizable) << 16
+            | static_cast<uint64_t>(isFloatingPoint) << 24
+            | static_cast<uint64_t>(static_cast<uint8_t>(isLittleEndian)) << 32;
+    }
 };
 static_assert(sizeof(DataViewData) == sizeof(uint64_t));
 
@@ -3985,10 +3997,11 @@ private:
         {
             u.int64 = 0;
         }
+        // Integers are stored zero-extended in int64 and read back truncated, so that a
+        // value stored at either width reads back the same on either byte order.
         OpInfoWrapper(uint32_t intValue)
         {
-            u.int64 = 0;
-            u.int32 = intValue;
+            u.int64 = intValue;
         }
         OpInfoWrapper(uint64_t intValue)
         {
@@ -4016,14 +4029,12 @@ private:
         }
         OpInfoWrapper& operator=(uint32_t int32)
         {
-            u.int64 = 0;
-            u.int32 = int32;
+            u.int64 = int32;
             return *this;
         }
         OpInfoWrapper& operator=(int32_t int32)
         {
-            u.int64 = 0;
-            u.int32 = int32;
+            u.int64 = static_cast<uint32_t>(int32);
             return *this;
         }
         OpInfoWrapper& operator=(uint64_t int64)
@@ -4076,7 +4087,7 @@ private:
             requires (IntegralOrEnum<T> && sizeof(T) <= 4)
         ALWAYS_INLINE T as() const
         {
-            return static_cast<T>(u.int32);
+            return static_cast<T>(static_cast<uint32_t>(u.int64));
         }
         template<typename T>
             requires (IntegralOrEnum<T> && sizeof(T) == 8)
@@ -4099,7 +4110,6 @@ private:
         }
 
         union {
-            uint32_t int32;
             uint64_t int64;
             void* pointer;
             const void* constPointer;

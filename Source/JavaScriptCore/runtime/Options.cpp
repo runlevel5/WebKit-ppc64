@@ -697,8 +697,10 @@ void Options::setAllJITCodeValidations(bool value)
 static inline void NODELETE disableAllWasmJITOptions()
 {
 #if ENABLE(WEBASSEMBLY)
-    // This really only makes sense if could use wasm, otherwise we should not override this.
-    Options::useLLInt() = true;
+    // The LLInt is wasm's fallback engine, so keep it on without the wasm JITs, but
+    // only if wasm can run: otherwise this would override an explicit --useLLInt=0.
+    if (Options::useWasm())
+        Options::useLLInt() = true;
 #endif
     Options::useBBQJIT() = false;
     Options::useOMGJIT() = false;
@@ -839,14 +841,20 @@ void Options::notifyOptionsChanged()
 #if !CPU(X86_64) && !CPU(ARM64)
     Options::useConcurrentGC() = false;
     Options::forceUnlinkedDFG() = false;
+#if !CPU(PPC64) || CPU(BIG_ENDIAN)
+    // Big-endian hosts would need the lanes of every v128 memory access reversed.
     Options::useWasmSIMD() = false;
+#endif
+#if !CPU(PPC64)
     Options::useWasmIPInt() = false;
-#if !CPU(ARM_THUMB2)
+#endif
+    // PPC64 has IPInt (InPlaceInterpreter64.asm) and BBQ, so neither is forced off.
+#if !CPU(ARM_THUMB2) && !CPU(PPC64)
     Options::useBBQJIT() = false;
 #endif
 #endif
 
-#if !CPU(ARM64)
+#if !CPU(ARM64) && !CPU(PPC64)
     Options::useRandomizingExecutableIslandAllocation() = false;
 #endif
 
@@ -866,7 +874,10 @@ void Options::notifyOptionsChanged()
         Options::thresholdForBBQOptimizeAfterWarmUp() = 0; // Trigger immediate BBQ tier up.
 
 #if CPU(ARM_THUMB2)
-    // WasmIPInt is not supported on ARM32, so disable wasm if BBQJIT is disabled.
+    // WasmIPInt is not supported on ARM32, so disable wasm if BBQJIT is
+    // disabled: that platform has no other engine, and aborting on the
+    // coherence check would take down every configuration that merely turns the
+    // JIT off, including ones that never touch wasm.
     if (Options::useWasm() && !Options::useBBQJIT())
         Options::useWasm() = false;
 #endif

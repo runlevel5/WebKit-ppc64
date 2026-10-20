@@ -533,7 +533,7 @@ AcceleratedBackingStore::BufferGBM::BufferGBM(WebPageProxy& webPage, uint64_t id
 #if GTK_CHECK_VERSION(4, 16, 0)
     gdk_memory_texture_builder_set_width(m_builder.get(), m_size.width());
     gdk_memory_texture_builder_set_height(m_builder.get(), m_size.height());
-    gdk_memory_texture_builder_set_format(m_builder.get(), gbm_bo_get_format(m_buffer) == DRM_FORMAT_ARGB8888 ? GDK_MEMORY_DEFAULT : GDK_MEMORY_B8G8R8X8);
+    gdk_memory_texture_builder_set_format(m_builder.get(), gbm_bo_get_format(m_buffer) == DRM_FORMAT_ARGB8888 ? GDK_MEMORY_B8G8R8A8_PREMULTIPLIED : GDK_MEMORY_B8G8R8X8);
 #endif
 }
 
@@ -652,7 +652,7 @@ AcceleratedBackingStore::BufferSHM::BufferSHM(WebPageProxy& webPage, uint64_t id
 #if GTK_CHECK_VERSION(4, 16, 0)
     gdk_memory_texture_builder_set_width(m_builder.get(), m_bitmap->size().width());
     gdk_memory_texture_builder_set_height(m_builder.get(), m_bitmap->size().height());
-    gdk_memory_texture_builder_set_format(m_builder.get(), GDK_MEMORY_DEFAULT);
+    gdk_memory_texture_builder_set_format(m_builder.get(), GDK_MEMORY_B8G8R8A8_PREMULTIPLIED);
     gdk_memory_texture_builder_set_stride(m_builder.get(), m_bitmap->bytesPerRow());
 #endif
 }

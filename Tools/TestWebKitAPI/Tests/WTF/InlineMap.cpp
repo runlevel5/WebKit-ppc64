@@ -1090,6 +1090,10 @@ TEST(WTF_InlineMap, RefKeysGrowth)
         }
         EXPECT_EQ(count, 50u);
     }
+    loggers.clear();
+
+    // Drain the RefLogger log so subsequent tests start clean.
+    takeLogStr();
 }
 
 TEST(WTF_InlineMap, ClearEmpty)

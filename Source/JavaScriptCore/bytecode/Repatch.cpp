@@ -2130,8 +2130,13 @@ void linkDirectCall(DirectCallLinkInfo& callLinkInfo, CodeBlock* calleeCodeBlock
 {
     // DirectCall is only used from DFG / FTL.
     callLinkInfo.setCallTarget(uncheckedDowncast<FunctionCodeBlock>(calleeCodeBlock), CodeLocationLabel<JSEntryPtrTag>(codePtr));
-    if (calleeCodeBlock)
+    if (calleeCodeBlock) {
+        // Never push an info that is already on an incoming-calls list: at the
+        // head of the same list, its next pointer would refer to itself.
+        if (callLinkInfo.isOnList())
+            callLinkInfo.remove();
         calleeCodeBlock->linkIncomingCall(callLinkInfo.owner(), &callLinkInfo);
+    }
 }
 
 void resetGetBy(CodeBlock* codeBlock, PropertyInlineCache& propertyCache, GetByKind kind)
