@@ -30,6 +30,7 @@
 #include "IntSize.h"
 #include "NativeImage.h"
 #include "SharedBuffer.h"
+#include <wtf/FlipBytes.h>
 #include <wtf/StdLibExtras.h>
 #include <wtf/TZoneMallocInlines.h>
 #include <wtf/text/ParsingUtilities.h>
@@ -167,7 +168,7 @@ public:
         if (!a)
             return;
 
-        auto pixel = asSRGBA(PackedColor::ARGB { destination }).resolved();
+        auto pixel = asSRGBA(PackedColor::ARGB { storedPixel(destination) }).resolved();
 
         if (a >= 255 || !pixel.alpha) {
             setPixel(destination, r, g, b, a);
@@ -189,7 +190,7 @@ public:
         if (!m_premultiplyAlpha)
             result = unpremultiplied(result);
 
-        destination = PackedColor::ARGB { result }.value;
+        destination = storedPixel(PackedColor::ARGB { result }.value);
     }
 
     static bool isOverSize(const IntSize& size)
@@ -236,6 +237,17 @@ private:
         return IntRect(IntPoint(), m_size).contains(rect);
     }
 
+    // Skia's 32-bit pixels are B, G, R, A in memory on both byte orders, which is a native ARGB
+    // word only on little-endian. Converts in both directions.
+    static uint32_t storedPixel(uint32_t pixel)
+    {
+#if USE(SKIA) && CPU(BIG_ENDIAN)
+        return flipBytes(pixel);
+#else
+        return pixel;
+#endif
+    }
+
     uint32_t pixelValue(uint8_t r, uint8_t g, uint8_t b, uint8_t a) const
     {
         if (m_premultiplyAlpha && !a)
@@ -246,7 +258,7 @@ private:
         if (m_premultiplyAlpha && a < 255)
             result = premultipliedFlooring(result);
 
-        return PackedColor::ARGB { result }.value;
+        return storedPixel(PackedColor::ARGB { result }.value);
     }
 
     // m_pixels type should be identical to the one set in ImageBackingStoreCairo.cpp
