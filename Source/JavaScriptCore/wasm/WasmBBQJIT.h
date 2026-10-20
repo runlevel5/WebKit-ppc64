@@ -1388,6 +1388,9 @@ public:
 
     template<typename Functor>
     void emitAtomicOpGeneric(ExtAtomicOpType op, Address address, GPRReg oldGPR, GPRReg scratchGPR, const Functor& functor);
+#if CPU(BIG_ENDIAN)
+    void byteSwapForWasmMemory(Width, GPRReg);
+#endif
 
     template<typename Functor>
     void emitAtomicOpGeneric(ExtAtomicOpType op, Address address, Location old, Location cur, const Functor& functor);

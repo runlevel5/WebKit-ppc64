@@ -187,7 +187,23 @@ public:
     static constexpr GPRReg returnRegister2 = PPC64Registers::r4;
 
     // SIMD searches. VSR0-13 are volatile in ELFv2, and the searches are only
-    // used when the generated code makes no calls.
+    // used when the generated code makes no calls. Their lane handling assumes
+    // little-endian, so big-endian leaves them off.
+#if CPU(BIG_ENDIAN)
+    static constexpr FPRReg vectorTemp0 = InvalidFPRReg;
+    static constexpr FPRReg vectorTemp1 = InvalidFPRReg;
+    static constexpr FPRReg vectorTemp2 = InvalidFPRReg;
+    static constexpr FPRReg vectorTemp3 = InvalidFPRReg;
+    static constexpr FPRReg vectorTemp4 = InvalidFPRReg;
+    static constexpr FPRReg vectorInput0 = InvalidFPRReg;
+    static constexpr FPRReg vectorInput1 = InvalidFPRReg;
+    static constexpr FPRReg vectorInput2 = InvalidFPRReg;
+    static constexpr FPRReg vectorInput3 = InvalidFPRReg;
+    static constexpr FPRReg vectorScratch0 = InvalidFPRReg;
+    static constexpr FPRReg vectorScratch1 = InvalidFPRReg;
+    static constexpr FPRReg vectorScratch2 = InvalidFPRReg;
+    static constexpr FPRReg vectorScratch3 = InvalidFPRReg;
+#else
     static constexpr FPRReg vectorTemp0 = PPC64Registers::f0;
     static constexpr FPRReg vectorTemp1 = PPC64Registers::f1;
     static constexpr FPRReg vectorTemp2 = PPC64Registers::f2;
@@ -201,6 +217,7 @@ public:
     static constexpr FPRReg vectorScratch1 = PPC64Registers::f10;
     static constexpr FPRReg vectorScratch2 = PPC64Registers::f11;
     static constexpr FPRReg vectorScratch3 = PPC64Registers::f12;
+#endif
 #endif
 };
 

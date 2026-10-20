@@ -2160,7 +2160,12 @@ public:
         Allocator allocator = allocatorForConcurrently<JSBigInt>(vm, JSBigInt::allocationSize(1), AllocatorForMode::AllocatorIfExists);
         emitAllocateJSCell(resultGPR, JITAllocator::constant(allocator), scratchGPR1, structure, scratchGPR2, slowCases, SlowAllocationResult::UndefinedBehavior);
 
+        // m_length = 1 and m_hash = 0 in one store; m_length is the first of the two.
+#if CPU(BIG_ENDIAN)
+        store64(TrustedImm64(1ULL << 32), Address(resultGPR, JSBigInt::offsetOfLength()));
+#else
         store64(TrustedImm64(1), Address(resultGPR, JSBigInt::offsetOfLength()));
+#endif
 
         if (isSigned) {
             neg64(valueGPR, scratchGPR1);
