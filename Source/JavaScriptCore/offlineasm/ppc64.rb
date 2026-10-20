@@ -398,6 +398,18 @@ end
 # -------------------------------------------------------------------------
 # Preprocessing pass — normalise forms that PPC64 cannot encode directly.
 # -------------------------------------------------------------------------
+
+# Operands for an X-form access: "0, base" for a zero offset, else the sum in r0.
+def ppc64XFormAddress(addr, codeOriginString)
+    raise "ppc64: X-form access needs an Address operand at #{codeOriginString}" unless addr.is_a?(Address)
+    base = addr.base.ppc64Operand
+    off = addr.offset.value
+    return "0, #{base}" if off == 0
+    ppc64ValidateDOffset(off, codeOriginString)
+    $asm.puts "addi 0, #{base}, #{off}"
+    "0, 0"
+end
+
 def ppc64LowerMalformedAddresses(list)
     # Lower BaseIndex addressing modes that PPC64 cannot encode directly.
     # Pattern: base + index * (1 << scaleShift) + offset
@@ -880,8 +892,29 @@ class Instruction
     end
 end
 
+# riscLowerTest turns a byte test on memory (btbz addr, mask, lbl) into
+# andi addr, mask, tmp, and the generic address lowering then fetches that
+# operand with a 32-bit load.  The low byte of that word is the addressed byte
+# only on little-endian, so load the byte explicitly first.
+def ppc64LowerByteTestsOnMemory(list)
+    newList = []
+    list.each {
+        | node |
+        if node.is_a?(Instruction) && node.opcode =~ /\A(bt|t)b(s|z|nz)\z/ && node.operands[0].is_a?(Address)
+            co  = node.codeOrigin
+            tmp = Tmp.new(co, :gpr)
+            newList << Instruction.new(co, "loadb", [node.operands[0], tmp])
+            newList << Instruction.new(co, node.opcode, [tmp] + node.operands[1..], node.annotation)
+        else
+            newList << node
+        end
+    }
+    newList
+end
+
 class Sequence
     def getModifiedListPPC64(result = @list)
+        result = ppc64LowerByteTestsOnMemory(result)
         # Expand bt*z/bt*nz (test-and-branch) into and + bieq/bineq
         result = riscLowerTest(result)
         # Expand bmulio → smulli + rshifti + bineq
@@ -1905,6 +1938,106 @@ class Instruction
             dst  = operands[1].ppc64Operand
             ppc64ValidateDOffset(addr.offset.value, codeOriginString)
             $asm.puts "lha #{dst}, #{addr.ppc64Operand}"
+
+        # Little-endian memory (wasm linear memory). On a little-endian host
+        # these are the plain accesses; on big-endian the byte-reversed X-form
+        # ones, with r0 as the address and data scratch, and the ELFv2 red
+        # zone to move float bits (the FPRs hold doubles).
+        when "loadhle", "loadhsile", "loadhsqle", "loadile", "loadisle", "loadqle"
+            addr = operands[0]
+            dst  = operands[1].ppc64Operand
+            unless $currentSettings["BIG_ENDIAN"]
+                plain = { "loadhle" => "lhz", "loadhsile" => "lha", "loadhsqle" => "lha", "loadile" => "lwz", "loadisle" => "lwa", "loadqle" => "ld" }[opcode]
+                if plain == "lwa" or plain == "ld"
+                    ppc64ValidateDSOffset(addr.offset.value, codeOriginString)
+                else
+                    ppc64ValidateDOffset(addr.offset.value, codeOriginString)
+                end
+                $asm.puts "#{plain} #{dst}, #{addr.ppc64Operand}"
+                ppc64ZeroExtend32(dst) if opcode == "loadhsile"
+            else
+                ea = ppc64XFormAddress(addr, codeOriginString)
+                case opcode
+                when "loadhle"
+                    $asm.puts "lhbrx #{dst}, #{ea}"
+                when "loadhsile"
+                    $asm.puts "lhbrx #{dst}, #{ea}"
+                    $asm.puts "extsh #{dst}, #{dst}"
+                    ppc64ZeroExtend32(dst)
+                when "loadhsqle"
+                    $asm.puts "lhbrx #{dst}, #{ea}"
+                    $asm.puts "extsh #{dst}, #{dst}"
+                when "loadile"
+                    $asm.puts "lwbrx #{dst}, #{ea}"
+                when "loadisle"
+                    $asm.puts "lwbrx #{dst}, #{ea}"
+                    $asm.puts "extsw #{dst}, #{dst}"
+                when "loadqle"
+                    $asm.puts "ldbrx #{dst}, #{ea}"
+                end
+            end
+
+        when "loadfle", "loaddle"
+            addr = operands[0]
+            dst  = operands[1].ppc64Operand
+            unless $currentSettings["BIG_ENDIAN"]
+                ppc64ValidateDOffset(addr.offset.value, codeOriginString)
+                $asm.puts "#{opcode == "loadfle" ? "lfs" : "lfd"} #{dst}, #{addr.ppc64Operand}"
+            else
+                ea = ppc64XFormAddress(addr, codeOriginString)
+                if opcode == "loadfle"
+                    $asm.puts "lwbrx 0, #{ea}"
+                    $asm.puts "stw 0, -8(1)"
+                    $asm.puts "lfs #{dst}, -8(1)"
+                else
+                    $asm.puts "ldbrx 0, #{ea}"
+                    $asm.puts "mtvsrd #{dst}, 0"
+                end
+            end
+
+        when "storehle", "storeile", "storeqle"
+            src  = operands[0].ppc64Operand
+            addr = operands[1]
+            unless $currentSettings["BIG_ENDIAN"]
+                plain = { "storehle" => "sth", "storeile" => "stw", "storeqle" => "std" }[opcode]
+                if plain == "std"
+                    ppc64ValidateDSOffset(addr.offset.value, codeOriginString)
+                else
+                    ppc64ValidateDOffset(addr.offset.value, codeOriginString)
+                end
+                $asm.puts "#{plain} #{src}, #{addr.ppc64Operand}"
+            else
+                ea = ppc64XFormAddress(addr, codeOriginString)
+                $asm.puts "#{ { "storehle" => "sthbrx", "storeile" => "stwbrx", "storeqle" => "stdbrx" }[opcode] } #{src}, #{ea}"
+            end
+
+        when "storefle", "storedle"
+            src  = operands[0].ppc64Operand
+            addr = operands[1]
+            unless $currentSettings["BIG_ENDIAN"]
+                ppc64ValidateDOffset(addr.offset.value, codeOriginString)
+                $asm.puts "#{opcode == "storefle" ? "stfs" : "stfd"} #{src}, #{addr.ppc64Operand}"
+            else
+                # The data goes through r0, so the address cannot.
+                raise "ppc64: #{opcode} needs a zero-offset Address at #{codeOriginString}" unless addr.is_a?(Address) and addr.offset.value == 0
+                base = addr.base.ppc64Operand
+                if opcode == "storefle"
+                    $asm.puts "stfs #{src}, -8(1)"
+                    $asm.puts "lwz 0, -8(1)"
+                    $asm.puts "stwbrx 0, 0, #{base}"
+                else
+                    $asm.puts "mfvsrd 0, #{src}"
+                    $asm.puts "stdbrx 0, 0, #{base}"
+                end
+            end
+
+        # Byte swap in place; the result is zero-extended like the loads.
+        when "bswaph", "bswapi", "bswapq"
+            reg = operands[0].ppc64Operand
+            store, load = { "bswaph" => ["sthbrx", "lhz"], "bswapi" => ["stwbrx", "lwz"], "bswapq" => ["stdbrx", "ld"] }[opcode]
+            $asm.puts "addi 0, 1, -8"
+            $asm.puts "#{store} #{reg}, 0, 0"
+            $asm.puts "#{load} #{reg}, -8(1)"
 
         # ------------------------------------------------------------------
         # Stores

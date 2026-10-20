@@ -104,7 +104,7 @@ GPRReg SpeculativeJIT::fillJSValue(Edge edge)
             m_gprs.retain(gpr, virtualRegister, SpillOrderSpilled);
             switch (spillFormat) {
             case DataFormatInt32: {
-                load32(addressFor(virtualRegister), gpr);
+                load32(payloadFor(virtualRegister), gpr);
                 or64(GPRInfo::numberTagRegister, gpr);
                 spillFormat = DataFormatJSInt32;
                 break;
@@ -1222,13 +1222,13 @@ GPRReg SpeculativeJIT::fillSpeculateInt32Internal(Edge edge, DataFormat& returnF
         if (spillFormat == DataFormatJSInt32 || spillFormat == DataFormatInt32) {
             // If we know this was spilled as an integer we can fill without checking.
             if (strict) {
-                load32(addressFor(virtualRegister), gpr);
+                load32(payloadFor(virtualRegister), gpr);
                 info.fillInt32(m_stream, gpr);
                 returnFormat = DataFormatInt32;
                 return gpr;
             }
             if (spillFormat == DataFormatInt32) {
-                load32(addressFor(virtualRegister), gpr);
+                load32(payloadFor(virtualRegister), gpr);
                 info.fillInt32(m_stream, gpr);
                 returnFormat = DataFormatInt32;
             } else {
@@ -2590,7 +2590,7 @@ void SpeculativeJIT::compileMapGetImpl(Node* node)
 
     JIT_COMMENT(*this, "Compute the bucketCount = Capacity and bucketIndex = hashTableStartIndex + (hash & bucketCount - 1).");
     addPtr(TrustedImm32(JSCellButterfly::offsetOfData()), mapStorageOrDataGPR);
-    load32(Address(mapStorageOrDataGPR, MapOrSet::Helper::capacityIndex() * sizeof(uint64_t)), bucketCountGPR);
+    load32(Address(mapStorageOrDataGPR, MapOrSet::Helper::capacityIndex() * sizeof(uint64_t) + PayloadOffset), bucketCountGPR);
     sub32(bucketCountGPR, TrustedImm32(1), bucketIndexOrDeletedValueGPR);
     and32(hashGPR, bucketIndexOrDeletedValueGPR);
     add32(TrustedImm32(MapOrSet::Helper::hashTableStartIndex()), bucketIndexOrDeletedValueGPR);
@@ -6398,6 +6398,20 @@ void SpeculativeJIT::compile(Node* node)
         if (node->child3())
             isLittleEndianOperand.emplace(this, node->child3());
         GPRReg isLittleEndianGPR = isLittleEndianOperand ? isLittleEndianOperand->gpr() : InvalidGPRReg;
+#if CPU(BIG_ENDIAN)
+        // The accesses below are in the host's byte order and swap for the other one, so on a
+        // big-endian host the "little-endian" cases are the ones that swap.
+        std::optional<GPRTemporary> swappedIsLittleEndian;
+        if (data.isLittleEndian == TriState::True)
+            data.isLittleEndian = TriState::False;
+        else if (data.isLittleEndian == TriState::False)
+            data.isLittleEndian = TriState::True;
+        if (isLittleEndianGPR != InvalidGPRReg) {
+            swappedIsLittleEndian.emplace(this);
+            xor32(TrustedImm32(1), isLittleEndianGPR, swappedIsLittleEndian->gpr());
+            isLittleEndianGPR = swappedIsLittleEndian->gpr();
+        }
+#endif
 
         if (data.isResizable)
             loadTypedArrayLength(dataViewGPR, t1, t2, t1, TypeDataView);
@@ -6695,6 +6709,19 @@ void SpeculativeJIT::compile(Node* node)
         if (m_graph.varArgChild(node, 3))
             isLittleEndianOperand.emplace(this, m_graph.varArgChild(node, 3));
         GPRReg isLittleEndianGPR = isLittleEndianOperand ? isLittleEndianOperand->gpr() : InvalidGPRReg;
+#if CPU(BIG_ENDIAN)
+        // As in DataViewGet: on a big-endian host the "little-endian" cases are the ones that swap.
+        std::optional<GPRTemporary> swappedIsLittleEndian;
+        if (data.isLittleEndian == TriState::True)
+            data.isLittleEndian = TriState::False;
+        else if (data.isLittleEndian == TriState::False)
+            data.isLittleEndian = TriState::True;
+        if (isLittleEndianGPR != InvalidGPRReg) {
+            swappedIsLittleEndian.emplace(this);
+            xor32(TrustedImm32(1), isLittleEndianGPR, swappedIsLittleEndian->gpr());
+            isLittleEndianGPR = swappedIsLittleEndian->gpr();
+        }
+#endif
 
         if (data.isResizable)
             loadTypedArrayLength(dataViewGPR, t1, t2, t1, TypeDataView);
@@ -9077,7 +9104,7 @@ void SpeculativeJIT::compileMapIteratorNext(Node* node)
 
     // Fast path: iterate to find next non-deleted entry.
     move(currentEntryGPR, newEntryGPR);
-    load32(Address(storageGPR, JSCellButterfly::offsetOfData() + capacityIndex * sizeof(uint64_t)), scratchGPR1);
+    load32(Address(storageGPR, JSCellButterfly::offsetOfData() + capacityIndex * sizeof(uint64_t) + PayloadOffset), scratchGPR1);
     add32(TrustedImm32(hashTableStartIndex), scratchGPR1);
     if (entrySize == 3) {
         lshift32(newEntryGPR, TrustedImm32(1), scratchGPR2);

@@ -71,7 +71,35 @@ WTF_ALLOW_UNSAFE_BUFFER_USAGE_BEGIN
 #include <wtf/MathExtras.h>
 #include <wtf/StdLibExtras.h>
 
+// Wasm memory is little-endian; a big-endian host byte-reverses every access.
+#if CPU(BIG_ENDIAN)
+#define WASM_MEMORY_ACCESS(name) name##LittleEndian
+#else
+#define WASM_MEMORY_ACCESS(name) name
+#endif
+
 namespace JSC { namespace Wasm { namespace BBQJITImpl {
+
+// A 32-bit value is the payload of its 8-byte slot.
+static inline MacroAssembler::Address payloadOf(MacroAssembler::Address address)
+{
+    return address.withOffset(PayloadOffset);
+}
+static inline MacroAssembler::Address slotAddress(TypeKind type, MacroAssembler::Address address)
+{
+    return (type == TypeKind::I32 || type == TypeKind::F32) ? payloadOf(address) : address;
+}
+// The low `size` bytes of a 32-bit value held in an 8-byte slot.
+static inline MacroAssembler::Address narrowSourceOf(MacroAssembler::Address slot, unsigned size)
+{
+#if CPU(BIG_ENDIAN)
+    return size < 8 ? slot.withOffset(PayloadOffset + 4 - size) : slot;
+#else
+    UNUSED_PARAM(size);
+    return slot;
+#endif
+}
+
 
 Location Location::fromArgumentLocation(ArgumentLocation argLocation, TypeKind)
 {
@@ -98,7 +126,12 @@ uint32_t NODELETE BBQJIT::sizeOfType(TypeKind type)
     switch (type) {
     case TypeKind::I32:
     case TypeKind::F32:
+#if CPU(BIG_ENDIAN)
+        // A 32-bit value is the payload of an 8-byte slot, so the slot must be one.
+        return 8;
+#else
         return 4;
+#endif
     case TypeKind::I64:
     case TypeKind::F64:
         return 8;
@@ -201,13 +234,13 @@ Value BBQJIT::instanceValue()
         Location resultLocation = allocate(result);
         switch (type.kind) {
         case TypeKind::I32:
-            m_jit.load32(Address(wasmScratchGPR), resultLocation.asGPR());
+            m_jit.load32(Address(wasmScratchGPR, PayloadOffset), resultLocation.asGPR());
             break;
         case TypeKind::I64:
             m_jit.load64(Address(wasmScratchGPR), resultLocation.asGPR());
             break;
         case TypeKind::F32:
-            m_jit.loadFloat(Address(wasmScratchGPR), resultLocation.asFPR());
+            m_jit.loadFloat(Address(wasmScratchGPR, PayloadOffset), resultLocation.asFPR());
             break;
         case TypeKind::F64:
             m_jit.loadDouble(Address(wasmScratchGPR), resultLocation.asFPR());
@@ -284,13 +317,13 @@ Value BBQJIT::instanceValue()
 
         switch (type.kind) {
         case TypeKind::I32:
-            m_jit.store32(valueLocation.asGPR(), Address(wasmScratchGPR));
+            m_jit.store32(valueLocation.asGPR(), Address(wasmScratchGPR, PayloadOffset));
             break;
         case TypeKind::I64:
             m_jit.store64(valueLocation.asGPR(), Address(wasmScratchGPR));
             break;
         case TypeKind::F32:
-            m_jit.storeFloat(valueLocation.asFPR(), Address(wasmScratchGPR));
+            m_jit.storeFloat(valueLocation.asFPR(), Address(wasmScratchGPR, PayloadOffset));
             break;
         case TypeKind::F64:
             m_jit.storeDouble(valueLocation.asFPR(), Address(wasmScratchGPR));
@@ -394,34 +427,34 @@ Value BBQJIT::instanceValue()
                 m_jit.load8(location, resultLocation.asGPR());
                 break;
             case LoadOpType::I32Load16S:
-                m_jit.load16SignedExtendTo32(location, resultLocation.asGPR());
+                m_jit.WASM_MEMORY_ACCESS(load16SignedExtendTo32)(location, resultLocation.asGPR());
                 break;
             case LoadOpType::I64Load16S:
-                m_jit.load16SignedExtendTo64(location, resultLocation.asGPR());
+                m_jit.WASM_MEMORY_ACCESS(load16SignedExtendTo64)(location, resultLocation.asGPR());
                 break;
             case LoadOpType::I32Load16U:
-                m_jit.load16(location, resultLocation.asGPR());
+                m_jit.WASM_MEMORY_ACCESS(load16)(location, resultLocation.asGPR());
                 break;
             case LoadOpType::I64Load16U:
-                m_jit.load16(location, resultLocation.asGPR());
+                m_jit.WASM_MEMORY_ACCESS(load16)(location, resultLocation.asGPR());
                 break;
             case LoadOpType::I32Load:
-                m_jit.load32(location, resultLocation.asGPR());
+                m_jit.WASM_MEMORY_ACCESS(load32)(location, resultLocation.asGPR());
                 break;
             case LoadOpType::I64Load32U:
-                m_jit.load32(location, resultLocation.asGPR());
+                m_jit.WASM_MEMORY_ACCESS(load32)(location, resultLocation.asGPR());
                 break;
             case LoadOpType::I64Load32S:
-                m_jit.load32SignedExtendTo64(location, resultLocation.asGPR());
+                m_jit.WASM_MEMORY_ACCESS(load32SignedExtendTo64)(location, resultLocation.asGPR());
                 break;
             case LoadOpType::I64Load:
-                m_jit.load64(location, resultLocation.asGPR());
+                m_jit.WASM_MEMORY_ACCESS(load64)(location, resultLocation.asGPR());
                 break;
             case LoadOpType::F32Load:
-                m_jit.loadFloat(location, resultLocation.asFPR());
+                m_jit.WASM_MEMORY_ACCESS(loadFloat)(location, resultLocation.asFPR());
                 break;
             case LoadOpType::F64Load:
-                m_jit.loadDouble(location, resultLocation.asFPR());
+                m_jit.WASM_MEMORY_ACCESS(loadDouble)(location, resultLocation.asFPR());
                 break;
             }
 
@@ -471,20 +504,20 @@ Value BBQJIT::instanceValue()
                 return;
             case StoreOpType::I64Store16:
             case StoreOpType::I32Store16:
-                m_jit.store16(valueLocation.asGPR(), location);
+                m_jit.WASM_MEMORY_ACCESS(store16)(valueLocation.asGPR(), location);
                 return;
             case StoreOpType::I64Store32:
             case StoreOpType::I32Store:
-                m_jit.store32(valueLocation.asGPR(), location);
+                m_jit.WASM_MEMORY_ACCESS(store32)(valueLocation.asGPR(), location);
                 return;
             case StoreOpType::I64Store:
-                m_jit.store64(valueLocation.asGPR(), location);
+                m_jit.WASM_MEMORY_ACCESS(store64)(valueLocation.asGPR(), location);
                 return;
             case StoreOpType::F32Store:
-                m_jit.storeFloat(valueLocation.asFPR(), location);
+                m_jit.WASM_MEMORY_ACCESS(storeFloat)(valueLocation.asFPR(), location);
                 return;
             case StoreOpType::F64Store:
-                m_jit.storeDouble(valueLocation.asFPR(), location);
+                m_jit.WASM_MEMORY_ACCESS(storeDouble)(valueLocation.asFPR(), location);
                 return;
             }
         });
@@ -546,6 +579,27 @@ void BBQJIT::emitSanitizeAtomicResult(ExtAtomicOpType op, TypeKind resultType, G
     emitSanitizeAtomicResult(op, resultType, result, result);
 }
 
+#if CPU(BIG_ENDIAN)
+void BBQJIT::byteSwapForWasmMemory(Width width, GPRReg gpr)
+{
+    switch (width) {
+    case Width8:
+        break;
+    case Width16:
+        m_jit.byteSwap16(gpr);
+        break;
+    case Width32:
+        m_jit.byteSwap32(gpr);
+        break;
+    case Width64:
+        m_jit.byteSwap64(gpr);
+        break;
+    case Width128:
+        RELEASE_ASSERT_NOT_REACHED();
+    }
+}
+#endif
+
 template<typename Functor>
 void BBQJIT::emitAtomicOpGeneric(ExtAtomicOpType op, Address address, GPRReg oldGPR, GPRReg scratchGPR, const Functor& functor)
 {
@@ -597,7 +651,13 @@ void BBQJIT::emitAtomicOpGeneric(ExtAtomicOpType op, Address address, GPRReg old
     }
 
     // Operation
+#if CPU(BIG_ENDIAN)
+    byteSwapForWasmMemory(accessWidth, oldGPR);
+#endif
     functor(oldGPR, scratchGPR);
+#if CPU(BIG_ENDIAN)
+    byteSwapForWasmMemory(accessWidth, scratchGPR);
+#endif
 
 #if CPU(X86_64)
     switch (accessWidth) {
@@ -1270,6 +1330,13 @@ Value BBQJIT::emitAtomicBinaryRMWOp(ExtAtomicOpType op, Type valueType, Location
         }
 
         m_jit.move(expectedGPR, resultGPR);
+#if CPU(BIG_ENDIAN)
+        ScratchScope<1, 0> swappedValue(*this);
+        m_jit.move(valueGPR, swappedValue.gpr(0));
+        valueGPR = swappedValue.gpr(0);
+        byteSwapForWasmMemory(accessWidth, valueGPR);
+        byteSwapForWasmMemory(accessWidth, resultGPR);
+#endif
         switch (accessWidth) {
         case Width8:
             m_jit.atomicStrongCAS8(StatusCondition::Success, resultGPR, valueGPR, address, scratchGPR);
@@ -1287,6 +1354,9 @@ Value BBQJIT::emitAtomicBinaryRMWOp(ExtAtomicOpType op, Type valueType, Location
             RELEASE_ASSERT_NOT_REACHED();
             break;
         }
+#if CPU(BIG_ENDIAN)
+        byteSwapForWasmMemory(accessWidth, resultGPR);
+#endif
     };
 
     switch (accessWidth) {
@@ -3227,7 +3297,7 @@ void BBQJIT::emitCatchImpl(ControlData& dataCatch, const RTT& exceptionSignature
             Location slot = canonicalSlot(result);
             switch (type.kind) {
             case TypeKind::I32:
-                m_jit.transfer32(Address(wasmScratchGPR, JSWebAssemblyException::Payload::Storage::offsetOfData() + offset * sizeof(uint64_t)), slot.asAddress());
+                m_jit.transfer32(Address(wasmScratchGPR, JSWebAssemblyException::Payload::Storage::offsetOfData() + offset * sizeof(uint64_t) + PayloadOffset), payloadOf(slot.asAddress()));
                 break;
             case TypeKind::I31ref:
             case TypeKind::I64:
@@ -3253,7 +3323,7 @@ void BBQJIT::emitCatchImpl(ControlData& dataCatch, const RTT& exceptionSignature
                 m_jit.transfer64(Address(wasmScratchGPR, JSWebAssemblyException::Payload::Storage::offsetOfData() + offset * sizeof(uint64_t)), slot.asAddress());
                 break;
             case TypeKind::F32:
-                m_jit.transfer32(Address(wasmScratchGPR, JSWebAssemblyException::Payload::Storage::offsetOfData() + offset * sizeof(uint64_t)), slot.asAddress());
+                m_jit.transfer32(Address(wasmScratchGPR, JSWebAssemblyException::Payload::Storage::offsetOfData() + offset * sizeof(uint64_t) + PayloadOffset), payloadOf(slot.asAddress()));
                 break;
             case TypeKind::F64:
                 m_jit.transfer64(Address(wasmScratchGPR, JSWebAssemblyException::Payload::Storage::offsetOfData() + offset * sizeof(uint64_t)), slot.asAddress());
@@ -3314,9 +3384,9 @@ void BBQJIT::emitCatchTableImpl(ControlData& entryData, ControlType::TryTableTar
                 switch (type.kind) {
                 case TypeKind::I32:
                     if (slot.isGPR())
-                        m_jit.load32(Address(wasmScratchGPR, JSWebAssemblyException::Payload::Storage::offsetOfData() + offset * sizeof(uint64_t)), slot.asGPR());
+                        m_jit.load32(Address(wasmScratchGPR, JSWebAssemblyException::Payload::Storage::offsetOfData() + offset * sizeof(uint64_t) + PayloadOffset), slot.asGPR());
                     else
-                        m_jit.transfer32(Address(wasmScratchGPR, JSWebAssemblyException::Payload::Storage::offsetOfData() + offset * sizeof(uint64_t)), slot.asAddress());
+                        m_jit.transfer32(Address(wasmScratchGPR, JSWebAssemblyException::Payload::Storage::offsetOfData() + offset * sizeof(uint64_t) + PayloadOffset), payloadOf(slot.asAddress()));
                     break;
                 case TypeKind::I31ref:
                 case TypeKind::I64:
@@ -3346,9 +3416,9 @@ void BBQJIT::emitCatchTableImpl(ControlData& entryData, ControlType::TryTableTar
                     break;
                 case TypeKind::F32:
                     if (slot.isFPR())
-                        m_jit.loadFloat(Address(wasmScratchGPR, JSWebAssemblyException::Payload::Storage::offsetOfData() + offset * sizeof(uint64_t)), slot.asFPR());
+                        m_jit.loadFloat(Address(wasmScratchGPR, JSWebAssemblyException::Payload::Storage::offsetOfData() + offset * sizeof(uint64_t) + PayloadOffset), slot.asFPR());
                     else
-                        m_jit.transfer32(Address(wasmScratchGPR, JSWebAssemblyException::Payload::Storage::offsetOfData() + offset * sizeof(uint64_t)), slot.asAddress());
+                        m_jit.transfer32(Address(wasmScratchGPR, JSWebAssemblyException::Payload::Storage::offsetOfData() + offset * sizeof(uint64_t) + PayloadOffset), payloadOf(slot.asAddress()));
                     break;
                 case TypeKind::F64:
                     if (slot.isFPR())
@@ -4773,7 +4843,7 @@ void BBQJIT::emitStoreConst(Value constant, Location loc)
 {
     LOG_INSTRUCTION("Store", constant, RESULT(loc));
     // Doesn't have to be a real Type we just need the TypeKind for the StorageType.
-    emitStoreConst(StorageType(Type { constant.type(), 0 }), constant, loc.asAddress());
+    emitStoreConst(StorageType(Type { constant.type(), 0 }), constant, slotAddress(constant.type(), loc.asAddress()));
 }
 
 void BBQJIT::emitStoreConst(StorageType type, Value constant, BaseIndex loc)
@@ -4881,7 +4951,7 @@ void BBQJIT::emitStore(TypeKind type, Location src, Location dst)
     ASSERT(src.isRegister());
 
     // Doesn't have to be a real Type we just need the TypeKind for the StorageType.
-    emitStore(StorageType(Type { type, 0 }), src, dst.asAddress());
+    emitStore(StorageType(Type { type, 0 }), src, slotAddress(type, dst.asAddress()));
 }
 
 void BBQJIT::emitMoveConst(Value constant, Location loc)
@@ -4937,13 +5007,13 @@ void BBQJIT::emitMoveMemory(StorageType type, Location src, Address dst)
 
     switch (type.elementSize()) {
     case 1:
-        m_jit.transfer8(src.asAddress(), dst);
+        m_jit.transfer8(narrowSourceOf(src.asAddress(), 1), dst);
         break;
     case 2:
-        m_jit.transfer16(src.asAddress(), dst);
+        m_jit.transfer16(narrowSourceOf(src.asAddress(), 2), dst);
         break;
     case 4:
-        m_jit.transfer32(src.asAddress(), dst);
+        m_jit.transfer32(narrowSourceOf(src.asAddress(), 4), dst);
         break;
     case 8:
         m_jit.transfer64(src.asAddress(), dst);
@@ -4963,13 +5033,13 @@ void BBQJIT::emitMoveMemory(StorageType type, Location src, BaseIndex dst)
 
     switch (type.elementSize()) {
     case 1:
-        m_jit.transfer8(src.asAddress(), dst);
+        m_jit.transfer8(narrowSourceOf(src.asAddress(), 1), dst);
         break;
     case 2:
-        m_jit.transfer16(src.asAddress(), dst);
+        m_jit.transfer16(narrowSourceOf(src.asAddress(), 2), dst);
         break;
     case 4:
-        m_jit.transfer32(src.asAddress(), dst);
+        m_jit.transfer32(narrowSourceOf(src.asAddress(), 4), dst);
         break;
     case 8:
         m_jit.transfer64(src.asAddress(), dst);
@@ -4994,7 +5064,7 @@ void BBQJIT::emitMoveMemory(TypeKind type, Location src, Location dst)
     switch (type) {
     case TypeKind::I32:
     case TypeKind::F32:
-        m_jit.transfer32(src.asAddress(), dst.asAddress());
+        m_jit.transfer32(payloadOf(src.asAddress()), payloadOf(dst.asAddress()));
         break;
     case TypeKind::I64:
     case TypeKind::F64:
@@ -5070,13 +5140,13 @@ void BBQJIT::emitLoad(TypeKind type, Location src, Location dst)
 
     switch (type) {
     case TypeKind::I32:
-        m_jit.load32(src.asAddress(), dst.asGPR());
+        m_jit.load32(payloadOf(src.asAddress()), dst.asGPR());
         break;
     case TypeKind::I64:
         m_jit.load64(src.asAddress(), dst.asGPR());
         break;
     case TypeKind::F32:
-        m_jit.loadFloat(src.asAddress(), dst.asFPR());
+        m_jit.loadFloat(payloadOf(src.asAddress()), dst.asFPR());
         break;
     case TypeKind::F64:
         m_jit.loadDouble(src.asAddress(), dst.asFPR());

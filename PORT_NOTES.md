@@ -6,7 +6,8 @@ it must keep. They are written for reviewers who know JSC but not Power.
 
 ## Scope
 
-- **Targets.** 64-bit PowerPC with the ELFv2 ABI, little-endian (ppc64le). 32-bit PowerPC, AIX and
+- **Targets.** 64-bit PowerPC with the ELFv2 ABI, little-endian (ppc64le) and big-endian (see
+  *Big-endian*). Big-endian ELFv1 keeps using the C_LOOP interpreter. 32-bit PowerPC, AIX and
   pointer authentication are out of scope.
 - **ISA baseline: POWER8 (Power ISA 2.07).** POWER9 (ISA 3.0) and POWER10 (ISA 3.1) instructions are
   used only behind a runtime check (see *ISA levels*), so one binary runs on every POWER8+ machine.
@@ -22,7 +23,8 @@ it must keep. They are written for reviewers who know JSC but not Power.
 - `CPU(PPC64)` means 64-bit PowerPC in either byte order. `CPU(PPC64LE)` is the little-endian
   subset. Byte-order-specific code uses `CPU(BIG_ENDIAN)`, never `!CPU(PPC64LE)`.
 - The offlineasm backend (`ppc64.rb`), the Air architecture tags and `isPPC64()` all say PPC64.
-- CMake enables the JIT for `WTF_CPU_PPC64LE`.
+- CMake enables the JIT for `WTF_CPU_PPC64LE`, or for `WTF_CPU_PPC64` with `WTF_PPC64_ELFV2`
+  (`_CALL_ELF == 2`).
 - `ppc64.rb` is a CMake dependency of `LLIntAssembly.h`, so editing the backend rebuilds the
   interpreter.
 - `PPC64_UNSUPPORTED()` marks MacroAssembler operations that are deliberately absent. Reaching one
@@ -173,6 +175,92 @@ Float16 values live in bits 48–63 of VSR doubleword 0.
 - **Pages are 64 KB on the usual distributions.** Memory-threshold tests are tuned for 4 KB pages,
   so the stress runner's memory limit must be set accordingly.
 
+## Big-endian
+
+Big-endian ELFv2 shares the ABI and every instruction sequence with little-endian. Only the byte
+order of memory differs. Nearly every big-endian bug had one shape: **a 32-bit access to the first
+four bytes of an 8-byte slot.** That covers a boxed int32's payload, the low word of a
+pointer-sized field, and a `Move32` spill into an 8-byte stack slot.
+
+### JavaScript tiers
+
+- **JSValue halves.** `TagOffset` is 0 and `PayloadOffset` is 4. Int32 locals are filled through
+  `payloadFor`. The callee slot on JSVALUE64 is a whole pointer (`addressFor`), so the LLInt's
+  `loadp Callee + PayloadOffset[cfr]` on 64-bit was a latent upstream bug.
+- **Boxed int32 metadata** read with `load32` needs `+ PayloadOffset`. This covers the Map/Set
+  ordered-hash-table counts in DFG, FTL and the `size` inline cache.
+- **DataView.** `isLittleEndian` is inverted on a big-endian host. The CSE key must carry byte size
+  and signedness, because the AbstractHeap payload is 48 bits.
+- **Low word of a 64-bit field:**
+  - `JSRopeString::offsetOfFlags()`;
+  - Yarr `branch32` against frame slots written with `storePtr` (`frameSlotLowWordAddress`);
+  - the `FreeCell::scrambledBits` halves in the inline allocator, and the `FreeList` secret.
+- **Words built by shifting** are read back in host order:
+  - the object header (`structureID << 32 | typeInfo`);
+  - rope `CompactFibers` and the `JSBigInt` header (`1 << 32`);
+  - `OpInfoWrapper`, whose integers are stored zero-extended in an `int64` and read back truncated
+    (the `int32` union member is gone);
+  - `ArrayMode`, where a bare `Array::Type` no longer converts through the private word constructor.
+- **Air.** GP spill slots are at least 8 bytes, and `lowerStackArgs` moves a narrower spill access
+  to the low-order half. Patch (stackmap) arguments are the exception, because OSR exit and the B3
+  stackmap code restore them with a whole-slot `load64`.
+- **offlineasm.** `btbz addr, mask` used to become `andi` on a 32-bit load.
+  `ppc64LowerByteTestsOnMemory` loads the byte first (`MasqueradesAsUndefined`, the typed-array
+  mode byte).
+- **Yarr.** Surrogate-pair loads are 32-bit pairs of UTF-16 code units, rotated with
+  `rotateRight32(16)` after the load. Multi-character compares (`maxCharactersAtOnce = 1`) and SIMD
+  searches are off.
+- **DFG and FTL `startsWith`/`endsWith`** pack constant search characters in host order.
+
+### WebAssembly
+
+WebAssembly runs in all tiers. SIMD stays off, because the v128 lane order is not reversed. Two
+rules carry the rest.
+
+**Linear memory is little-endian**, so every access wider than a byte is byte-reversed:
+- offlineasm has `load*le`, `store*le` and `bswap*` under `if BIG_ENDIAN`, which ppc64 lowers to
+  `l*brx`/`st*brx` with r0 and the red zone as scratch.
+- BBQ uses the `*LittleEndian` helpers in MacroAssemblerPPC64.
+- OMG uses patchpoints, because B3 has no byte-reversed memory operations.
+- LL/SC and CAS loops swap the bytes around the operation.
+
+**A 32-bit value lives at `PayloadOffset` (+4) of its 8-byte slot everywhere:**
+- IPInt pushes whole words and pushes an int32 zero-extended, because ELFv2 returns it
+  sign-extended. 64-bit results that share the int32 paths (`ref.cast`, memory64 `memory.grow`)
+  push whole words.
+- BBQ gives i32 and f32 8-byte frame slots. With 4-byte slots, a payload would land on a saved
+  callee-save.
+- The `IPIntStackEntry` and `IPIntLocal` unions pad i32 and f32.
+- OMG and Air address the payload half of stack-passed values, stack results, globals, exception
+  payloads and the OSR scratch buffer. With the graph-coloring allocator, stack results are pinned
+  to their canonical slot, and the post-call copy moves only the payload.
+- The FTL's direct calls into wasm, the JS-to-wasm entry and the wasm-to-JS exit all use the payload
+  half.
+
+**Module data is little-endian by format:** the header version, f32/f64 constants,
+`memory.atomic.wait` operands, and data-segment copies into i16, i32 and i64 arrays.
+
+Two bugs invisible on little-endian fell out of this: the JS-to-wasm call stub stored the boxed
+callee pointer at `slot + PayloadOffset`, and the frame builder wrote converted i32/f32 arguments as
+4 bytes at the start of the slot.
+
+### Big-endian results
+
+JSTests/stress passed 82,106 with 88 failures before WebAssembly was enabled on big-endian. All 88
+failures came from nine tests that use WebAssembly.
+
+JSTests/wasm.yaml passes 15,313 and fails 766. Every failure is expected:
+- 567 SIMD variants.
+- 170 tests that read wasm memory through JS typed arrays or DataView, which use host byte order by
+  specification.
+- 15 tests whose modules need SIMD.
+- 14 slow-memory runs of tests that use the emscripten-built wabt library. Its JS glue writes
+  `environ_sizes_get` results through `HEAPU32` in host order. Wasm reads a huge size and grows
+  memory to about 2 GB, and slow memory's zero-filled allocation makes that resident past the
+  runner's 2 GB limit.
+
+The same tree passes both suites on POWER10 little-endian with no failures.
+
 ## Testing
 
 - `run-jsc-stress-tests --memory-limited` with `JSCTEST_memoryLimit=2147483648`, over
@@ -198,7 +286,7 @@ Gates on WebKitGTK 2.54.1 suites:
 
 | Host and ISA level | JSTests/stress | JSTests/wasm.yaml | testmasm | testb3 / testair |
 |---|---|---|---|---|
-| POWER10, 3.1 | 82,176 / 0 | 19,812 / 0 | 386 / 0 | pass |
+| POWER10, 3.1 | 82,194 / 0 | 19,826 / 0 | 386 / 0 | pass |
 | POWER10, capped to 3.0 and 2.07 | — | — | 386 / 0 | pass (2.07) |
 | POWER9, 3.0 | 82,176 / 0 | 19,812 / 0 | — | — |
 | POWER9, capped to 2.07 | 82,176 / 0 | 19,812 / 0 | — | — |
@@ -246,6 +334,8 @@ These affect other architectures too:
 
 ## Known limits
 
+- **Big-endian WebAssembly SIMD and Yarr multi-character and SIMD searches are off** (see
+  *Big-endian*).
 - **No POWER8 hardware testing.** This is the largest risk. POWER8 paths were exercised only by
   capping the ISA level, which cannot catch a newer instruction that lacks its runtime check.
 - **Yarr inlining is untuned.** `maximumRegExpTestInlineCodesize` (500 bytes) was sized for denser

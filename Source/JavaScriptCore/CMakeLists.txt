@@ -316,7 +316,7 @@ elseif (ARM_THUMB2_DETECTED)
     set(OFFLINE_ASM_BACKEND "ARMv7")
 elseif (WTF_CPU_RISCV64)
     set(OFFLINE_ASM_BACKEND "RISCV64")
-elseif (WTF_CPU_PPC64LE)
+elseif (WTF_CPU_PPC64LE OR WTF_CPU_PPC64)
     # A C_LOOP build of ppc64 still uses the C_LOOP offlineasm backend.
     if (ENABLE_C_LOOP)
         set(OFFLINE_ASM_BACKEND "C_LOOP")

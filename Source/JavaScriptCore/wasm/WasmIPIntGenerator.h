@@ -49,8 +49,21 @@ namespace IPInt {
 constexpr static unsigned STACK_ENTRY_SIZE = 16; // bytes
 struct IPIntStackEntry {
     union {
+#if CPU(BIG_ENDIAN)
+        // A 32-bit value lives at PayloadOffset of its 8-byte slot, as in
+        // every wasm frame slot.
+        struct {
+            int32_t i32UpperHalf;
+            int32_t i32;
+        };
+        struct {
+            float f32UpperHalf;
+            float f32;
+        };
+#else
         int32_t i32;
         float f32;
+#endif
         int64_t i64;
         double f64;
         v128_t v128;
@@ -61,8 +74,21 @@ struct IPIntStackEntry {
 constexpr static unsigned LOCAL_SIZE = 16; // bytes
 struct IPIntLocal {
     union {
+#if CPU(BIG_ENDIAN)
+        // A 32-bit value lives at PayloadOffset of its 8-byte slot, as in
+        // every wasm frame slot.
+        struct {
+            int32_t i32UpperHalf;
+            int32_t i32;
+        };
+        struct {
+            float f32UpperHalf;
+            float f32;
+        };
+#else
         int32_t i32;
         float f32;
+#endif
         int64_t i64;
         double f64;
         v128_t v128;

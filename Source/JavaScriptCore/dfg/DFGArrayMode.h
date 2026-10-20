@@ -431,7 +431,7 @@ public:
         case Array::String:
         case Array::DirectArguments:
         case Array::ScopedArguments:
-            return ArrayMode(Array::Generic);
+            return ArrayMode(Array::Generic, action());
         default:
             return *this;
         }
@@ -606,6 +606,9 @@ private:
     {
         u.asWord = word;
     }
+    // A bare type would otherwise convert to the word constructor above, which
+    // places it in the wrong byte on big-endian hosts.
+    explicit ArrayMode(Array::Type) = delete;
     
     ArrayModes arrayModesWithIndexingShapes(IndexingType shape) const
     {

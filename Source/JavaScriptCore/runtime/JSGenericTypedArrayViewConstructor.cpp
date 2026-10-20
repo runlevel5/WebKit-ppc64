@@ -135,9 +135,16 @@ template<typename CharacterType>
         if (SIMD::isNonZero(flags)) [[unlikely]]
             return false;
 
+        // Each 16-bit lane holds a digit pair; the first digit is its low byte on
+        // little-endian and its high byte on big-endian.
         auto converted = simde_vreinterpretq_u16_u8(nibbles);
+#if CPU(BIG_ENDIAN)
+        auto low = converted;
+        auto high = simde_vshrq_n_u16(converted, 4);
+#else
         auto low = simde_vshrq_n_u16(converted, 8);
         auto high = simde_vshlq_n_u16(converted, 4);
+#endif
         simde_vst1_u8(output, simde_vmovn_u16(simde_vorrq_u16(low, high)));
         return true;
     };

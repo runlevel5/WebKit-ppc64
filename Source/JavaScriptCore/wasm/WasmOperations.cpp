@@ -143,8 +143,9 @@ JSC_DEFINE_JIT_OPERATION(operationJSToWasmEntryWrapperBuildFrame, JSToWasmCallee
 
         if (wasmFrameConvention.params[i].location.isStackArgument()) {
             auto dst = wasmFrameConvention.params[i].location.offsetFromSP() + calleeSPOffsetFromFP;
+            // A 32-bit value is the payload of its slot: write the whole slot.
             if (type.isI32() || type.isF32())
-                *access.operator()<uint32_t>(callFrame, dst) = static_cast<uint32_t>(value);
+                *access.operator()<uint64_t>(callFrame, dst) = static_cast<uint32_t>(value);
             else
                 *access.operator()<uint64_t>(callFrame, dst) = value;
         } else {
@@ -203,7 +204,7 @@ JSC_DEFINE_JIT_OPERATION(operationJSToWasmEntryWrapperBuildReturnFrame, EncodedJ
 
         JSValue result;
         if (signature.returnType(0).isI32())
-            result = jsNumber(*access.operator()<int32_t>(registerSpace, 0));
+            result = jsNumber(static_cast<int32_t>(*access.operator()<uint64_t>(registerSpace, 0)));
         else if (signature.returnType(0).isI64()) {
             result = JSBigInt::makeHeapBigIntOrBigInt32(instance->realm(), *access.operator()<int64_t>(registerSpace, 0));
             OPERATION_RETURN_IF_EXCEPTION(scope, encodedJSValue());
@@ -258,7 +259,7 @@ JSC_DEFINE_JIT_OPERATION(operationJSToWasmEntryWrapperBuildReturnFrame, EncodedJ
         if (loc.isGPR() || loc.isFPR()) {
             switch (type.kind) {
             case TypeKind::I32:
-                result = jsNumber(*access.operator()<int32_t>(registerSpace, GPRInfo::toArgumentIndex(loc.jsr().payloadGPR()) * sizeof(UCPURegister)));
+                result = jsNumber(static_cast<int32_t>(*access.operator()<uint64_t>(registerSpace, GPRInfo::toArgumentIndex(loc.jsr().payloadGPR()) * sizeof(UCPURegister))));
                 break;
             case TypeKind::I64:
                 result = JSBigInt::makeHeapBigIntOrBigInt32(globalObject, *access.operator()<int64_t>(registerSpace, GPRInfo::toArgumentIndex(loc.jsr().payloadGPR()) * sizeof(UCPURegister)));
@@ -277,14 +278,14 @@ JSC_DEFINE_JIT_OPERATION(operationJSToWasmEntryWrapperBuildReturnFrame, EncodedJ
         } else {
             switch (type.kind) {
             case TypeKind::I32:
-                result = jsNumber(*access.operator()<int32_t>(callFrame, calleeSPOffsetFromFP + loc.offsetFromSP()));
+                result = jsNumber(*access.operator()<int32_t>(callFrame, calleeSPOffsetFromFP + loc.offsetFromSP() + PayloadOffset));
                 break;
             case TypeKind::I64:
                 result = JSBigInt::makeHeapBigIntOrBigInt32(globalObject, *access.operator()<int64_t>(callFrame, calleeSPOffsetFromFP + loc.offsetFromSP()));
                 OPERATION_RETURN_IF_EXCEPTION(scope, encodedJSValue());
                 break;
             case TypeKind::F32:
-                result = jsNumber(purifyNaN(*access.operator()<float>(callFrame, calleeSPOffsetFromFP + loc.offsetFromSP())));
+                result = jsNumber(purifyNaN(*access.operator()<float>(callFrame, calleeSPOffsetFromFP + loc.offsetFromSP() + PayloadOffset)));
                 break;
             case TypeKind::F64:
                 result = jsNumber(purifyNaN(*access.operator()<double>(callFrame, calleeSPOffsetFromFP + loc.offsetFromSP())));
@@ -429,7 +430,7 @@ JSC_DEFINE_JIT_OPERATION(operationWasmToJSExitMarshalArguments, void, (void* sp,
         case TypeKind::F32: {
             float val;
             if (wasmParam.isStack())
-                val = *access.operator()<float>(callFrame, wasmParam.offsetFromFP());
+                val = *access.operator()<float>(callFrame, wasmParam.offsetFromFP() + PayloadOffset);
             else
                 val = loadF32FromFPRSlot(access.operator()<uint64_t>(argumentRegisters, GPRInfo::numberOfArgumentRegisters * sizeof(UCPURegister) + FPRInfo::toArgumentIndex(wasmParam.fpr()) * bytesForWidth(Width::Width64)));
 
@@ -522,7 +523,7 @@ JSC_DEFINE_JIT_OPERATION(operationWasmToJSExitMarshalReturnValues, void, (void* 
                 OPERATION_RETURN_IF_EXCEPTION(scope);
                 *access.operator()<uint64_t>(registerSpace, 0) = static_cast<uint64_t>(result);
             } else {
-                uint64_t result = static_cast<uint64_t>(*access.operator()<uint32_t>(registerSpace, 0));
+                uint64_t result = static_cast<uint32_t>(*access.operator()<uint64_t>(registerSpace, 0)); // The payload of the boxed int32.
                 *access.operator()<uint64_t>(registerSpace, 0) = result;
             }
             break;
@@ -538,7 +539,7 @@ JSC_DEFINE_JIT_OPERATION(operationWasmToJSExitMarshalReturnValues, void, (void* 
             auto offset = GPRInfo::numberOfArgumentRegisters * sizeof(UCPURegister) + FPRInfo::toArgumentIndex(dest) * bytesForWidth(Width::Width64);
             if (returned.isNumber()) {
                 if (returned.isInt32()) {
-                    float result = static_cast<float>(*access.operator()<int32_t>(registerSpace, 0));
+                    float result = static_cast<float>(static_cast<int32_t>(*access.operator()<uint64_t>(registerSpace, 0)));
                     *access.operator()<uint64_t>(registerSpace, offset) = f32FPRSlotBits(result);
                 } else {
 #if USE(JSVALUE64)
@@ -561,7 +562,7 @@ JSC_DEFINE_JIT_OPERATION(operationWasmToJSExitMarshalReturnValues, void, (void* 
             auto offset = GPRInfo::numberOfArgumentRegisters * sizeof(UCPURegister) + FPRInfo::toArgumentIndex(dest) * bytesForWidth(Width::Width64);
             if (returned.isNumber()) {
                 if (returned.isInt32()) {
-                    double result = static_cast<double>(*access.operator()<int32_t>(registerSpace, 0));
+                    double result = static_cast<double>(static_cast<int32_t>(*access.operator()<uint64_t>(registerSpace, 0)));
                     *access.operator()<double>(registerSpace, offset) = result;
                 } else {
 #if USE(JSVALUE64)
@@ -803,11 +804,10 @@ void loadValuesIntoBuffer(Probe::Context& context, const StackMap& values, Wasm:
         } else if (value.isFPR()) {
             switch (value.type().kind()) {
             case B3::Float:
-                // The OSR entry reads a Float slot as 4 bytes; an FPR holds it in
+                // The buffer reader takes the low 32 bits; an FPR holds an f32 in
                 // its register format (the double image on PPC64).
                 dataLogLnIf(verbose, "FPR for value ", index, " ", value.fpr(), " = ", context.fpr(value.fpr()));
-                *std::bit_cast<uint64_t*>(buffer + index) = 0;
-                *std::bit_cast<float*>(buffer + index) = loadF32FromFPRSlot(&context.fpr(value.fpr()));
+                *std::bit_cast<uint64_t*>(buffer + index) = std::bit_cast<uint32_t>(loadF32FromFPRSlot(&context.fpr(value.fpr())));
                 break;
             case B3::Double:
                 dataLogLnIf(verbose, "FPR for value ", index, " ", value.fpr(), " = ", context.fpr(value.fpr()));
@@ -827,7 +827,7 @@ void loadValuesIntoBuffer(Probe::Context& context, const StackMap& values, Wasm:
         } else if (value.isConstant()) {
             switch (value.type().kind()) {
             case B3::Float:
-                *std::bit_cast<float*>(buffer + index) = value.floatValue();
+                *std::bit_cast<uint64_t*>(buffer + index) = std::bit_cast<uint32_t>(value.floatValue());
                 break;
             case B3::Double:
                 *std::bit_cast<double*>(buffer + index) = value.doubleValue();
@@ -851,7 +851,7 @@ void loadValuesIntoBuffer(Probe::Context& context, const StackMap& values, Wasm:
 
             switch (value.type().kind()) {
             case B3::Float:
-                *std::bit_cast<float*>(baseStore) = *std::bit_cast<float*>(baseLoad);
+                *std::bit_cast<uint64_t*>(baseStore) = std::bit_cast<uint32_t>(*std::bit_cast<float*>(baseLoad + PayloadOffset)); // The buffer reader takes the low 32 bits.
                 break;
             case B3::Double:
                 *std::bit_cast<double*>(baseStore) = *std::bit_cast<double*>(baseLoad);
@@ -1240,13 +1240,13 @@ JSC_DEFINE_NOEXCEPT_JIT_OPERATION(operationWasmLoopOSREnterBBQJIT, void, (Probe:
             auto* baseStore = std::bit_cast<uint8_t*>(context.fp()) + value.offsetFromFP();
             switch (type.kind()) {
             case B3::Int32:
-                *std::bit_cast<uint32_t*>(baseStore) = static_cast<uint32_t>(*bufferSlot);
+                *std::bit_cast<uint32_t*>(baseStore + PayloadOffset) = static_cast<uint32_t>(*bufferSlot);
                 break;
             case B3::Int64:
                 *std::bit_cast<uint64_t*>(baseStore) = *bufferSlot;
                 break;
             case B3::Float:
-                *std::bit_cast<float*>(baseStore) = std::bit_cast<float>(static_cast<uint32_t>(*bufferSlot));
+                *std::bit_cast<float*>(baseStore + PayloadOffset) = std::bit_cast<float>(static_cast<uint32_t>(*bufferSlot));
                 break;
             case B3::Double:
                 *std::bit_cast<double*>(baseStore) = std::bit_cast<double>(*bufferSlot);

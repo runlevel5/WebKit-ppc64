@@ -841,7 +841,8 @@ void Options::notifyOptionsChanged()
 #if !CPU(X86_64) && !CPU(ARM64)
     Options::useConcurrentGC() = false;
     Options::forceUnlinkedDFG() = false;
-#if !CPU(PPC64)
+#if !CPU(PPC64) || CPU(BIG_ENDIAN)
+    // Big-endian hosts would need the lanes of every v128 memory access reversed.
     Options::useWasmSIMD() = false;
 #endif
 #if !CPU(PPC64)

@@ -147,7 +147,7 @@ static void marshallJSResult(CCallHelpers& jit, const RTT& signature, const Call
                     switch (type.kind) {
                     case TypeKind::F32:
                         tmp = ValueLocation { fprScratch };
-                        jit.loadFloat(readLocation, fprScratch);
+                        jit.loadFloat(readLocation.withOffset(PayloadOffset), fprScratch);
                         break;
                     case TypeKind::F64:
                         tmp = ValueLocation { fprScratch };
@@ -155,7 +155,7 @@ static void marshallJSResult(CCallHelpers& jit, const RTT& signature, const Call
                         break;
                     case TypeKind::I32:
                         tmp = ValueLocation { scratchJSR };
-                        jit.load32(readLocation, scratchJSR.payloadGPR());
+                        jit.load32(readLocation.withOffset(PayloadOffset), scratchJSR.payloadGPR());
                         break;
                     default:
                         tmp = ValueLocation { scratchJSR };

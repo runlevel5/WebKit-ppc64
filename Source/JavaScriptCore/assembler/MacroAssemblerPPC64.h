@@ -29,6 +29,10 @@
 
 #if ENABLE(ASSEMBLER) && CPU(PPC64)
 
+#if !defined(_CALL_ELF) || _CALL_ELF != 2
+#error "The PPC64 JIT supports the ELFv2 ABI only"
+#endif
+
 #include <JavaScriptCore/AbstractMacroAssembler.h>
 #include <JavaScriptCore/PPC64Assembler.h>
 #include <limits>
@@ -4674,6 +4678,96 @@ public:
     }
     // Register byte-reverse: brh/brw/brd on POWER10, else rotate/mask sequences.
     // The 16- and 32-bit results are zero-extended.
+    // Accesses to memory whose byte order is fixed by its format rather than
+    // by the host (wasm linear memory). Only big-endian builds call these;
+    // the byte-reversed forms are X-form, so the address goes through
+    // memoryTempRegister and the data, for floats, through dataTempRegister
+    // and the ELFv2 red zone (the FPRs hold doubles).
+    template<typename AddressType>
+    RegisterID littleEndianAddress(AddressType address)
+    {
+        ResolvedAddress r = resolveAddress(address, memoryTempRegister);
+        if (!r.offset)
+            return r.base;
+        m_assembler.addi(memoryTempRegister, r.base, r.offset);
+        return memoryTempRegister;
+    }
+    template<typename AddressType>
+    void load16LittleEndian(AddressType address, RegisterID dest)
+    {
+        m_assembler.lhbrx(dest, PPC64Registers::r0, littleEndianAddress(address));
+    }
+    template<typename AddressType>
+    void load16SignedExtendTo32LittleEndian(AddressType address, RegisterID dest)
+    {
+        load16LittleEndian(address, dest);
+        m_assembler.extsh(dest, dest);
+        zeroExtend32ToWordInternal(dest);
+    }
+    template<typename AddressType>
+    void load16SignedExtendTo64LittleEndian(AddressType address, RegisterID dest)
+    {
+        load16LittleEndian(address, dest);
+        m_assembler.extsh(dest, dest);
+    }
+    template<typename AddressType>
+    void load32LittleEndian(AddressType address, RegisterID dest)
+    {
+        m_assembler.lwbrx(dest, PPC64Registers::r0, littleEndianAddress(address));
+    }
+    template<typename AddressType>
+    void load32SignedExtendTo64LittleEndian(AddressType address, RegisterID dest)
+    {
+        load32LittleEndian(address, dest);
+        m_assembler.extsw(dest, dest);
+    }
+    template<typename AddressType>
+    void load64LittleEndian(AddressType address, RegisterID dest)
+    {
+        m_assembler.ldbrx(dest, PPC64Registers::r0, littleEndianAddress(address));
+    }
+    template<typename AddressType>
+    void loadFloatLittleEndian(AddressType address, FPRegisterID dest)
+    {
+        load32LittleEndian(address, dataTempRegister);
+        m_assembler.stw(dataTempRegister, -8, stackPointerRegister);
+        m_assembler.lfs(dest, -8, stackPointerRegister);
+    }
+    template<typename AddressType>
+    void loadDoubleLittleEndian(AddressType address, FPRegisterID dest)
+    {
+        load64LittleEndian(address, dataTempRegister);
+        m_assembler.mtvsrd(dest, dataTempRegister);
+    }
+    template<typename AddressType>
+    void store16LittleEndian(RegisterID src, AddressType address)
+    {
+        m_assembler.sthbrx(src, PPC64Registers::r0, littleEndianAddress(address));
+    }
+    template<typename AddressType>
+    void store32LittleEndian(RegisterID src, AddressType address)
+    {
+        m_assembler.stwbrx(src, PPC64Registers::r0, littleEndianAddress(address));
+    }
+    template<typename AddressType>
+    void store64LittleEndian(RegisterID src, AddressType address)
+    {
+        m_assembler.stdbrx(src, PPC64Registers::r0, littleEndianAddress(address));
+    }
+    template<typename AddressType>
+    void storeFloatLittleEndian(FPRegisterID src, AddressType address)
+    {
+        m_assembler.stfs(src, -8, stackPointerRegister);
+        m_assembler.lwz(dataTempRegister, -8, stackPointerRegister);
+        store32LittleEndian(dataTempRegister, address);
+    }
+    template<typename AddressType>
+    void storeDoubleLittleEndian(FPRegisterID src, AddressType address)
+    {
+        m_assembler.mfvsrd(dataTempRegister, src);
+        store64LittleEndian(dataTempRegister, address);
+    }
+
     void byteSwap16(RegisterID reg)
     {
         if (supportsISA3_1()) {

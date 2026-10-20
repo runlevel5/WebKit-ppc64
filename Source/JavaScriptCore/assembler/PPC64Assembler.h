@@ -557,6 +557,32 @@ public:
         insn(xForm(31, rt, ra, rb, /*XO*/ 21, /*Rc*/ 0));
     }
 
+    // Byte-reversed loads and stores (X-form, EA = (RA|0) + RB).
+    void lhbrx(RegisterID rt, RegisterID ra, RegisterID rb)
+    {
+        insn(xForm(31, rt, ra, rb, /*XO*/ 790, /*Rc*/ 0));
+    }
+    void lwbrx(RegisterID rt, RegisterID ra, RegisterID rb)
+    {
+        insn(xForm(31, rt, ra, rb, /*XO*/ 534, /*Rc*/ 0));
+    }
+    void ldbrx(RegisterID rt, RegisterID ra, RegisterID rb)
+    {
+        insn(xForm(31, rt, ra, rb, /*XO*/ 532, /*Rc*/ 0));
+    }
+    void sthbrx(RegisterID rs, RegisterID ra, RegisterID rb)
+    {
+        insn(xForm(31, rs, ra, rb, /*XO*/ 918, /*Rc*/ 0));
+    }
+    void stwbrx(RegisterID rs, RegisterID ra, RegisterID rb)
+    {
+        insn(xForm(31, rs, ra, rb, /*XO*/ 662, /*Rc*/ 0));
+    }
+    void stdbrx(RegisterID rs, RegisterID ra, RegisterID rb)
+    {
+        insn(xForm(31, rs, ra, rb, /*XO*/ 660, /*Rc*/ 0));
+    }
+
     void stdx(RegisterID rs, RegisterID ra, RegisterID rb)
     {
         insn(xForm(31, rs, ra, rb, /*XO*/ 149, /*Rc*/ 0));

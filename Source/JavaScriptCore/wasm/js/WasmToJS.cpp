@@ -280,7 +280,7 @@ Expected<MacroAssemblerCodeRef<WasmEntryPtrTag>, BindingFailure> wasmToJS(const 
                 else {
                     // We've already spilled all arguments, these registers are available as scratch.
                     fprReg = FPRInfo::argumentFPR0;
-                    jit.loadFloat(JIT::Address(GPRInfo::callFrameRegister, frOffset), fprReg);
+                    jit.loadFloat(JIT::Address(GPRInfo::callFrameRegister, frOffset + PayloadOffset), fprReg);
                     frOffset += sizeof(Register);
                 }
                 jit.convertFloatToDouble(fprReg, fprReg);
