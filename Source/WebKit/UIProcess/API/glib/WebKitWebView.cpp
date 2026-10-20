@@ -5354,7 +5354,7 @@ void webkit_web_view_get_snapshot(WebKitWebView* webView, WebKitSnapshotRegion r
                 if (image) {
 #if USE(GTK4)
                     auto* bytes = webkit_image_as_bytes(image.get());
-                    if (auto texture = adoptGRef(gdk_memory_texture_new(webkit_image_get_width(image.get()), webkit_image_get_height(image.get()), GDK_MEMORY_DEFAULT, bytes, webkit_image_get_stride(image.get())))) {
+                    if (auto texture = adoptGRef(gdk_memory_texture_new(webkit_image_get_width(image.get()), webkit_image_get_height(image.get()), GDK_MEMORY_B8G8R8A8_PREMULTIPLIED, bytes, webkit_image_get_stride(image.get())))) {
                         g_task_return_pointer(task.get(), texture.leakRef(), g_object_unref);
                         return;
                     }

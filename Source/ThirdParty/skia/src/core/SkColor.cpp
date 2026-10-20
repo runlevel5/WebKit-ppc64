@@ -134,13 +134,13 @@ SkColor SkHSVToColor(U8CPU a, const SkScalar hsv[3]) {
 template <>
 SkColor4f SkColor4f::FromColor(SkColor bgra) {
     SkColor4f rgba;
-    swizzle_rb(Sk4f_fromL32(bgra)).store(rgba.vec());
+    swizzle_rb(Sk4f_fromColorValue(bgra)).store(rgba.vec());
     return rgba;
 }
 
 template <>
 SkColor SkColor4f::toSkColor() const {
-    return Sk4f_toL32(swizzle_rb(skvx::float4::Load(this->vec())));
+    return Sk4f_toColorValue(swizzle_rb(skvx::float4::Load(this->vec())));
 }
 
 template <>
@@ -158,7 +158,7 @@ SkColor4f SkColor4f::FromBytes_RGBA(uint32_t c) {
 template <>
 SkPMColor4f SkPMColor4f::FromPMColor(SkPMColor c) {
     SkPMColor4f color;
-    swizzle_rb_if_bgra(Sk4f_fromL32(c)).store(&color);
+    swizzle_rb_if_bgra(Sk4f_fromColorValue(c)).store(&color);
     return color;
 }
 

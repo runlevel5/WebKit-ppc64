@@ -1088,18 +1088,15 @@ else ()
     target_compile_definitions(Skia PRIVATE SK_TYPEFACE_FACTORY_FREETYPE)
 endif ()
 
+# Pixels are B, G, R, A in memory on both byte orders. On big-endian, the scalar
+# blitters and the raster pipeline convert between that layout and the packed
+# SkPMColor value at their loads and stores (BE_CONVERT, swap_8888_bytes).
+target_compile_definitions(Skia PUBLIC
+    SK_R32_SHIFT=16
+)
 if (CMAKE_CXX_BYTE_ORDER STREQUAL "BIG_ENDIAN")
     target_compile_definitions(Skia PUBLIC
         I_ACKNOWLEDGE_SKIA_DOES_NOT_SUPPORT_BIG_ENDIAN
-
-        SK_R32_SHIFT=24
-        SK_G32_SHIFT=16
-        SK_B32_SHIFT=8
-        SK_A32_SHIFT=0
-    )
-else ()
-    target_compile_definitions(Skia PUBLIC
-        SK_R32_SHIFT=16
     )
 endif ()
 
