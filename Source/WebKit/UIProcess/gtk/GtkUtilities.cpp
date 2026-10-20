@@ -166,7 +166,7 @@ GRefPtr<GdkTexture> skiaImageToGdkTexture(SkImage& image)
         static_cast<SkImage*>(data)->unref();
     }, SkRef(&image)));
 
-    return adoptGRef(gdk_memory_texture_new(pixmap.width(), pixmap.height(), GDK_MEMORY_DEFAULT, bytes.get(), pixmap.rowBytes()));
+    return adoptGRef(gdk_memory_texture_new(pixmap.width(), pixmap.height(), GDK_MEMORY_B8G8R8A8_PREMULTIPLIED, bytes.get(), pixmap.rowBytes()));
 }
 #else
 RefPtr<cairo_surface_t> skiaImageToCairoSurface(SkImage& image)
