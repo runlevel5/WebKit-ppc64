@@ -1081,7 +1081,6 @@ public:
         return calleeFrame.withOffset(CallFrameSlot::callee * static_cast<int>(sizeof(Register)))
             // calleeFrame is from the caller's perspective
             .withOffset(-safeCast<int>(sizeof(CallerFrameAndPC)))
-            .withOffset(PayloadOffset)
             .withOffset(offset);
     }
 

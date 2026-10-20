@@ -36,6 +36,7 @@
 #include "JSWebAssemblyInstance.h"
 #include "JSWebAssemblyStruct.h"
 #include "TypedArrayController.h"
+#include <wtf/FlipBytes.h>
 #include "WaiterListManager.h"
 #include "WasmIPIntGenerator.h"
 #include "WasmModuleInformation.h"
@@ -181,6 +182,21 @@ inline JSValue arrayNewFixed(JSWebAssemblyInstance* instance, WebAssemblyGCStruc
     return array;
 }
 
+// Data segments hold little-endian elements; arrays hold host-order ones.
+template<typename Span>
+ALWAYS_INLINE void flipDataSegmentElementsIfBigEndian(Span span)
+{
+#if CPU(BIG_ENDIAN)
+    using Element = typename Span::value_type;
+    if constexpr (sizeof(Element) == 2 || sizeof(Element) == 4 || sizeof(Element) == 8) {
+        for (auto& element : span)
+            element = flipBytes(element);
+    }
+#else
+    UNUSED_PARAM(span);
+#endif
+}
+
 template<typename T>
 EncodedJSValue createArrayFromDataSegment(JSWebAssemblyInstance* instance, WebAssemblyGCStructure* structure, size_t arraySize, unsigned dataSegmentIndex, unsigned offset)
 {
@@ -198,6 +214,7 @@ EncodedJSValue createArrayFromDataSegment(JSWebAssemblyInstance* instance, WebAs
         // In that case, the caller is responsible for throwing an exception.
         return JSValue::encode(jsNull());
     }
+    flipDataSegmentElementsIfBigEndian(span);
     return JSValue::encode(array);
 }
 
@@ -457,7 +474,10 @@ inline bool arrayInitData(JSWebAssemblyInstance* instance, EncodedJSValue dst, u
     // Otherwise we need a writeBarrier.
     ASSERT(!dstObject->elementsAreRefTypes());
     return dstObject->visitSpan([&](auto span) ALWAYS_INLINE_LAMBDA -> bool {
-        return instance->copyDataSegment(dstObject, srcDataIndex, srcOffset, size * elementSize, reinterpret_cast<uint8_t*>(span.subspan(dstOffset).data()));
+        if (!instance->copyDataSegment(dstObject, srcDataIndex, srcOffset, size * elementSize, reinterpret_cast<uint8_t*>(span.subspan(dstOffset).data())))
+            return false;
+        flipDataSegmentElementsIfBigEndian(span.subspan(dstOffset, size));
+        return true;
     });
 }
 
@@ -775,6 +795,9 @@ inline int32_t memoryAtomicWait32(JSWebAssemblyInstance* instance, uint64_t offs
     if (!vm.m_typedArrayController->isAtomicsWaitAllowedOnCurrentThread())
         return -1;
     int32_t* pointer = std::bit_cast<int32_t*>(std::bit_cast<uint8_t*>(instance->memory(memoryIndex)->basePointer()) + offsetInMemory);
+#if CPU(BIG_ENDIAN)
+    value = flipBytes(value); // The memory holds the little-endian form.
+#endif
     return waitImpl<int32_t>(vm, pointer, value, timeoutInNanoseconds);
 }
 
@@ -799,6 +822,9 @@ inline int32_t memoryAtomicWait64(JSWebAssemblyInstance* instance, uint64_t offs
     if (!vm.m_typedArrayController->isAtomicsWaitAllowedOnCurrentThread())
         return -1;
     int64_t* pointer = std::bit_cast<int64_t*>(std::bit_cast<uint8_t*>(instance->memory(memoryIndex)->basePointer()) + offsetInMemory);
+#if CPU(BIG_ENDIAN)
+    value = flipBytes(value); // The memory holds the little-endian form.
+#endif
     return waitImpl<int64_t>(vm, pointer, value, timeoutInNanoseconds);
 }
 

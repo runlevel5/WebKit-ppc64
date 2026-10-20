@@ -33,6 +33,7 @@
 #include "WasmParser.h"
 #include "WasmSectionParser.h"
 #include "WasmTypeDefinitionInlines.h"
+#include <wtf/FlipBytes.h>
 #include <wtf/FileHandle.h>
 #include <wtf/FileSystem.h>
 #include <wtf/UnalignedAccess.h>
@@ -119,6 +120,9 @@ auto StreamingParser::parseModuleHeader(Vector<uint8_t>&& data) -> State
     dataLogLnIf(WasmStreamingParserInternal::verbose, "header validation");
     WASM_STREAMING_PARSER_FAIL_IF(data[0] != '\0' || data[1] != 'a' || data[2] != 's' || data[3] != 'm', "module doesn't start with '\\0asm'"_s);
     uint32_t versionNumber = WTF::unalignedLoad<uint32_t>(data.span().data() + 4);
+#if CPU(BIG_ENDIAN)
+    versionNumber = flipBytes(versionNumber);
+#endif
     WASM_STREAMING_PARSER_FAIL_IF(versionNumber != expectedVersionNumber, "unexpected version number "_s, versionNumber, " expected "_s, expectedVersionNumber);
     return State::SectionID;
 }

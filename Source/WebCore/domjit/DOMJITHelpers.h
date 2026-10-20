@@ -66,7 +66,12 @@ void tryLookUpWrapperCache(CCallHelpers& jit, CCallHelpers::JumpList& failureCas
     jit.loadPtr(CCallHelpers::Address(wrapped, ScriptWrappable::offsetOfWrapper<WrappedType>()), resultGPR);
     failureCases.append(jit.branchTestPtr(CCallHelpers::Zero, resultGPR));
     failureCases.append(branchIfNotWeakIsLive(jit, resultGPR));
+#if USE(JSVALUE64)
+    // A cell's encoded JSValue is the whole pointer; the payload half is only the low word.
+    jit.loadPtr(CCallHelpers::Address(resultGPR, JSC::WeakImpl::offsetOfJSValue()), resultGPR);
+#else
     jit.loadPtr(CCallHelpers::Address(resultGPR, JSC::WeakImpl::offsetOfJSValue() + JSC::JSValue::offsetOfPayload()), resultGPR);
+#endif
 }
 
 template<typename WrappedType, typename ToJSFunction>

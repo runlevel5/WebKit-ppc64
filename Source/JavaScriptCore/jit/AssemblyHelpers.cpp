@@ -414,7 +414,15 @@ void AssemblyHelpers::emitStoreStructureWithTypeInfo(AssemblyHelpers& jit, Trust
 {
     const Structure* structurePtr = reinterpret_cast<const Structure*>(structure.m_value);
 #if USE(JSVALUE64)
-    jit.store64(TrustedImm64(static_cast<uint64_t>(structurePtr->id().bits()) | (static_cast<uint64_t>(structurePtr->typeInfoBlob()) << 32)), MacroAssembler::Address(dest, JSCell::structureIDOffset()));
+    // One 64-bit store of the StructureID (offset 0) and the type info blob (offset 4).
+    uint64_t structureID = structurePtr->id().bits();
+    uint64_t typeInfoBlob = structurePtr->typeInfoBlob();
+#if CPU(BIG_ENDIAN)
+    uint64_t header = (structureID << 32) | typeInfoBlob;
+#else
+    uint64_t header = structureID | (typeInfoBlob << 32);
+#endif
+    jit.store64(TrustedImm64(header), MacroAssembler::Address(dest, JSCell::structureIDOffset()));
     if (ASSERT_ENABLED) {
         Jump correctStructure = jit.branch32(Equal, MacroAssembler::Address(dest, JSCell::structureIDOffset()), TrustedImm32(structurePtr->id().bits()));
         jit.abortWithReason(AHStructureIDIsValid);
@@ -994,6 +1002,15 @@ void AssemblyHelpers::emitRandomThunk(VM& vm, GPRReg scratch0, GPRReg scratch1, 
 
 void AssemblyHelpers::emitAllocateWithNonNullAllocator(GPRReg resultGPR, const JITAllocator& allocator, GPRReg allocatorGPR, GPRReg scratchGPR, JumpList& slowPath, SlowAllocationResult slowAllocationResult)
 {
+    // FreeCell::scrambledBits packs the interval length above the offset to the next interval in
+    // one 64-bit word, read here a half at a time.
+#if CPU(BIG_ENDIAN)
+    constexpr ptrdiff_t lowWordOffset = 4;
+    constexpr ptrdiff_t highWordOffset = 0;
+#else
+    constexpr ptrdiff_t lowWordOffset = 0;
+    constexpr ptrdiff_t highWordOffset = 4;
+#endif
     if (Options::forceGCSlowPaths()) {
         slowPath.append(jump());
         return;
@@ -1066,11 +1083,11 @@ void AssemblyHelpers::emitAllocateWithNonNullAllocator(GPRReg resultGPR, const J
     popPath.link(this);
     loadPtr(Address(allocatorGPR, LocalAllocator::offsetOfFreeList() + FreeList::offsetOfNextInterval()), resultGPR);
     zeroPath = branchTestPtr(ResultCondition::NonZero, resultGPR, TrustedImm32(1));
-    load32(Address(allocatorGPR, LocalAllocator::offsetOfFreeList() + FreeList::offsetOfSecret()), scratchGPR);
-    xor32(Address(resultGPR, FreeCell::offsetOfScrambledBits()), scratchGPR); // Lower 32 bits -> offset to next interval
+    load32(Address(allocatorGPR, LocalAllocator::offsetOfFreeList() + FreeList::offsetOfSecret() + lowWordOffset), scratchGPR);
+    xor32(Address(resultGPR, FreeCell::offsetOfScrambledBits() + lowWordOffset), scratchGPR); // Lower 32 bits -> offset to next interval
     add64(scratchGPR, Address(allocatorGPR, LocalAllocator::offsetOfFreeList() + FreeList::offsetOfNextInterval()));
-    load32(Address(allocatorGPR, LocalAllocator::offsetOfFreeList() + FreeList::offsetOfSecret() + 4), scratchGPR);
-    xor32(Address(resultGPR, FreeCell::offsetOfScrambledBits() + 4), scratchGPR); // Upper 32 bits -> size of interval
+    load32(Address(allocatorGPR, LocalAllocator::offsetOfFreeList() + FreeList::offsetOfSecret() + highWordOffset), scratchGPR);
+    xor32(Address(resultGPR, FreeCell::offsetOfScrambledBits() + highWordOffset), scratchGPR); // Upper 32 bits -> size of interval
     storePtr(resultGPR, Address(allocatorGPR, LocalAllocator::offsetOfFreeList() + FreeList::offsetOfIntervalStart()));
     addPtr(resultGPR, scratchGPR);
     storePtr(scratchGPR, Address(allocatorGPR, LocalAllocator::offsetOfFreeList() + FreeList::offsetOfIntervalEnd()));
@@ -1097,13 +1114,13 @@ void AssemblyHelpers::emitAllocateWithNonNullAllocator(GPRReg resultGPR, const J
     popPath.link(this);
     loadPtr(Address(allocatorGPR, LocalAllocator::offsetOfFreeList() + FreeList::offsetOfNextInterval()), resultGPR);
     zeroPath = branchTestPtr(ResultCondition::NonZero, resultGPR, TrustedImm32(1));
-    load32(Address(allocatorGPR, LocalAllocator::offsetOfFreeList() + FreeList::offsetOfSecret()), scratchGPR);
-    xor32(Address(resultGPR, FreeCell::offsetOfScrambledBits()), scratchGPR); // Lower 32 bits -> offset to next interval
+    load32(Address(allocatorGPR, LocalAllocator::offsetOfFreeList() + FreeList::offsetOfSecret() + lowWordOffset), scratchGPR);
+    xor32(Address(resultGPR, FreeCell::offsetOfScrambledBits() + lowWordOffset), scratchGPR); // Lower 32 bits -> offset to next interval
     loadPtr(Address(allocatorGPR, LocalAllocator::offsetOfFreeList() + FreeList::offsetOfNextInterval()), dataTempRegister);
     addPtr(scratchGPR, dataTempRegister);
     storePtr(dataTempRegister, Address(allocatorGPR, LocalAllocator::offsetOfFreeList() + FreeList::offsetOfNextInterval()));
-    load32(Address(allocatorGPR, LocalAllocator::offsetOfFreeList() + FreeList::offsetOfSecret() + 4), scratchGPR);
-    xor32(Address(resultGPR, FreeCell::offsetOfScrambledBits() + 4), scratchGPR); // Upper 32 bits -> size of interval
+    load32(Address(allocatorGPR, LocalAllocator::offsetOfFreeList() + FreeList::offsetOfSecret() + highWordOffset), scratchGPR);
+    xor32(Address(resultGPR, FreeCell::offsetOfScrambledBits() + highWordOffset), scratchGPR); // Upper 32 bits -> size of interval
     addPtr(resultGPR, scratchGPR);
     storePtr(scratchGPR, Address(allocatorGPR, LocalAllocator::offsetOfFreeList() + FreeList::offsetOfIntervalEnd()));
     jump(bumpLabel);
