@@ -177,6 +177,7 @@ add_library(Skia STATIC
     src/core/SkPath.cpp
     src/core/SkPathBuilder.cpp
     src/core/SkPathData.cpp
+    src/core/SkPathDump.cpp
     src/core/SkPathEffect.cpp
     src/core/SkPathIter.cpp
     src/core/SkPathMeasure.cpp
@@ -238,6 +239,7 @@ add_library(Skia STATIC
     src/core/SkStream.cpp
     src/core/SkStrike.cpp
     src/core/SkStrikeCache.cpp
+    src/core/SkStrikeRef.cpp
     src/core/SkStrikeSpec.cpp
     src/core/SkString.cpp
     src/core/SkStringUtils.cpp
@@ -972,6 +974,12 @@ target_link_libraries(Skia PRIVATE
     JPEG::JPEG
     PNG::PNG
 )
+
+# Skia is a plain static library, so WEBKIT_LIBRARY/WEBKIT_FRAMEWORK do not add PGO
+# instrumentation to it; without it the raster backend gets no profile.
+if (PGO_COMPILE_OPTIONS)
+    target_compile_options(Skia PRIVATE ${PGO_COMPILE_OPTIONS})
+endif ()
 
 WEBKIT_ADD_TARGET_CXX_FLAGS(Skia
     -ffp-contract=off
