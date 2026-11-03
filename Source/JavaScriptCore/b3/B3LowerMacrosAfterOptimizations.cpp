@@ -195,8 +195,9 @@ private:
             }
 
             case RotL: {
-                // ARM64 doesn't have a rotate left.
-                if (isARM64()) {
+                // ARM64 doesn't have a rotate left, and neither does PPC64's Air
+                // (only RotateRight is provided, lowered to rlwnm/rldcl).
+                if (isARM64() || isPPC64()) {
                     Value* newShift = m_insertionSet.insert<Value>(m_index, Neg, m_value->origin(), m_value->child(1));
                     Value* rotate = m_insertionSet.insert<Value>(m_index, RotR, m_value->origin(), m_value->child(0), newShift);
                     m_value->replaceWithIdentity(rotate);

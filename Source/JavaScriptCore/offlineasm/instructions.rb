@@ -533,7 +533,29 @@ CXX_INSTRUCTIONS =
      "cloopDo",              # no operands
     ]
 
-INSTRUCTIONS = MACRO_INSTRUCTIONS + X86_INSTRUCTIONS + X86_SIMD_INSTRUCTIONS + ARM_INSTRUCTIONS + ARM64_INSTRUCTIONS + ARM64_SIMD_INSTRUCTIONS + RISC_INSTRUCTIONS + MIPS_INSTRUCTIONS + CXX_INSTRUCTIONS
+# Accesses to memory that is little-endian regardless of the host (wasm linear
+# memory), and register byte swaps. Only reached under "if BIG_ENDIAN".
+PPC64_INSTRUCTIONS =
+    [
+     "loadhle",
+     "loadhsile",
+     "loadhsqle",
+     "loadile",
+     "loadisle",
+     "loadqle",
+     "loadfle",
+     "loaddle",
+     "storehle",
+     "storeile",
+     "storeqle",
+     "storefle",
+     "storedle",
+     "bswaph",
+     "bswapi",
+     "bswapq",
+    ]
+
+INSTRUCTIONS = MACRO_INSTRUCTIONS + X86_INSTRUCTIONS + X86_SIMD_INSTRUCTIONS + ARM_INSTRUCTIONS + ARM64_INSTRUCTIONS + ARM64_SIMD_INSTRUCTIONS + RISC_INSTRUCTIONS + MIPS_INSTRUCTIONS + CXX_INSTRUCTIONS + PPC64_INSTRUCTIONS
 
 INSTRUCTION_SET = INSTRUCTIONS.to_set
 

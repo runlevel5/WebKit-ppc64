@@ -252,9 +252,16 @@ JSC_DEFINE_HOST_FUNCTION(uint8ArrayPrototypeToHex, (JSGlobalObject* globalObject
             // merged             : LH0LLH0LLH0LLH0LLH0LLH0LLH0LLH0L
             // masked             : 0H0L0H0L0H0L0H0L0H0L0H0L0H0L0H0L
             constexpr simde_uint8x16_t characters { '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f' };
+            // Build each 16-bit lane so that, read as bytes, the high nibble comes
+            // first: the lane's low byte on little-endian, its high byte on big-endian.
             auto widen = simde_vmovl_u8(input);
+#if CPU(BIG_ENDIAN)
+            auto high = simde_vshlq_n_u16(simde_vshrq_n_u16(widen, 4), 8);
+            auto low = widen;
+#else
             auto high = simde_vshlq_n_u16(widen, 8);
             auto low = simde_vshrq_n_u16(widen, 4);
+#endif
             auto merged = SIMD::bitOr(high, low);
             auto masked = SIMD::bitAnd(simde_vreinterpretq_u8_u16(merged), SIMD::splat<uint8_t>(0xf));
             return simde_vqtbl1q_u8(characters, masked);

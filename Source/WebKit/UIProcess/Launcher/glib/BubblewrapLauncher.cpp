@@ -990,6 +990,15 @@ GRefPtr<GSubprocess> bubblewrapSpawn(GSubprocessLauncher* launcher, const Proces
     }
 #endif
 
+#if ENABLE(LLVM_PROFILE_GENERATION)
+    // Instrumented processes write their profiles at exit; without a writable bind the
+    // web and network process profiles are lost inside the sandbox.
+    if (const char* profileFile = g_getenv("LLVM_PROFILE_FILE")) {
+        auto profileDir = FileSystem::parentPath(FileSystem::stringFromFileSystemRepresentation(profileFile));
+        bindIfExists(sandboxArgs, profileDir.utf8().data(), BindFlags::ReadWrite);
+    }
+#endif
+
     int seccompFd = setupSeccomp();
     GUniquePtr<char> fdStr(g_strdup_printf("%d", seccompFd));
     g_subprocess_launcher_take_fd(launcher, seccompFd, seccompFd);

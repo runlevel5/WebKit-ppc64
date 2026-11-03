@@ -166,6 +166,10 @@ void initialize()
     llint_entry(opcodeMap, opcodeMapWide16, opcodeMapWide32);
 
 #if ENABLE(WEBASSEMBLY)
+    // Every wasm function is entered through IPInt (ipint_entry), even with
+    // useWasmIPInt off, which only makes IPInt tier up at the first prologue
+    // check; so IPInt's dispatch bases are installed and validated whenever
+    // wasm is on, as verifyInitialization() below expects.
     if (Options::useWasm())
         IPInt::initialize();
 #endif

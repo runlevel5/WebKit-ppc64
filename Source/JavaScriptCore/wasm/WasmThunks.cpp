@@ -34,6 +34,7 @@
 #include "JSInterfaceJIT.h"
 #include "JSWebAssemblyInstance.h"
 #include "LinkBuffer.h"
+#include "MaxFrameExtentForSlowPathCall.h"
 #include "ProbeContext.h"
 #include "ScratchRegisterAllocator.h"
 #include "WasmExceptionType.h"
@@ -143,7 +144,8 @@ MacroAssemblerCodeRef<JITThunkPtrTag> materializeBaselineDataGenerator(const Abs
     JIT_COMMENT(jit, "materializeBaselineDataGenerator");
     jit.emitFunctionPrologue();
 
-    const unsigned extraPaddingBytes = 0;
+    // Keep the ELFv2 C call's linkage area below the preserved registers.
+    const unsigned extraPaddingBytes = maxFrameExtentForSlowPathCall;
     RegisterSet builder;
     for (auto regs : wasmCallingConvention().jsrArgs)
         builder.add(regs, IgnoreVectors);
@@ -204,7 +206,8 @@ MacroAssemblerCodeRef<JITThunkPtrTag> callPolymorphicCalleeGenerator(const Abstr
 
     needsPolyMaterialization.link(jit);
     jit.emitFunctionPrologue();
-    const unsigned extraPaddingBytes = 0;
+    // Keep the ELFv2 C call's linkage area below the preserved registers.
+    const unsigned extraPaddingBytes = maxFrameExtentForSlowPathCall;
     RegisterSet builder;
     for (auto regs : wasmCallingConvention().jsrArgs)
         builder.add(regs, IgnoreVectors);
@@ -356,7 +359,8 @@ MacroAssemblerCodeRef<JITThunkPtrTag> triggerOMGEntryTierUpThunkGeneratorImpl(co
 
     jit.emitFunctionPrologue();
 
-    const unsigned extraPaddingBytes = 0;
+    // Keep the ELFv2 C call's linkage area below the preserved registers.
+    const unsigned extraPaddingBytes = maxFrameExtentForSlowPathCall;
     auto registersToSpill = RegisterSet::registersToSaveForCCall(isSIMDContext ? RegisterSet::allRegisters() : RegisterSet::allScalarRegisters()).normalizeWidths();
     unsigned numberOfStackBytesUsedForRegisterPreservation = ScratchRegisterAllocator::preserveRegistersToStackForCall(jit, registersToSpill, extraPaddingBytes);
 

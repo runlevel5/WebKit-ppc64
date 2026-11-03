@@ -102,6 +102,36 @@ Code::Code(Procedure& proc)
             // ARM-only.
             all.remove(MacroAssembler::addressTempRegister);
 #endif // CPU(ARM)
+#if CPU(PPC64)
+            // ELFv2 makes f14-f31 callee-saved, but JSC only models f14-f21 as
+            // VM callee-saves, and no C-to-VM entry saves f22-f31. An exception
+            // unwinding through Air code using them would lose the C caller's
+            // values, so keep them out of the pool.
+            //
+            // r24-r30 are scratch to the LLInt, IPInt and the JITs, and
+            // pushCalleeSaves saves them at every C-to-VM entry, so Air may use
+            // them (saving them in its prologue, as Air code can be called from
+            // C). Without them the graph-coloring allocators cannot color the
+            // unspillable FTL tag registers, which are live across calls.
+            if (bank == FP) {
+                for (auto reg = PPC64Registers::f22; reg <= PPC64Registers::f31; reg = static_cast<PPC64Registers::FPRegisterID>(reg + 1))
+                    all.remove(reg);
+            }
+            // The MacroAssembler's scratch registers are clobbered by immediate and
+            // offset folding. They are not in reservedHardwareRegisters (which must
+            // stay free of FPRs), so remove them here, as the ARM ports do.
+            if (bank == GP) {
+                all.remove(MacroAssembler::dataTempRegister);
+                all.remove(MacroAssembler::memoryTempRegister);
+                // CCallSpecial and patchpoints use GPRInfo's r29/r30 scratch
+                // registers without declaring them clobbered. See GPRInfo.h.
+                static_assert(GPRInfo::nonPreservedNonArgumentGPR0 == GPRInfo::nonArgGPR0 && GPRInfo::nonPreservedNonArgumentGPR0 == GPRInfo::regWS0 && GPRInfo::nonPreservedNonArgumentGPR0 == GPRInfo::wasmScratchGPR0);
+                static_assert(GPRInfo::nonPreservedNonArgumentGPR1 == GPRInfo::nonArgGPR1 && GPRInfo::nonPreservedNonArgumentGPR1 == GPRInfo::regWS1 && GPRInfo::nonPreservedNonArgumentGPR1 == GPRInfo::wasmScratchGPR1);
+                all.remove(GPRInfo::nonPreservedNonArgumentGPR0);
+                all.remove(GPRInfo::nonPreservedNonArgumentGPR1);
+            } else
+                all.remove(MacroAssembler::fpTempRegister);
+#endif
             auto calleeSave = RegisterSet::calleeSaveRegisters();
             all.forEach(
                 [&] (Reg reg) {

@@ -853,6 +853,159 @@ public:
 
 #endif // CPU(RISCV64)
 
+#if CPU(PPC64)
+
+#define NUMBER_OF_ARGUMENT_REGISTERS 8u
+// ELFv2 callee-saved GP: r14-r23 (csr0-csr9, 10 regs); FP: f14-f21 (csfr0-csfr7, 8 regs).
+#define NUMBER_OF_CALLEE_SAVES_REGISTERS 18u
+
+class GPRInfo {
+public:
+    typedef GPRReg RegisterType;
+    // The 8 volatile temps r3-r10 plus regCS0-regCS5 (r14-r19); regCS6-9 hold
+    // metadataTable/jitData/numberTag/notCellMask. Complex inline caches need
+    // more than the 8 volatiles.
+    static constexpr unsigned numberOfRegisters = 14;
+    static constexpr unsigned numberOfArgumentRegisters = NUMBER_OF_ARGUMENT_REGISTERS;
+
+    static constexpr GPRReg callFrameRegister    = PPC64Registers::fp;       // r31
+    static constexpr GPRReg numberTagRegister    = PPC64Registers::r22;      // csr8
+    static constexpr GPRReg notCellMaskRegister  = PPC64Registers::r23;      // csr9
+    static constexpr GPRReg jitDataRegister      = PPC64Registers::r21;      // csr7
+    static constexpr GPRReg wasmIPIntPCRegister  = PPC64Registers::r21;      // csr7
+    static constexpr GPRReg metadataTableRegister = PPC64Registers::r20;     // csr6
+
+    // Volatile GP temporaries — ELFv2 argument registers r3-r10.
+    static constexpr GPRReg regT0 = PPC64Registers::r3;
+    static constexpr GPRReg regT1 = PPC64Registers::r4;
+    static constexpr GPRReg regT2 = PPC64Registers::r5;
+    static constexpr GPRReg regT3 = PPC64Registers::r6;
+    static constexpr GPRReg regT4 = PPC64Registers::r7;
+    static constexpr GPRReg regT5 = PPC64Registers::r8;
+    static constexpr GPRReg regT6 = PPC64Registers::r9;
+    static constexpr GPRReg regT7 = PPC64Registers::r10;
+
+    // Callee-saved GP registers.
+    static constexpr GPRReg regCS0 = PPC64Registers::r14; // WasmInstance
+    static constexpr GPRReg regCS1 = PPC64Registers::r15;
+    static constexpr GPRReg regCS2 = PPC64Registers::r16;
+    static constexpr GPRReg regCS3 = PPC64Registers::r17; // WasmBaseMemory
+    static constexpr GPRReg regCS4 = PPC64Registers::r18; // WasmBoundsCheckingSize
+    static constexpr GPRReg regCS5 = PPC64Registers::r19;
+    static constexpr GPRReg regCS6 = PPC64Registers::r20; // metadataTable in LLInt/Baseline / IPIntMC
+    static constexpr GPRReg regCS7 = PPC64Registers::r21; // jitData / IPIntPC
+    static constexpr GPRReg regCS8 = PPC64Registers::r22; // numberTag
+    static constexpr GPRReg regCS9 = PPC64Registers::r23; // notCellMask
+
+    static constexpr GPRReg argumentGPR0 = PPC64Registers::r3;  // regT0
+    static constexpr GPRReg argumentGPR1 = PPC64Registers::r4;  // regT1
+    static constexpr GPRReg argumentGPR2 = PPC64Registers::r5;  // regT2
+    static constexpr GPRReg argumentGPR3 = PPC64Registers::r6;  // regT3
+    static constexpr GPRReg argumentGPR4 = PPC64Registers::r7;  // regT4
+    static constexpr GPRReg argumentGPR5 = PPC64Registers::r8;  // regT5
+    static constexpr GPRReg argumentGPR6 = PPC64Registers::r9;  // regT6
+    static constexpr GPRReg argumentGPR7 = PPC64Registers::r10; // regT7
+
+    // ELFv2's only volatile non-argument GPRs are r11/r12, which are the
+    // MacroAssembler's dataTempRegister and memoryTempRegister and so cannot
+    // hold a value across MacroAssembler operations. Use r29/r30: ELFv2
+    // callee-saved, but scratch to JSC. The LLInt and IPInt use them as
+    // temporaries, they are not VM callee-saves, pushCalleeSaves saves them at
+    // C-to-VM entry, and Air never allocates them (AirCode.cpp), so
+    // CCallSpecial and FTL patchpoints may use them without declaring a clobber.
+    //
+    // These are JIT-side names only; offlineasm's ws0/ws1 stay r11/r12.
+    static constexpr GPRReg nonArgGPR0 = PPC64Registers::r29;
+    static constexpr GPRReg nonArgGPR1 = PPC64Registers::r30;
+
+    static constexpr GPRReg returnValueGPR  = PPC64Registers::r3; // regT0
+    static constexpr GPRReg returnValueGPR2 = PPC64Registers::r4; // regT1
+
+    static constexpr GPRReg nonPreservedNonReturnGPR    = PPC64Registers::r5;  // regT2
+    static constexpr GPRReg nonPreservedNonArgumentGPR0 = PPC64Registers::r29;
+    static constexpr GPRReg nonPreservedNonArgumentGPR1 = PPC64Registers::r30;
+
+    // StaticScratchRegisterAllocator requires handlerGPR to be allocatable.
+    static constexpr GPRReg handlerGPR = PPC64Registers::r10;
+
+    static constexpr GPRReg wasmScratchGPR0 = PPC64Registers::r29;
+    static constexpr GPRReg wasmScratchGPR1 = PPC64Registers::r30;
+    static constexpr GPRReg wasmContextInstancePointer    = regCS0;
+    static constexpr GPRReg wasmBaseMemoryPointer         = regCS3;
+    static constexpr GPRReg wasmBoundsCheckingSizeRegister = regCS4;
+
+    static constexpr GPRReg regWS0 = PPC64Registers::r29;
+    static constexpr GPRReg regWS1 = PPC64Registers::r30;
+    static constexpr GPRReg regWA0 = PPC64Registers::r3;
+    static constexpr GPRReg regWA1 = PPC64Registers::r4;
+    static constexpr GPRReg regWA2 = PPC64Registers::r5;
+    static constexpr GPRReg regWA3 = PPC64Registers::r6;
+    static constexpr GPRReg regWA4 = PPC64Registers::r7;
+    static constexpr GPRReg regWA5 = PPC64Registers::r8;
+    static constexpr GPRReg regWA6 = PPC64Registers::r9;
+    static constexpr GPRReg regWA7 = PPC64Registers::r10;
+
+    static constexpr GPRReg patchpointScratchRegister = PPC64Registers::r11; // dataTempRegister
+
+    static constexpr GPRReg toRegister(unsigned index)
+    {
+        ASSERT_UNDER_CONSTEXPR_CONTEXT(index < numberOfRegisters);
+        constexpr GPRReg registerForIndex[numberOfRegisters] = {
+            regT0, regT1, regT2, regT3, regT4, regT5, regT6, regT7,
+            // Callee-saved temps last so the allocator prefers volatiles.
+            regCS0, regCS1, regCS2, regCS3, regCS4, regCS5,
+        };
+        return registerForIndex[index];
+    }
+
+    static constexpr GPRReg toArgumentRegister(unsigned index)
+    {
+        ASSERT_UNDER_CONSTEXPR_CONTEXT(index < numberOfArgumentRegisters);
+        constexpr GPRReg registerForIndex[numberOfArgumentRegisters] = {
+            argumentGPR0, argumentGPR1, argumentGPR2, argumentGPR3,
+            argumentGPR4, argumentGPR5, argumentGPR6, argumentGPR7,
+        };
+        return registerForIndex[index];
+    }
+
+    static unsigned toIndex(GPRReg reg)
+    {
+        ASSERT(reg != InvalidGPRReg);
+        ASSERT(static_cast<int>(reg) < 32);
+        static const unsigned indexForRegister[32] = {
+            // r0-r7
+            InvalidIndex, InvalidIndex, InvalidIndex, 0, 1, 2, 3, 4,
+            // r8-r15: r8-r10 are regT5-7; r11/r12 excluded (assembler scratch);
+            // r13 reserved (thread ptr); r14/r15 = regCS0/regCS1 pool indices 8/9.
+            5, 6, 7, InvalidIndex, InvalidIndex, InvalidIndex, 8, 9,
+            // r16-r23: r16-r19 = regCS2-regCS5 pool indices 10-13; r20-r23 reserved.
+            10, 11, 12, 13, InvalidIndex, InvalidIndex, InvalidIndex, InvalidIndex,
+            // r24-r31: callee-saves / cfr
+            InvalidIndex, InvalidIndex, InvalidIndex, InvalidIndex, InvalidIndex, InvalidIndex, InvalidIndex, InvalidIndex,
+        };
+        return indexForRegister[reg];
+    }
+
+    static unsigned toArgumentIndex(GPRReg reg)
+    {
+        ASSERT(reg != InvalidGPRReg);
+        ASSERT(static_cast<int>(reg) < 32);
+        if (reg < argumentGPR0 || reg > argumentGPR7)
+            return InvalidIndex;
+        return static_cast<unsigned>(reg) - static_cast<unsigned>(PPC64Registers::r3);
+    }
+
+    static ASCIILiteral debugName(GPRReg reg)
+    {
+        ASSERT(reg != InvalidGPRReg);
+        return MacroAssembler::gprName(reg);
+    }
+
+    static constexpr unsigned InvalidIndex = 0xffffffff;
+};
+
+#endif // CPU(PPC64)
+
 // To make some code generic over both JSVALUE64 and JSVALUE32_64 platforms, we use standard names
 // for certain JSValueRegs instances. On JSVALUE64, a JSValueRegs corresponds to a single 64-bit
 // architectural GPR, while on JSVALUE32_64, a JSValueRegs corresponds to a pair of 32-bit

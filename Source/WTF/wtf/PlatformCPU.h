@@ -61,24 +61,20 @@
 #define WTF_CPU_KNOWN 1
 #endif
 
-/* CPU(PPC64) - PowerPC 64-bit Big Endian */
-#if (  defined(__ppc64__)      \
-    || defined(__PPC64__))     \
-    && defined(__BYTE_ORDER__) \
-    && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+/* CPU(PPC64) - PowerPC 64-bit, either byte order */
+#if defined(__ppc64__)       \
+    || defined(__PPC64__)    \
+    || defined(__ppc64le__)  \
+    || defined(__PPC64LE__)
 #define WTF_CPU_PPC64 1
 #define WTF_CPU_KNOWN 1
 #endif
 
 /* CPU(PPC64LE) - PowerPC 64-bit Little Endian */
-#if (   defined(__ppc64__)     \
-    || defined(__PPC64__)      \
-    || defined(__ppc64le__)    \
-    || defined(__PPC64LE__))   \
+#if CPU(PPC64)                 \
     && defined(__BYTE_ORDER__) \
     && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
 #define WTF_CPU_PPC64LE 1
-#define WTF_CPU_KNOWN 1
 #endif
 
 /* CPU(PPC) - PowerPC 32-bit */

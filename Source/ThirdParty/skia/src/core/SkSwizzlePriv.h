@@ -58,4 +58,23 @@ static inline uint32_t Sk4f_toL32(const skvx::float4& px) {
                        .store(&l32);
     return l32;
 }
+
+// Sk4f_fromL32 and Sk4f_toL32 work on a pixel's bytes in memory order. A packed color value
+// (SkColor, SkPMColor) keeps channel 0 in its low-order byte, which is the last byte in memory on
+// big-endian, so these variants convert by value.
+static inline skvx::float4 Sk4f_fromColorValue(uint32_t value) {
+#ifdef SK_CPU_BENDIAN
+    return skvx::shuffle<3, 2, 1, 0>(Sk4f_fromL32(value));
+#else
+    return Sk4f_fromL32(value);
+#endif
+}
+
+static inline uint32_t Sk4f_toColorValue(const skvx::float4& px) {
+#ifdef SK_CPU_BENDIAN
+    return Sk4f_toL32(skvx::shuffle<3, 2, 1, 0>(px));
+#else
+    return Sk4f_toL32(px);
+#endif
+}
 #endif  // SkSwizzlePriv_DEFINED

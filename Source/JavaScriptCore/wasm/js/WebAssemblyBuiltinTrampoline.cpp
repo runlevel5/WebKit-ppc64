@@ -55,6 +55,9 @@ Expected<MacroAssemblerCodeRef<WasmEntryPtrTag>, BindingFailure> generateWasmBui
 
     JIT jit;
     jit.emitFunctionPrologue();
+    // sp == cfr after the prologue, and an ELFv2 C call saves LR/TOC at sp + 16/24,
+    // the frame's CodeBlock and Callee slots. The epilogue restores sp from cfr.
+    jit.makeSpaceOnStackForCCall();
 
     // IPInt stores the callee and wasmInstance into the frame but JIT tiers don't, so we must do that here.
     jit.move(GPRInfo::wasmContextInstancePointer, scratch);

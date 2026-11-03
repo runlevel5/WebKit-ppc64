@@ -63,6 +63,7 @@
 #include "JSObject.h"
 #include "JSWebAssemblyArray.h"
 #include "JSWebAssemblyArrayInlines.h"
+#include "JSWebAssemblyInstance.h"
 #include "JSWebAssemblyStruct.h"
 #include "LinkBuffer.h"
 #include "MarkedSpace.h"
@@ -81,6 +82,16 @@ WTF_ALLOW_UNSAFE_BUFFER_USAGE_BEGIN
 namespace JSC { namespace B3 {
 
 namespace {
+
+// POWER9 (Power ISA 3.0) has integer remainder and JS-style min/max instructions.
+static bool ppc64HasISA3_00()
+{
+#if CPU(PPC64)
+    return MacroAssembler::supportsISA3_00();
+#else
+    return false;
+#endif
+}
 
 class LowerMacros {
 public:
@@ -129,6 +140,7 @@ private:
             switch (m_value->opcode()) {
             case Mod: {
                 if (m_value->isChill()) {
+                    // Only ARM64 has a native chill Div to build on; see makeDivisionChill().
                     if (isARM64()) {
                         BasicBlock* before = m_blockInsertionSet.splitForward(m_block, m_index, &m_insertionSet);
                         BasicBlock* zeroDenCase = m_blockInsertionSet.insertBefore(m_block);
@@ -289,8 +301,14 @@ private:
                     break;
                 }
 
-                if (isARM64()) {
-                    Value* divResult = m_insertionSet.insert<Value>(m_index, chill(Div), m_origin, m_value->child(0), m_value->child(1));
+                // POWER9's modsw/modsd lower a non-chill Mod directly.
+                if (ppc64HasISA3_00())
+                    break;
+                if (isARM64() || isPPC64()) {
+                    // A non-chill Mod makes no promise for x%0 or INT_MIN%-1, so a plain Div is
+                    // enough. Only ARM64 lowers a chill Div natively.
+                    Kind divKind = isARM64() ? chill(Div) : Kind(Div);
+                    Value* divResult = m_insertionSet.insert<Value>(m_index, divKind, m_origin, m_value->child(0), m_value->child(1));
                     Value* multipliedBack = m_insertionSet.insert<Value>(m_index, Mul, m_origin, divResult, m_value->child(1));
                     Value* result = m_insertionSet.insert<Value>(m_index, Sub, m_origin, m_value->child(0), multipliedBack);
                     m_value->replaceWithIdentity(result);
@@ -308,7 +326,9 @@ private:
                         replaceWithBinaryCall(Math::i32_rem_u);
                     break;
                 }
-                if (isARM64()) {
+                if (ppc64HasISA3_00())
+                    break;
+                if (isARM64() || isPPC64()) {
                     Value* divResult = m_insertionSet.insert<Value>(m_index, UDiv, m_origin, m_value->child(0), m_value->child(1));
                     Value* multipliedBack = m_insertionSet.insert<Value>(m_index, Mul, m_origin, divResult, m_value->child(1));
                     Value* result = m_insertionSet.insert<Value>(m_index, Sub, m_origin, m_value->child(0), multipliedBack);
@@ -329,7 +349,10 @@ private:
             }
             case FMax:
             case FMin: {
-                if (isX86() || isARM_THUMB2()) {
+                // POWER9's xsmaxjdp/xsminjdp return a signalling NaN operand unquieted. JS
+                // never sees one, but wasm requires min/max to return an arithmetic NaN.
+                bool expandForPPC64 = isPPC64() && (m_proc.isWasm() || !ppc64HasISA3_00());
+                if (isX86() || isARM_THUMB2() || expandForPPC64) {
                     bool isMax = m_value->opcode() == FMax;
 
                     Value* a = m_value->child(0);
@@ -1093,7 +1116,9 @@ private:
     {
         ASSERT(nonChillOpcode == Div || nonChillOpcode == Mod);
 
-        // ARM supports this instruction natively.
+        // ARM supports this instruction natively: sdiv gives 0 for x/0 and INT_MIN for INT_MIN/-1.
+        // PPC64's divw/divd do not trap, but their result is undefined for both, so PPC64 needs
+        // the explicit checks below just like x86.
         if (isARM64())
             return;
 
@@ -1138,7 +1163,13 @@ private:
         Value* innerResult;
         if (isARM_THUMB2() && (m_value->type() == Int64 || m_value->type() == Int32))
             innerResult = callDivModHelper(normalDivCase, nonChillOpcode, num, den);
-        else
+        else if (isPPC64() && nonChillOpcode == Mod && !ppc64HasISA3_00()) {
+            // POWER8 has no integer remainder instruction. Here den is neither 0 nor -1 paired
+            // with INT_MIN, so the plain Div is well defined and num - (num / den) * den is exact.
+            Value* quotient = normalDivCase->appendNew<Value>(m_proc, Div, m_origin, num, den);
+            Value* multipliedBack = normalDivCase->appendNew<Value>(m_proc, Mul, m_origin, quotient, den);
+            innerResult = normalDivCase->appendNew<Value>(m_proc, Sub, m_origin, num, multipliedBack);
+        } else
             innerResult = normalDivCase->appendNew<Value>(m_proc, nonChillOpcode, m_origin, num, den);
         UpsilonValue* normalResult = normalDivCase->appendNew<UpsilonValue>(
             m_proc, m_origin,
@@ -1715,6 +1746,13 @@ private:
     UpsilonValue* emitWasmGCSlowPath(BasicBlock* slowPathBlock, BasicBlock* mergeBlock, Value* instance, uint32_t typeIndex,
         SlowFunctionType slowFunction, Wasm::ExceptionType exnType, Value* extraArg = nullptr)
     {
+#if !USE(BUILTIN_FRAME_ADDRESS) || ASSERT_ENABLED
+        // Wasm operations find their caller's frame through the instance (DECLARE_WASM_CALL_FRAME), so
+        // store it as OMG's callWasmOperation does.
+        slowPathBlock->appendNew<MemoryValue>(m_proc, Store, m_origin,
+            slowPathBlock->appendNew<Value>(m_proc, FramePointer, m_origin), instance,
+            safeCast<int32_t>(JSWebAssemblyInstance::offsetOfTemporaryCallFrame()));
+#endif
         Value* slowFunctionAddress = slowPathBlock->appendNew<ConstPtrValue>(m_proc, m_origin, slowFunction);
         Value* typeIndexValue = slowPathBlock->appendNew<Const32Value>(m_proc, m_origin, typeIndex);
         Value* slowResult;

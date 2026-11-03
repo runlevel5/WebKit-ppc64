@@ -147,7 +147,7 @@ static void marshallJSResult(CCallHelpers& jit, const RTT& signature, const Call
                     switch (type.kind) {
                     case TypeKind::F32:
                         tmp = ValueLocation { fprScratch };
-                        jit.loadFloat(readLocation, fprScratch);
+                        jit.loadFloat(readLocation.withOffset(PayloadOffset), fprScratch);
                         break;
                     case TypeKind::F64:
                         tmp = ValueLocation { fprScratch };
@@ -155,7 +155,7 @@ static void marshallJSResult(CCallHelpers& jit, const RTT& signature, const Call
                         break;
                     case TypeKind::I32:
                         tmp = ValueLocation { scratchJSR };
-                        jit.load32(readLocation, scratchJSR.payloadGPR());
+                        jit.load32(readLocation.withOffset(PayloadOffset), scratchJSR.payloadGPR());
                         break;
                     default:
                         tmp = ValueLocation { scratchJSR };
@@ -291,7 +291,13 @@ MacroAssemblerCodeRef<JITThunkPtrTag> createJSToWasmJITShared()
 
         // Prepare frame
         jit.setupArguments<decltype(operationJSToWasmEntryWrapperBuildFrame)>(GPRInfo::argumentGPR0, GPRInfo::callFrameRegister, GPRInfo::regWS0);
+        // The operation fills the argument buffer at sp, where an ELFv2 C call's
+        // linkage area would be, so give the call its own area below the buffer.
+        if constexpr (!!maxFrameExtentForSlowPathCall)
+            jit.subPtr(CCallHelpers::TrustedImm32(maxFrameExtentForSlowPathCall), CCallHelpers::stackPointerRegister);
         jit.callOperation<OperationPtrTag>(operationJSToWasmEntryWrapperBuildFrame);
+        if constexpr (!!maxFrameExtentForSlowPathCall)
+            jit.addPtr(CCallHelpers::TrustedImm32(maxFrameExtentForSlowPathCall), CCallHelpers::stackPointerRegister);
 
         // Restore Callee slot regardless
 #if USE(JSVALUE64)
@@ -324,6 +330,16 @@ MacroAssemblerCodeRef<JITThunkPtrTag> createJSToWasmJITShared()
         jit.loadPair64(CCallHelpers::Address(CCallHelpers::stackPointerRegister, 0 * 8), GPRInfo::regWA0, GPRInfo::regWA1);
         jit.loadPair64(CCallHelpers::Address(CCallHelpers::stackPointerRegister, 2 * 8), GPRInfo::regWA2, GPRInfo::regWA3);
         jit.loadPair64(CCallHelpers::Address(CCallHelpers::stackPointerRegister, 4 * 8), GPRInfo::regWA4, GPRInfo::regWA5);
+#elif CPU(PPC64)
+        // ELFv2 passes 8 arguments in r3-r10; the generic path below restores only 6.
+        jit.load64(CCallHelpers::Address(CCallHelpers::stackPointerRegister, 0 * 8), GPRInfo::regWA0);
+        jit.load64(CCallHelpers::Address(CCallHelpers::stackPointerRegister, 1 * 8), GPRInfo::regWA1);
+        jit.load64(CCallHelpers::Address(CCallHelpers::stackPointerRegister, 2 * 8), GPRInfo::regWA2);
+        jit.load64(CCallHelpers::Address(CCallHelpers::stackPointerRegister, 3 * 8), GPRInfo::regWA3);
+        jit.load64(CCallHelpers::Address(CCallHelpers::stackPointerRegister, 4 * 8), GPRInfo::regWA4);
+        jit.load64(CCallHelpers::Address(CCallHelpers::stackPointerRegister, 5 * 8), GPRInfo::regWA5);
+        jit.load64(CCallHelpers::Address(CCallHelpers::stackPointerRegister, 6 * 8), GPRInfo::regWA6);
+        jit.load64(CCallHelpers::Address(CCallHelpers::stackPointerRegister, 7 * 8), GPRInfo::regWA7);
 #elif USE(JSVALUE64)
         jit.load64(CCallHelpers::Address(CCallHelpers::stackPointerRegister, 0 * 8), GPRInfo::regWA0);
         jit.load64(CCallHelpers::Address(CCallHelpers::stackPointerRegister, 1 * 8), GPRInfo::regWA1);
@@ -341,7 +357,7 @@ MacroAssemblerCodeRef<JITThunkPtrTag> createJSToWasmJITShared()
         jit.loadPairDouble(CCallHelpers::Address(CCallHelpers::stackPointerRegister, (GPRInfo::numberOfArgumentRegisters + 2) * 8), FPRInfo::argumentFPR2, FPRInfo::argumentFPR3);
         jit.loadPairDouble(CCallHelpers::Address(CCallHelpers::stackPointerRegister, (GPRInfo::numberOfArgumentRegisters + 4) * 8), FPRInfo::argumentFPR4, FPRInfo::argumentFPR5);
         jit.loadPairDouble(CCallHelpers::Address(CCallHelpers::stackPointerRegister, (GPRInfo::numberOfArgumentRegisters + 6) * 8), FPRInfo::argumentFPR6, FPRInfo::argumentFPR7);
-#elif CPU(X86_64) || CPU(RISCV64)
+#elif CPU(X86_64) || CPU(RISCV64) || CPU(PPC64)
         jit.loadDouble(CCallHelpers::Address(CCallHelpers::stackPointerRegister, (GPRInfo::numberOfArgumentRegisters + 0) * 8), FPRInfo::argumentFPR0);
         jit.loadDouble(CCallHelpers::Address(CCallHelpers::stackPointerRegister, (GPRInfo::numberOfArgumentRegisters + 1) * 8), FPRInfo::argumentFPR1);
         jit.loadDouble(CCallHelpers::Address(CCallHelpers::stackPointerRegister, (GPRInfo::numberOfArgumentRegisters + 2) * 8), FPRInfo::argumentFPR2);
@@ -410,6 +426,15 @@ MacroAssemblerCodeRef<JITThunkPtrTag> createJSToWasmJITShared()
         jit.storePair64(GPRInfo::regWA0, GPRInfo::regWA1, CCallHelpers::Address(CCallHelpers::stackPointerRegister, 0 * 8));
         jit.storePair64(GPRInfo::regWA2, GPRInfo::regWA3, CCallHelpers::Address(CCallHelpers::stackPointerRegister, 2 * 8));
         jit.storePair64(GPRInfo::regWA4, GPRInfo::regWA5, CCallHelpers::Address(CCallHelpers::stackPointerRegister, 4 * 8));
+#elif CPU(PPC64)
+        jit.store64(GPRInfo::regWA0, CCallHelpers::Address(CCallHelpers::stackPointerRegister, 0 * 8));
+        jit.store64(GPRInfo::regWA1, CCallHelpers::Address(CCallHelpers::stackPointerRegister, 1 * 8));
+        jit.store64(GPRInfo::regWA2, CCallHelpers::Address(CCallHelpers::stackPointerRegister, 2 * 8));
+        jit.store64(GPRInfo::regWA3, CCallHelpers::Address(CCallHelpers::stackPointerRegister, 3 * 8));
+        jit.store64(GPRInfo::regWA4, CCallHelpers::Address(CCallHelpers::stackPointerRegister, 4 * 8));
+        jit.store64(GPRInfo::regWA5, CCallHelpers::Address(CCallHelpers::stackPointerRegister, 5 * 8));
+        jit.store64(GPRInfo::regWA6, CCallHelpers::Address(CCallHelpers::stackPointerRegister, 6 * 8));
+        jit.store64(GPRInfo::regWA7, CCallHelpers::Address(CCallHelpers::stackPointerRegister, 7 * 8));
 #elif USE(JSVALUE64)
         jit.store64(GPRInfo::regWA0, CCallHelpers::Address(CCallHelpers::stackPointerRegister, 0 * 8));
         jit.store64(GPRInfo::regWA1, CCallHelpers::Address(CCallHelpers::stackPointerRegister, 1 * 8));
@@ -426,7 +451,7 @@ MacroAssemblerCodeRef<JITThunkPtrTag> createJSToWasmJITShared()
         jit.storePairDouble(FPRInfo::argumentFPR2, FPRInfo::argumentFPR3, CCallHelpers::Address(CCallHelpers::stackPointerRegister, (GPRInfo::numberOfArgumentRegisters +  2) * 8));
         jit.storePairDouble(FPRInfo::argumentFPR4, FPRInfo::argumentFPR5, CCallHelpers::Address(CCallHelpers::stackPointerRegister, (GPRInfo::numberOfArgumentRegisters +  4) * 8));
         jit.storePairDouble(FPRInfo::argumentFPR6, FPRInfo::argumentFPR7, CCallHelpers::Address(CCallHelpers::stackPointerRegister, (GPRInfo::numberOfArgumentRegisters +  6) * 8));
-#elif CPU(X86_64) || CPU(RISCV64)
+#elif CPU(X86_64) || CPU(RISCV64) || CPU(PPC64)
         jit.storeDouble(FPRInfo::argumentFPR0, CCallHelpers::Address(CCallHelpers::stackPointerRegister, (GPRInfo::numberOfArgumentRegisters +  0) * 8));
         jit.storeDouble(FPRInfo::argumentFPR1, CCallHelpers::Address(CCallHelpers::stackPointerRegister, (GPRInfo::numberOfArgumentRegisters +  1) * 8));
         jit.storeDouble(FPRInfo::argumentFPR2, CCallHelpers::Address(CCallHelpers::stackPointerRegister, (GPRInfo::numberOfArgumentRegisters +  2) * 8));
@@ -449,7 +474,13 @@ MacroAssemblerCodeRef<JITThunkPtrTag> createJSToWasmJITShared()
         // Prepare frame
         {
             jit.setupArguments<decltype(operationJSToWasmEntryWrapperBuildReturnFrame)>(CCallHelpers::stackPointerRegister, GPRInfo::callFrameRegister);
+            // As for operationJSToWasmEntryWrapperBuildFrame: keep the C call's
+            // linkage area off the saved results at sp.
+            if constexpr (!!maxFrameExtentForSlowPathCall)
+                jit.subPtr(CCallHelpers::TrustedImm32(maxFrameExtentForSlowPathCall), CCallHelpers::stackPointerRegister);
             jit.callOperation<OperationPtrTag>(operationJSToWasmEntryWrapperBuildReturnFrame);
+            if constexpr (!!maxFrameExtentForSlowPathCall)
+                jit.addPtr(CCallHelpers::TrustedImm32(maxFrameExtentForSlowPathCall), CCallHelpers::stackPointerRegister);
             using ResultType = typename FunctionTraits<decltype(operationJSToWasmEntryWrapperBuildReturnFrame)>::ResultType;
 #if USE(JSVALUE64)
             static_assert(CCallHelpers::operationExceptionRegister<ResultType>() != InvalidGPRReg, "We don't have a VM readily available so we rely on exception being returned");

@@ -30,7 +30,8 @@ macro saveIPIntRegisters()
     subp IPIntCalleeSaveSpaceStackAligned, sp
     if ARM64 or ARM64E
         storepairq MC, PC, -2 * SlotSize[cfr]
-    elsif X86_64 or RISCV64
+    elsif X86_64 or RISCV64 or PPC64
+        # PPC64 has no store-pair, so use the two-storep form.
         storep PC, -1 * SlotSize[cfr]
         storep MC, -2 * SlotSize[cfr]
     end
@@ -42,7 +43,8 @@ macro restoreIPIntRegisters()
     # to be observable within the same Wasm module.
     if ARM64 or ARM64E
         loadpairq -2 * SlotSize[cfr], MC, PC
-    elsif X86_64 or RISCV64
+    elsif X86_64 or RISCV64 or PPC64
+        # PPC64 has no load-pair, so use the two-loadp form.
         loadp -1 * SlotSize[cfr], PC
         loadp -2 * SlotSize[cfr], MC
     end
@@ -51,7 +53,7 @@ end
 
 # Dispatch target bases
 
-if ARM64 or ARM64E or X86_64
+if ARM64 or ARM64E or X86_64 or PPC64
 const ipint_dispatch_base = _ipint_unreachable
 end
 
@@ -59,6 +61,10 @@ if ARM64 or ARM64E
 const ipint_gc_dispatch_base = _ipint_struct_new
 const ipint_conversion_dispatch_base = _ipint_i32_trunc_sat_f32_s
 const ipint_simd_dispatch_base = _ipint_simd_v128_load_mem
+const ipint_atomic_dispatch_base = _ipint_memory_atomic_notify
+elsif PPC64
+const ipint_gc_dispatch_base = _ipint_struct_new
+const ipint_conversion_dispatch_base = _ipint_i32_trunc_sat_f32_s
 const ipint_atomic_dispatch_base = _ipint_memory_atomic_notify
 end
 
@@ -71,7 +77,7 @@ if ARM64 or ARM64E
     pcrtoaddr ipint_dispatch_base, t7
     addlshiftp t7, t0, (constexpr (WTF::fastLog2(JSC::IPInt::alignIPInt))), t0
     jmp t0
-elsif X86_64
+elsif X86_64 or PPC64
     pcrtoaddr ipint_dispatch_base, t1
     lshiftq (constexpr (WTF::fastLog2(JSC::IPInt::alignIPInt))), t0
     addq t1, t0
@@ -87,7 +93,7 @@ end
 macro pushQuad(reg)
     if ARM64 or ARM64E
         push reg, reg
-    elsif X86_64
+    elsif X86_64 or PPC64
         push reg, reg
     else
         break
@@ -102,7 +108,8 @@ macro popQuad(reg)
     # FIXME: emit post-increment in offlineasm
     if ARM64 or ARM64E
         loadqinc [sp], reg, V128ISize
-    elsif X86_64
+    elsif X86_64 or PPC64
+        # PPC64 has no load-with-post-increment for GPRs, so load then bump sp.
         loadq [sp], reg
         addq V128ISize, sp
     else
@@ -121,6 +128,10 @@ end
 # Typed push/pop to make code pretty
 
 macro pushInt32(reg)
+if PPC64
+    # ELFv2 returns an int32 sign-extended; the slot holds it zero-extended.
+    zxi2q reg, reg
+end
     pushQuad(reg)
 end
 
@@ -128,12 +139,31 @@ macro popInt32(reg)
     popQuad(reg)
 end
 
+# PPC64: an f32 in an FPR is held in DOUBLE format (lfs widens, stfs narrows),
+# so pushv/popv -- a raw 16-byte copy of the VSR -- would put the 8-byte double
+# image of the float in the slot, not its 4-byte IEEE single encoding.  Every
+# other reader of a stack slot or local expects the latter at offset 0, exactly
+# as x86 and arm64 leave it: global.get/set and local.get/set copy slots raw,
+# f32 loads/stores and the C++ slow paths read 4 bytes, i32.reinterpret_f32 is a
+# plain bit move.  So on PPC64 the f32 slot form is the single encoding at
+# offset 0, written with stfs and read with lfs; the other 12 bytes are don't-
+# care, as they are on x86/arm64 after a float pushv.
 macro pushFloat32(reg)
-    pushv reg
+    if PPC64
+        subp V128ISize, sp
+        storef reg, PayloadOffset[sp]
+    else
+        pushv reg
+    end
 end
 
 macro popFloat32(reg)
-    popv reg
+    if PPC64
+        loadf PayloadOffset[sp], reg
+        addp V128ISize, sp
+    else
+        popv reg
+    end
 end
 
 macro pushInt64(reg)
@@ -166,6 +196,99 @@ const argumINTDst = sc0
 const argumINTSrc = csr2
 const argumINTEnd = csr3
 const argumINTDsp = csr4
+
+# Wasm linear memory is little-endian whatever the host is.
+if BIG_ENDIAN
+    macro wasmLoadh(addr, dst)
+        loadhle addr, dst
+    end
+    macro wasmLoadhsi(addr, dst)
+        loadhsile addr, dst
+    end
+    macro wasmLoadhsq(addr, dst)
+        loadhsqle addr, dst
+    end
+    macro wasmLoadi(addr, dst)
+        loadile addr, dst
+    end
+    macro wasmLoadq(addr, dst)
+        loadqle addr, dst
+    end
+    macro wasmLoadf(addr, dst)
+        loadfle addr, dst
+    end
+    macro wasmLoadd(addr, dst)
+        loaddle addr, dst
+    end
+    macro wasmStoreh(src, addr)
+        storehle src, addr
+    end
+    macro wasmStorei(src, addr)
+        storeile src, addr
+    end
+    macro wasmStoreq(src, addr)
+        storeqle src, addr
+    end
+    macro wasmStoref(src, addr)
+        storefle src, addr
+    end
+    macro wasmStored(src, addr)
+        storedle src, addr
+    end
+    # Register values read from or written to wasm memory by the LL/SC loops.
+    macro wasmSwaph(reg)
+        bswaph reg
+    end
+    macro wasmSwapi(reg)
+        bswapi reg
+    end
+    macro wasmSwapq(reg)
+        bswapq reg
+    end
+else
+    macro wasmLoadh(addr, dst)
+        loadh addr, dst
+    end
+    macro wasmLoadhsi(addr, dst)
+        loadhsi addr, dst
+    end
+    macro wasmLoadhsq(addr, dst)
+        loadhsq addr, dst
+    end
+    macro wasmLoadi(addr, dst)
+        loadi addr, dst
+    end
+    macro wasmLoadq(addr, dst)
+        loadq addr, dst
+    end
+    macro wasmLoadf(addr, dst)
+        loadf addr, dst
+    end
+    macro wasmLoadd(addr, dst)
+        loadd addr, dst
+    end
+    macro wasmStoreh(src, addr)
+        storeh src, addr
+    end
+    macro wasmStorei(src, addr)
+        storei src, addr
+    end
+    macro wasmStoreq(src, addr)
+        storeq src, addr
+    end
+    macro wasmStoref(src, addr)
+        storef src, addr
+    end
+    macro wasmStored(src, addr)
+        stored src, addr
+    end
+    macro wasmSwaph(reg)
+    end
+    macro wasmSwapi(reg)
+    end
+    macro wasmSwapq(reg)
+    end
+end
 
 macro ipintEntry()
     const argumINTEndAsScratch = argumINTEnd
@@ -208,7 +331,7 @@ macro argumINTDispatch()
     addp 1, MC
     bbgteq argumINTTmp, (constexpr IPInt::ArgumINTBytecode::NumOpcodes), _ipint_argument_dispatch_err
     lshiftp (constexpr (WTF::fastLog2(JSC::IPInt::alignArgumInt))), argumINTTmp
-if ARM64 or ARM64E or X86_64
+if ARM64 or ARM64E or X86_64 or PPC64
     pcrtoaddr _argumINT_begin, argumINTDsp
     addp argumINTTmp, argumINTDsp
     jmp argumINTDsp
@@ -227,9 +350,11 @@ macro argumINTInitializeDefaultLocals()
 if ARM64 or ARM64E
     # offlineasm doesn't have xzr so emit it
     emit "stp x19, xzr, [x9]"
-elsif X86_64
+elsif X86_64 or PPC64
     storep argumINTTmp, [argumINTDst]
     storep 0, 8[argumINTDst]
+else
+    error
 end
     subp LocalSize, argumINTDst
 end
@@ -508,12 +633,23 @@ end
     jmp .ipint_end_ret
 end)
 
-if ARM64 or ARM64E
+if ARM64 or ARM64E or PPC64
+    # PPC64 follows ARM64 rather than X86_64 here.  X86_64 can park these in
+    # t6/t7 because on X86_64 only six GPRs carry arguments, so t6/t7 are plain
+    # scratch.  On PPC64 ELFv2 all eight of t0-t7 map to r3-r10, which are the
+    # argument registers -- and .ipint_call_common clobbers t0-t5 outright.
+    # sc0/sc1 (= ws0/ws1 = r11/r12) are volatile and untouched between the load
+    # after the prepare-call operation and the store into the callee frame, which
+    # is exactly the ARM64 lifetime.  Both are dead before mINT reuses sc1 as
+    # mintSS: the normal path stores them into the callee frame first, and the
+    # tail-call path pushes them at .ipint_tail_call_no_restore_frame first.
     const IPIntCallCallee = sc1
     const IPIntCallFunctionSlot = sc0
 elsif X86_64
     const IPIntCallCallee = t7
     const IPIntCallFunctionSlot = t6
+else
+    error
 end
 
 ipintOp(_call, macro()
@@ -986,7 +1122,7 @@ ipintOp(_i32_load_mem, macro()
     popMemoryIndex(t0)
     loadStoreMakePointerFast(1[PC], 2[PC], t0, 4, t1, t2, .ipint_i32_load_mem_slow_path)
     # load memory location
-    loadi [t0], t1
+    wasmLoadi([t0], t1)
     pushInt32(t1)
 
     advancePC(3)
@@ -999,7 +1135,7 @@ ipintOp(_i64_load_mem, macro()
     popMemoryIndex(t0)
     loadStoreMakePointerFast(1[PC], 2[PC], t0, 8, t1, t2, .ipint_i64_load_mem_slow_path)
     # load memory location
-    loadq [t0], t1
+    wasmLoadq([t0], t1)
     pushInt64(t1)
 
     advancePC(3)
@@ -1012,7 +1148,7 @@ ipintOp(_f32_load_mem, macro()
     popMemoryIndex(t0)
     loadStoreMakePointerFast(1[PC], 2[PC], t0, 4, t1, t2, .ipint_f32_load_mem_slow_path)
     # load memory location
-    loadf [t0], ft0
+    wasmLoadf([t0], ft0)
     pushFloat32(ft0)
 
     advancePC(3)
@@ -1025,7 +1161,7 @@ ipintOp(_f64_load_mem, macro()
     popMemoryIndex(t0)
     loadStoreMakePointerFast(1[PC], 2[PC], t0, 8, t1, t2, .ipint_f64_load_mem_slow_path)
     # load memory location
-    loadd [t0], ft0
+    wasmLoadd([t0], ft0)
     pushFloat64(ft0)
 
     advancePC(3)
@@ -1061,7 +1197,7 @@ ipintOp(_i32_load16s_mem, macro()
     # pop index
     popMemoryIndex(t0)
     loadStoreMakePointerFast(1[PC], 2[PC], t0, 2, t1, t2, .ipint_i32_load16s_mem_slow_path)
-    loadhsi [t0], t1
+    wasmLoadhsi([t0], t1)
     pushInt32(t1)
 
     advancePC(3)
@@ -1073,7 +1209,7 @@ ipintOp(_i32_load16u_mem, macro()
     # pop index
     popMemoryIndex(t0)
     loadStoreMakePointerFast(1[PC], 2[PC], t0, 2, t1, t2, .ipint_i32_load16u_mem_slow_path)
-    loadh [t0], t1
+    wasmLoadh([t0], t1)
     pushInt32(t1)
 
     advancePC(3)
@@ -1109,7 +1245,7 @@ ipintOp(_i64_load16s_mem, macro()
     # pop index
     popMemoryIndex(t0)
     loadStoreMakePointerFast(1[PC], 2[PC], t0, 2, t1, t2, .ipint_i64_load16s_mem_slow_path)
-    loadhsq [t0], t1
+    wasmLoadhsq([t0], t1)
     pushInt64(t1)
 
     advancePC(3)
@@ -1121,7 +1257,7 @@ ipintOp(_i64_load16u_mem, macro()
     # pop index
     popMemoryIndex(t0)
     loadStoreMakePointerFast(1[PC], 2[PC], t0, 2, t1, t2, .ipint_i64_load16u_mem_slow_path)
-    loadh [t0], t1
+    wasmLoadh([t0], t1)
     pushInt64(t1)
 
     advancePC(3)
@@ -1133,7 +1269,7 @@ ipintOp(_i64_load32s_mem, macro()
     # pop index
     popMemoryIndex(t0)
     loadStoreMakePointerFast(1[PC], 2[PC], t0, 4, t1, t2, .ipint_i64_load32s_mem_slow_path)
-    loadi [t0], t1
+    wasmLoadi([t0], t1)
     sxi2q t1, t1
     pushInt64(t1)
 
@@ -1146,7 +1282,7 @@ ipintOp(_i64_load32u_mem, macro()
     # pop index
     popMemoryIndex(t0)
     loadStoreMakePointerFast(1[PC], 2[PC], t0, 4, t1, t2, .ipint_i64_load32u_mem_slow_path)
-    loadi [t0], t1
+    wasmLoadi([t0], t1)
     pushInt64(t1)
 
     advancePC(3)
@@ -1160,7 +1296,7 @@ ipintOp(_i32_store_mem, macro()
     # pop index
     popMemoryIndex(t0)
     loadStoreMakePointerFast(1[PC], 2[PC], t0, 4, t1, t2, .ipint_i32_store_mem_slow_path)
-    storei t3, [t0]
+    wasmStorei(t3, [t0])
     advancePC(3)
     nextIPIntInstruction()
 end)
@@ -1172,7 +1308,7 @@ ipintOp(_i64_store_mem, macro()
     # pop index
     popMemoryIndex(t0)
     loadStoreMakePointerFast(1[PC], 2[PC], t0, 8, t1, t2, .ipint_i64_store_mem_slow_path)
-    storeq t3, [t0]
+    wasmStoreq(t3, [t0])
     advancePC(3)
     nextIPIntInstruction()
 end)
@@ -1184,7 +1320,7 @@ ipintOp(_f32_store_mem, macro()
     # pop index
     popMemoryIndex(t0)
     loadStoreMakePointerFast(1[PC], 2[PC], t0, 4, t1, t2, .ipint_f32_store_mem_slow_path)
-    storef ft0, [t0]
+    wasmStoref(ft0, [t0])
     advancePC(3)
     nextIPIntInstruction()
 end)
@@ -1196,7 +1332,7 @@ ipintOp(_f64_store_mem, macro()
     # pop index
     popMemoryIndex(t0)
     loadStoreMakePointerFast(1[PC], 2[PC], t0, 8, t1, t2, .ipint_f64_store_mem_slow_path)
-    stored ft0, [t0]
+    wasmStored(ft0, [t0])
     advancePC(3)
     nextIPIntInstruction()
 end)
@@ -1220,7 +1356,7 @@ ipintOp(_i32_store16_mem, macro()
     # pop index
     popMemoryIndex(t0)
     loadStoreMakePointerFast(1[PC], 2[PC], t0, 2, t1, t2, .ipint_i32_store16_mem_slow_path)
-    storeh t3, [t0]
+    wasmStoreh(t3, [t0])
     advancePC(3)
     nextIPIntInstruction()
 end)
@@ -1244,7 +1380,7 @@ ipintOp(_i64_store16_mem, macro()
     # pop index
     popMemoryIndex(t0)
     loadStoreMakePointerFast(1[PC], 2[PC], t0, 2, t1, t2, .ipint_i64_store16_mem_slow_path)
-    storeh t3, [t0]
+    wasmStoreh(t3, [t0])
     advancePC(3)
     nextIPIntInstruction()
 end)
@@ -1256,7 +1392,7 @@ ipintOp(_i64_store32_mem, macro()
     # pop index
     popMemoryIndex(t0)
     loadStoreMakePointerFast(1[PC], 2[PC], t0, 4, t1, t2, .ipint_i64_store32_mem_slow_path)
-    storei t3, [t0]
+    wasmStorei(t3, [t0])
     advancePC(3)
     nextIPIntInstruction()
 end)
@@ -1284,7 +1420,7 @@ ipintOp(_memory_grow, macro()
     loadb IPInt::MemoryGrowMetadata::memoryIndex[MC], a2
     advanceMC(constexpr (sizeof(IPInt::MemoryGrowMetadata)))
     operationCall(macro() cCall3(_ipint_extern_memory_grow) end)
-    pushInt32(r0)
+    pushQuad(r0)
     ipintReloadMemory(t2)
     advancePC(2)
     nextIPIntInstruction()
@@ -1321,7 +1457,7 @@ end)
 ipintOp(_f32_const, macro()
     # f32.const
     # Load pre-computed value from metadata
-    loadf 1[PC], ft0
+    wasmLoadf(1[PC], ft0)
     pushFloat32(ft0)
 
     advancePC(5)
@@ -1331,7 +1467,7 @@ end)
 ipintOp(_f64_const, macro()
     # f64.const
     # Load pre-computed value from metadata
-    loadd 1[PC], ft0
+    wasmLoadd(1[PC], ft0)
     pushFloat64(ft0)
 
     advancePC(9)
@@ -1774,7 +1910,7 @@ ipintOp(_i32_div_s, macro()
         # https://bugs.webkit.org/show_bug.cgi?id=203692
         cdqi
         idivi t1
-    elsif ARM64 or ARM64E or RISCV64
+    elsif ARM64 or ARM64E or RISCV64 or PPC64
         divis t1, t0
     else
         error
@@ -1793,7 +1929,7 @@ ipintOp(_i32_div_u, macro()
     if X86_64
         xori t2, t2
         udivi t1
-    elsif ARM64 or ARM64E or RISCV64
+    elsif ARM64 or ARM64E or RISCV64 or PPC64
         divi t1, t0
     else
         error
@@ -1828,6 +1964,17 @@ ipintOp(_i32_rem_s, macro()
         subi t0, t2, t2
     elsif RISCV64
         remis t0, t1, t2
+    elsif PPC64
+        # POWER8 has no integer remainder instruction (modsw and friends are
+        # ISA 3.0), so synthesize the remainder as t0 - (t0 / t1) * t1, the
+        # same shape ARM64 uses. Only the two-operand "dst = dst op src" form
+        # of divis is used here, since that is the unambiguous offlineasm
+        # convention (the three-operand div forms have different operand
+        # orders on ARM64 and RISCV64).
+        move t0, t2
+        divis t1, t2
+        muli t1, t2
+        subi t0, t2, t2
     else
         error
     end
@@ -1853,6 +2000,12 @@ ipintOp(_i32_rem_u, macro()
         subi t0, t2, t2
     elsif RISCV64
         remi t0, t1, t2
+    elsif PPC64
+        # No POWER8 modulo instruction; see i32.rem_s above.
+        move t0, t2
+        divi t1, t2
+        muli t1, t2
+        subi t0, t2, t2
     else
         error
     end
@@ -2031,7 +2184,7 @@ ipintOp(_i64_div_s, macro()
         # https://bugs.webkit.org/show_bug.cgi?id=203692
         cqoq
         idivq t1
-    elsif ARM64 or ARM64E or RISCV64
+    elsif ARM64 or ARM64E or RISCV64 or PPC64
         divqs t1, t0
     else
         error
@@ -2050,7 +2203,7 @@ ipintOp(_i64_div_u, macro()
     if X86_64
         xorq t2, t2
         udivq t1
-    elsif ARM64 or ARM64E or RISCV64
+    elsif ARM64 or ARM64E or RISCV64 or PPC64
         divq t1, t0
     else
         error
@@ -2085,6 +2238,12 @@ ipintOp(_i64_rem_s, macro()
         subq t0, t2, t2
     elsif RISCV64
         remqs t0, t1, t2
+    elsif PPC64
+        # No POWER8 modulo instruction; see i32.rem_s above.
+        move t0, t2
+        divqs t1, t2
+        mulq t1, t2
+        subq t0, t2, t2
     else
         error
     end
@@ -2110,6 +2269,12 @@ ipintOp(_i64_rem_u, macro()
         subq t0, t2, t2
     elsif RISCV64
         remq t0, t1, t2
+    elsif PPC64
+        # No POWER8 modulo instruction; see i32.rem_s above.
+        move t0, t2
+        divq t1, t2
+        mulq t1, t2
+        subq t0, t2, t2
     else
         error
     end
@@ -2622,6 +2787,16 @@ end)
 
 ipintOp(_i32_wrap_i64, macro()
     # because of how we store values on stack, do nothing
+    if PPC64
+        # ...except on PPC64, where every other i32 producer leaves the upper
+        # word zero and C callees rely on it: ELFv2 makes the caller extend a
+        # 32-bit argument to 64 bits, and the IPInt slow paths take i32 operands
+        # straight from the value stack (array.new's length, for one), so a
+        # leftover high word would hand them a huge length.
+        loadq [sp], t0
+        zxi2q t0, t0
+        storeq t0, [sp]
+    end
     advancePC(1)
     nextIPIntInstruction()
 end)
@@ -3080,10 +3255,12 @@ ipintOp(_gc_prefix, macro()
     if ARM64 or ARM64E
         addlshiftp t1, t0, (constexpr (WTF::fastLog2(JSC::IPInt::alignIPInt))), t0
         jmp t0
-    elsif X86_64
+    elsif X86_64 or PPC64
         lshiftq (constexpr (WTF::fastLog2(JSC::IPInt::alignIPInt))), t0
         addq t1, t0
         jmp t0
+    else
+        error
     end
 
 .ipint_gc_nonexistent:
@@ -3100,10 +3277,12 @@ ipintOp(_conversion_prefix, macro()
     if ARM64 or ARM64E
         addlshiftp t1, t0, (constexpr (WTF::fastLog2(JSC::IPInt::alignIPInt))), t0
         jmp t0
-    elsif X86_64
+    elsif X86_64 or PPC64
         lshiftq (constexpr (WTF::fastLog2(JSC::IPInt::alignIPInt))), t0
         addq t1, t0
         jmp t0
+    else
+        error
     end
 
 .ipint_conversion_nonexistent:
@@ -3124,6 +3303,12 @@ ipintOp(_simd_prefix, macro()
         lshiftq (constexpr (WTF::fastLog2(JSC::IPInt::alignIPInt))), t0
         addq t1, t0
         jmp t0
+    elsif PPC64
+        lshiftq (constexpr (WTF::fastLog2(JSC::IPInt::alignIPInt))), t0
+        addq t1, t0
+        jmp t0
+    else
+        error
     end
 
 .ipint_simd_nonexistent:
@@ -3140,10 +3325,12 @@ ipintOp(_atomic_prefix, macro()
     if ARM64 or ARM64E
         addlshiftp t1, t0, (constexpr (WTF::fastLog2(JSC::IPInt::alignAtomicIPInt))), t0
         jmp t0
-    elsif X86_64
+    elsif X86_64 or PPC64
         lshiftq (constexpr (WTF::fastLog2(JSC::IPInt::alignAtomicIPInt))), t0
         addq t1, t0
         jmp t0
+    else
+        error
     end
 
 .ipint_atomic_nonexistent:
@@ -3422,7 +3609,7 @@ ipintOp(_array_init_elem, macro()
 end)
 
 ipintOp(_ref_test, macro()
-    loadi IPInt::RefTestCastMetadata::toHeapType[MC], a1
+    loadis IPInt::RefTestCastMetadata::toHeapType[MC], a1  # int32_t parameter: sign-extend (ELFv2 requires it)
     move 0, a2  # allowNull
     popQuad(a3)
     operationCall(macro() cCall3(_ipint_extern_ref_test) end)
@@ -3436,7 +3623,7 @@ ipintOp(_ref_test, macro()
 end)
 
 ipintOp(_ref_test_nullable, macro()
-    loadi IPInt::RefTestCastMetadata::toHeapType[MC], a1
+    loadis IPInt::RefTestCastMetadata::toHeapType[MC], a1  # int32_t parameter: sign-extend (ELFv2 requires it)
     move 1, a2  # allowNull
     popQuad(a3)
     operationCall(macro() cCall3(_ipint_extern_ref_test) end)
@@ -3450,12 +3637,12 @@ ipintOp(_ref_test_nullable, macro()
 end)
 
 ipintOp(_ref_cast, macro()
-    loadi IPInt::RefTestCastMetadata::toHeapType[MC], a1
+    loadis IPInt::RefTestCastMetadata::toHeapType[MC], a1  # int32_t parameter: sign-extend (ELFv2 requires it)
     move 0, a2  # allowNull
     popQuad(a3)
     operationCallMayThrow(macro() cCall3(_ipint_extern_ref_cast) end)
 
-    pushInt32(r0)
+    pushQuad(r0)
 
     loadb IPInt::RefTestCastMetadata::length[MC], t0
     advancePCByReg(t0)
@@ -3464,12 +3651,12 @@ ipintOp(_ref_cast, macro()
 end)
 
 ipintOp(_ref_cast_nullable, macro()
-    loadi IPInt::RefTestCastMetadata::toHeapType[MC], a1
+    loadis IPInt::RefTestCastMetadata::toHeapType[MC], a1  # int32_t parameter: sign-extend (ELFv2 requires it)
     move 1, a2  # allowNull
     popQuad(a3)
     operationCallMayThrow(macro() cCall3(_ipint_extern_ref_cast) end)
 
-    pushInt32(r0)
+    pushQuad(r0)
 
     loadb IPInt::RefTestCastMetadata::length[MC], t0
     advancePCByReg(t0)
@@ -3479,7 +3666,7 @@ end)
 
 ipintOp(_br_on_cast, macro()
     validateOpcodeConfig(a1)
-    loadi IPInt::RefTestCastMetadata::toHeapType[MC], a1
+    loadis IPInt::RefTestCastMetadata::toHeapType[MC], a1  # int32_t parameter: sign-extend (ELFv2 requires it)
     loadb IPInt::RefTestCastMetadata::allowNull[MC], a2
     loadq [sp], a3
     operationCall(macro() cCall3(_ipint_extern_ref_test) end)
@@ -3495,7 +3682,7 @@ end)
 
 ipintOp(_br_on_cast_fail, macro()
     validateOpcodeConfig(a1)
-    loadi IPInt::RefTestCastMetadata::toHeapType[MC], a1
+    loadis IPInt::RefTestCastMetadata::toHeapType[MC], a1  # int32_t parameter: sign-extend (ELFv2 requires it)
     loadb IPInt::RefTestCastMetadata::allowNull[MC], a2
     loadq [sp], a3
     operationCall(macro() cCall3(_ipint_extern_ref_test) end)
@@ -3983,6 +4170,13 @@ ipintOp(_i64_add128, macro()
     elsif X86_64
         addq t2, t0        # resultLo = lhsLo + rhsLo, sets carry flag
         adcq t3, t1        # resultHi = lhsHi + rhsHi + carry flag
+    elsif PPC64
+        # The offlineasm backend has no carry ops, so emit them directly:
+        # t0..t3 are r3..r6. addc sets XER.CA, adde consumes it.
+        emit "addc 3, 3, 5"   # resultLo = lhsLo + rhsLo, CA = carry
+        emit "adde 4, 4, 6"   # resultHi = lhsHi + rhsHi + CA
+    else
+        error
     end
     pushQuad(t0)
     pushQuad(t1)
@@ -4003,6 +4197,12 @@ ipintOp(_i64_sub128, macro()
     elsif X86_64
         subq t2, t0        # resultLo = lhsLo - rhsLo, sets carry flag (borrow)
         sbcq t3, t1        # resultHi = lhsHi - rhsHi - carry flag
+    elsif PPC64
+        # subfc RT,RA,RB = RB - RA with CA = no borrow; subfe consumes it.
+        emit "subfc 3, 5, 3"  # resultLo = lhsLo - rhsLo
+        emit "subfe 4, 6, 4"  # resultHi = lhsHi - rhsHi - borrow
+    else
+        error
     end
     pushQuad(t0)
     pushQuad(t1)
@@ -4022,6 +4222,11 @@ ipintOp(_i64_mul_wide_s, macro()
         # t0 = rax
         # t2 = rdx
         smulhq t1          # imulq %rsi: rdx:rax = rax * rsi -> t0=resultLo, t2=resultHi
+    elsif PPC64
+        emit "mulhd 5, 3, 4"  # resultHi = smulh(lhs, rhs) (t2 = r5) - must precede mulld
+        emit "mulld 3, 3, 4"  # resultLo = lhs * rhs
+    else
+        error
     end
     pushQuad(t0)
     pushQuad(t2)
@@ -4041,6 +4246,11 @@ ipintOp(_i64_mul_wide_u, macro()
         # t0 = rax
         # t2 = rdx
         umulhq t1          # mulq %rsi: rdx:rax = rax * rsi -> t0=resultLo, t2=resultHi
+    elsif PPC64
+        emit "mulhdu 5, 3, 4" # resultHi = umulh(lhs, rhs) (t2 = r5) - must precede mulld
+        emit "mulld 3, 3, 4"  # resultLo = lhs * rhs
+    else
+        error
     end
     pushQuad(t0)
     pushQuad(t2)
@@ -4068,6 +4278,10 @@ macro simdLoad8x8s()
         emit "sxtl v16.8h, v0.8b"
     elsif X86_64
         emit "pmovsxbw (%rax), %xmm0"
+    elsif PPC64
+        emit "lxsdx 32, 0, 3"
+        emit "vupkhsb 0, 0"
+        emit "xxswapd 32, 32"
     else
         break
     end
@@ -4079,6 +4293,11 @@ macro simdLoad8x8u()
         emit "uxtl v16.8h, v0.8b"
     elsif X86_64
         emit "pmovzxbw (%rax), %xmm0"
+    elsif PPC64
+        emit "lxsdx 32, 0, 3"
+        emit "vxor 2, 2, 2"
+        emit "vmrghb 0, 2, 0"
+        emit "xxswapd 32, 32"
     else
         break
     end
@@ -4090,6 +4309,10 @@ macro simdLoad16x4s()
         emit "sxtl v16.4s, v0.4h"
     elsif X86_64
         emit "pmovsxwd (%rax), %xmm0"
+    elsif PPC64
+        emit "lxsdx 32, 0, 3"
+        emit "vupkhsh 0, 0"
+        emit "xxswapd 32, 32"
     else
         break
     end
@@ -4101,6 +4324,11 @@ macro simdLoad16x4u()
         emit "uxtl v16.4s, v0.4h"
     elsif X86_64
         emit "pmovzxwd (%rax), %xmm0"
+    elsif PPC64
+        emit "lxsdx 32, 0, 3"
+        emit "vxor 2, 2, 2"
+        emit "vmrghh 0, 2, 0"
+        emit "xxswapd 32, 32"
     else
         break
     end
@@ -4112,6 +4340,10 @@ macro simdLoad32x2s()
         emit "sxtl v16.2d, v0.2s"
     elsif X86_64
         emit "pmovsxdq (%rax), %xmm0"
+    elsif PPC64
+        emit "lxsdx 32, 0, 3"
+        emit "vupkhsw 0, 0"
+        emit "xxswapd 32, 32"
     else
         break
     end
@@ -4123,6 +4355,11 @@ macro simdLoad32x2u()
         emit "uxtl v16.2d, v0.2s"
     elsif X86_64
         emit "pmovzxdq (%rax), %xmm0"
+    elsif PPC64
+        emit "lxsdx 32, 0, 3"
+        emit "vxor 2, 2, 2"
+        emit "vmrghw 0, 2, 0"
+        emit "xxswapd 32, 32"
     else
         break
     end
@@ -4136,6 +4373,10 @@ macro simdLoadSplat8()
         emit "vpinsrb $0, (%rax), %xmm0, %xmm0"
         emit "vpxor %xmm1, %xmm1, %xmm1"
         emit "vpshufb %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        loadb [t0], t1
+        emit "mtvsrwz 32, 4"
+        emit "vspltb 0, 0, 7"
     else
         break
     end
@@ -4149,6 +4390,10 @@ macro simdLoadSplat16()
         emit "vpinsrw $0, (%rax), %xmm0, %xmm0"
         emit "vpshuflw $0, %xmm0, %xmm0"
         emit "vpunpcklqdq %xmm0, %xmm0, %xmm0"
+    elsif PPC64
+        loadh [t0], t1
+        emit "mtvsrwz 32, 4"
+        emit "vsplth 0, 0, 3"
     else
         break
     end
@@ -4160,6 +4405,9 @@ macro simdLoadSplat32()
         emit "dup v16.4s, w1"
     elsif X86_64
         emit "vbroadcastss (%rax), %xmm0"
+    elsif PPC64
+        emit "lxsiwzx 32, 0, 3"
+        emit "xxspltw 32, 32, 1"
     else
         break
     end
@@ -4171,14 +4419,35 @@ macro simdLoadSplat64()
         emit "dup v16.2d, x1"
     elsif X86_64
         emit "vmovddup (%rax), %xmm0"
+    elsif PPC64
+        emit "lxvdsx 32, 0, 3"
     else
         break
     end
 end
 
+# Every 0xFD-prefixed (SIMD) handler below is defined through ipintSIMDOp.
+#
+# PPC64 register and lane model (the same as MacroAssemblerPPC64's):
+# - A v128 on the IPInt stack is in memory order; pushv/popv/loadv/storev are
+#   stxvd2x/lxvd2x, so in a register doubleword 0 (ISA bits 0-63) holds bytes
+#   0-7 as a little-endian u64. Wasm lane i of an S-byte element is ISA element
+#   i ^ (8/S - 1) (bytes i^7, halfwords i^3, words i^1). The unpack/pack
+#   instructions see the two doublewords swapped, hence the xxswapds.
+# - offlineasm v0 = VSR32 (VMX 0), v1 = VSR33 (VMX 1), v2 = VSR46 (VMX 14),
+#   so VMX instructions name them as 0, 1 and 14 and VSX ones as 32, 33, 46.
+#   VMX 2-7 (VSR 34-39) are scratch inside a handler; offlineasm never names
+#   them and nothing is live there between handlers.
+# - t0 = r3, t1 = r4, ft0 = f1 (VSR1; an f32 there is in double format, so
+#   lane moves go through xscvdpspn/xscvspdpn as in the JIT).
+# Every instruction used is in the POWER8 baseline.
+macro ipintSIMDOp(name, impl)
+    ipintOp(name, impl)
+end
+
 # 0xFD 0x00 - 0xFD 0x0B: memory
 
-ipintOp(_simd_v128_load_mem, macro()
+ipintSIMDOp(_simd_v128_load_mem, macro()
     # v128.load
     popMemoryIndex(t0)
     loadStoreMakePointerFast([t4], 1[t4], t0, 16, t1, t2, .simd_v128_load_slow_path)
@@ -4188,7 +4457,7 @@ ipintOp(_simd_v128_load_mem, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_v128_load_8x8s_mem, macro()
+ipintSIMDOp(_simd_v128_load_8x8s_mem, macro()
     # v128.load8x8_s
     popMemoryIndex(t0)
     loadStoreMakePointerFast([t4], 1[t4], t0, 8, t1, t2, .simd_v128_load_8x8s_slow_path)
@@ -4198,7 +4467,7 @@ ipintOp(_simd_v128_load_8x8s_mem, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_v128_load_8x8u_mem, macro()
+ipintSIMDOp(_simd_v128_load_8x8u_mem, macro()
     # v128.load8x8_u
     popMemoryIndex(t0)
     loadStoreMakePointerFast([t4], 1[t4], t0, 8, t1, t2, .simd_v128_load_8x8u_slow_path)
@@ -4208,7 +4477,7 @@ ipintOp(_simd_v128_load_8x8u_mem, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_v128_load_16x4s_mem, macro()
+ipintSIMDOp(_simd_v128_load_16x4s_mem, macro()
     # v128.load16x4_s
     popMemoryIndex(t0)
     loadStoreMakePointerFast([t4], 1[t4], t0, 8, t1, t2, .simd_v128_load_16x4s_slow_path)
@@ -4218,7 +4487,7 @@ ipintOp(_simd_v128_load_16x4s_mem, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_v128_load_16x4u_mem, macro()
+ipintSIMDOp(_simd_v128_load_16x4u_mem, macro()
     # v128.load16x4_u
     popMemoryIndex(t0)
     loadStoreMakePointerFast([t4], 1[t4], t0, 8, t1, t2, .simd_v128_load_16x4u_slow_path)
@@ -4228,7 +4497,7 @@ ipintOp(_simd_v128_load_16x4u_mem, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_v128_load_32x2s_mem, macro()
+ipintSIMDOp(_simd_v128_load_32x2s_mem, macro()
     # v128.load32x2_s
     popMemoryIndex(t0)
     loadStoreMakePointerFast([t4], 1[t4], t0, 8, t1, t2, .simd_v128_load_32x2s_slow_path)
@@ -4238,7 +4507,7 @@ ipintOp(_simd_v128_load_32x2s_mem, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_v128_load_32x2u_mem, macro()
+ipintSIMDOp(_simd_v128_load_32x2u_mem, macro()
     # v128.load32x2_u
     popMemoryIndex(t0)
     loadStoreMakePointerFast([t4], 1[t4], t0, 8, t1, t2, .simd_v128_load_32x2u_slow_path)
@@ -4248,7 +4517,7 @@ ipintOp(_simd_v128_load_32x2u_mem, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_v128_load8_splat_mem, macro()
+ipintSIMDOp(_simd_v128_load8_splat_mem, macro()
     # v128.load8_splat
     popMemoryIndex(t0)
     loadStoreMakePointerFast([t4], 1[t4], t0, 1, t1, t2, .simd_v128_load8_splat_slow_path)
@@ -4258,7 +4527,7 @@ ipintOp(_simd_v128_load8_splat_mem, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_v128_load16_splat_mem, macro()
+ipintSIMDOp(_simd_v128_load16_splat_mem, macro()
     # v128.load16_splat
     popMemoryIndex(t0)
     loadStoreMakePointerFast([t4], 1[t4], t0, 2, t1, t2, .simd_v128_load16_splat_slow_path)
@@ -4268,7 +4537,7 @@ ipintOp(_simd_v128_load16_splat_mem, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_v128_load32_splat_mem, macro()
+ipintSIMDOp(_simd_v128_load32_splat_mem, macro()
     # v128.load32_splat
     popMemoryIndex(t0)
     loadStoreMakePointerFast([t4], 1[t4], t0, 4, t1, t2, .simd_v128_load32_splat_slow_path)
@@ -4278,7 +4547,7 @@ ipintOp(_simd_v128_load32_splat_mem, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_v128_load64_splat_mem, macro()
+ipintSIMDOp(_simd_v128_load64_splat_mem, macro()
     # v128.load64_splat
     popMemoryIndex(t0)
     loadStoreMakePointerFast([t4], 1[t4], t0, 8, t1, t2, .simd_v128_load64_splat_slow_path)
@@ -4288,7 +4557,7 @@ ipintOp(_simd_v128_load64_splat_mem, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_v128_store_mem, macro()
+ipintSIMDOp(_simd_v128_store_mem, macro()
     # v128.store
     popVec(v0)
     popMemoryIndex(t0)
@@ -4299,7 +4568,7 @@ ipintOp(_simd_v128_store_mem, macro()
 end)
 
 # 0xFD 0x0C: v128.const
-ipintOp(_simd_v128_const, macro()
+ipintSIMDOp(_simd_v128_const, macro()
     # v128.const
     loadv [t4], v0
     pushVec(v0)
@@ -4309,7 +4578,7 @@ end)
 
 # 0xFD 0x0D - 0xFD 0x14: splat (+ shuffle/swizzle)
 
-ipintOp(_simd_i8x16_shuffle, macro()
+ipintSIMDOp(_simd_i8x16_shuffle, macro()
     # i8x16.shuffle - shuffle bytes from two vectors using 16 immediate indices
     if ARM64 or ARM64E
         popVec(v1)
@@ -4360,7 +4629,7 @@ ipintOp(_simd_i8x16_shuffle, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i8x16_swizzle, macro()
+ipintSIMDOp(_simd_i8x16_swizzle, macro()
     # i8x16.swizzle - swizzle bytes from first vector using indices from second vector
     popVec(v1)
     popVec(v0)
@@ -4378,6 +4647,13 @@ ipintOp(_simd_i8x16_swizzle, macro()
         emit "vpunpcklqdq %xmm2, %xmm2, %xmm2"   # xmm2 = [0x70, 0x70, ..., 0x70] (16 bytes)
         emit "vpaddusb %xmm2, %xmm1, %xmm1"      # Saturating add to set bit 7 for indices > 15
         emit "vpshufb %xmm1, %xmm0, %xmm0"       # Now vpshufb will return 0 for out-of-bounds
+    elsif PPC64
+        emit "vspltisb 2, 7"
+        emit "vxor 3, 1, 2"
+        emit "vperm 3, 0, 0, 3"
+        emit "vspltisb 2, 15"
+        emit "vcmpgtub 4, 1, 2"
+        emit "vandc 0, 3, 4"
     else
         break # Not implemented
     end
@@ -4387,7 +4663,7 @@ ipintOp(_simd_i8x16_swizzle, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i8x16_splat, macro()
+ipintSIMDOp(_simd_i8x16_splat, macro()
     # i8x16.splat - splat i32 value to all 16 8-bit lanes
     popInt32(t0)
 
@@ -4399,6 +4675,9 @@ ipintOp(_simd_i8x16_splat, macro()
         emit "vpinsrb $1, %eax, %xmm0, %xmm0"
         emit "vpshuflw $0, %xmm0, %xmm0"
         emit "vpunpcklqdq %xmm0, %xmm0, %xmm0"
+    elsif PPC64
+        emit "mtvsrwz 32, 3"
+        emit "vspltb 0, 0, 7"
     else
         break # Not implemented
     end
@@ -4408,7 +4687,7 @@ ipintOp(_simd_i8x16_splat, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_splat, macro()
+ipintSIMDOp(_simd_i16x8_splat, macro()
     # i16x8.splat - splat i32 value to all 8 16-bit lanes
     popInt32(t0)
 
@@ -4419,6 +4698,9 @@ ipintOp(_simd_i16x8_splat, macro()
         emit "vmovd %eax, %xmm0"
         emit "vpshuflw $0, %xmm0, %xmm0"
         emit "vpunpcklqdq %xmm0, %xmm0, %xmm0"
+    elsif PPC64
+        emit "mtvsrwz 32, 3"
+        emit "vsplth 0, 0, 3"
     else
         break # Not implemented
     end
@@ -4428,7 +4710,7 @@ ipintOp(_simd_i16x8_splat, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_splat, macro()
+ipintSIMDOp(_simd_i32x4_splat, macro()
     # i32x4.splat - splat i32 value to all 4 32-bit lanes
     popInt32(t0)
 
@@ -4438,6 +4720,9 @@ ipintOp(_simd_i32x4_splat, macro()
         # t0 is eax on X86_64, move to xmm0 and broadcast to all 4 dwords
         emit "vmovd %eax, %xmm0"
         emit "vshufps $0, %xmm0, %xmm0, %xmm0"
+    elsif PPC64
+        emit "mtvsrwz 32, 3"
+        emit "xxspltw 32, 32, 1"
     else
         break # Not implemented
     end
@@ -4447,7 +4732,7 @@ ipintOp(_simd_i32x4_splat, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i64x2_splat, macro()
+ipintSIMDOp(_simd_i64x2_splat, macro()
     # i64x2.splat - splat i64 value to all 2 64-bit lanes
     popInt64(t0)
 
@@ -4457,6 +4742,9 @@ ipintOp(_simd_i64x2_splat, macro()
         # t0 is rax on X86_64
         emit "vmovq %rax, %xmm0"
         emit "vmovddup %xmm0, %xmm0"
+    elsif PPC64
+        emit "mtvsrd 32, 3"
+        emit "xxpermdi 32, 32, 32, 0"
     else
         break # Not implemented
     end
@@ -4466,7 +4754,7 @@ ipintOp(_simd_i64x2_splat, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f32x4_splat, macro()
+ipintSIMDOp(_simd_f32x4_splat, macro()
     # f32x4.splat - splat f32 value to all 4 32-bit float lanes
     popFloat32(ft0)
 
@@ -4475,6 +4763,9 @@ ipintOp(_simd_f32x4_splat, macro()
     elsif X86_64
         # ft0 is xmm0 on X86_64, broadcast to all 4 float lanes
         emit "vshufps $0x00, %xmm0, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xscvdpspn 32, 1"
+        emit "xxspltw 32, 32, 0"
     else
         break # Not implemented
     end
@@ -4484,7 +4775,7 @@ ipintOp(_simd_f32x4_splat, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f64x2_splat, macro()
+ipintSIMDOp(_simd_f64x2_splat, macro()
     # f64x2.splat - splat f64 value to all 2 64-bit float lanes
     popFloat64(ft0)
 
@@ -4493,6 +4784,8 @@ ipintOp(_simd_f64x2_splat, macro()
     elsif X86_64
         # ft0 is xmm0 on X86_64, duplicate lower 64-bit to both lanes
         emit "vmovddup %xmm0, %xmm0"
+    elsif PPC64
+        emit "xxpermdi 32, 1, 1, 0"
     else
         break # Not implemented
     end
@@ -4503,7 +4796,7 @@ ipintOp(_simd_f64x2_splat, macro()
 end)
 
 # 0xFD 0x15 - 0xFD 0x22: extract and replace lanes
-ipintOp(_simd_i8x16_extract_lane_s, macro()
+ipintSIMDOp(_simd_i8x16_extract_lane_s, macro()
     # i8x16.extract_lane_s (lane)
     loadb ImmLaneIdxOffset[t4], t0
     andi ImmLaneIdx16Mask, t0
@@ -4514,7 +4807,7 @@ ipintOp(_simd_i8x16_extract_lane_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i8x16_extract_lane_u, macro()
+ipintSIMDOp(_simd_i8x16_extract_lane_u, macro()
     # i8x16.extract_lane_u (lane)
     loadb ImmLaneIdxOffset[t4], t0
     andi ImmLaneIdx16Mask, t0
@@ -4525,7 +4818,7 @@ ipintOp(_simd_i8x16_extract_lane_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i8x16_replace_lane, macro()
+ipintSIMDOp(_simd_i8x16_replace_lane, macro()
     # i8x16.replace_lane (lane)
     loadb ImmLaneIdxOffset[t4], t0
     andi ImmLaneIdx16Mask, t0
@@ -4535,7 +4828,7 @@ ipintOp(_simd_i8x16_replace_lane, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_extract_lane_s, macro()
+ipintSIMDOp(_simd_i16x8_extract_lane_s, macro()
     # i16x8.extract_lane_s (lane)
     loadb ImmLaneIdxOffset[t4], t0
     andi ImmLaneIdx8Mask, t0
@@ -4546,7 +4839,7 @@ ipintOp(_simd_i16x8_extract_lane_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_extract_lane_u, macro()
+ipintSIMDOp(_simd_i16x8_extract_lane_u, macro()
     # i16x8.extract_lane_u (lane)
     loadb ImmLaneIdxOffset[t4], t0
     andi ImmLaneIdx8Mask, t0
@@ -4557,7 +4850,7 @@ ipintOp(_simd_i16x8_extract_lane_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_replace_lane, macro()
+ipintSIMDOp(_simd_i16x8_replace_lane, macro()
     # i16x8.replace_lane (lane)
     loadb ImmLaneIdxOffset[t4], t0
     andi ImmLaneIdx8Mask, t0
@@ -4567,7 +4860,7 @@ ipintOp(_simd_i16x8_replace_lane, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_extract_lane, macro()
+ipintSIMDOp(_simd_i32x4_extract_lane, macro()
     # i32x4.extract_lane (lane)
     loadb ImmLaneIdxOffset[t4], t0
     andi ImmLaneIdx4Mask, t0
@@ -4578,7 +4871,7 @@ ipintOp(_simd_i32x4_extract_lane, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_replace_lane, macro()
+ipintSIMDOp(_simd_i32x4_replace_lane, macro()
     # i32x4.replace_lane (lane)
     loadb ImmLaneIdxOffset[t4], t0
     andi ImmLaneIdx4Mask, t0
@@ -4588,7 +4881,7 @@ ipintOp(_simd_i32x4_replace_lane, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i64x2_extract_lane, macro()
+ipintSIMDOp(_simd_i64x2_extract_lane, macro()
     # i64x2.extract_lane (lane)
     loadb ImmLaneIdxOffset[t4], t0
     andi ImmLaneIdx2Mask, t0
@@ -4599,7 +4892,7 @@ ipintOp(_simd_i64x2_extract_lane, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i64x2_replace_lane, macro()
+ipintSIMDOp(_simd_i64x2_replace_lane, macro()
     # i64x2.replace_lane (lane)
     loadb ImmLaneIdxOffset[t4], t0
     andi ImmLaneIdx2Mask, t0
@@ -4609,7 +4902,7 @@ ipintOp(_simd_i64x2_replace_lane, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f32x4_extract_lane, macro()
+ipintSIMDOp(_simd_f32x4_extract_lane, macro()
     # f32x4.extract_lane (lane)
     loadb ImmLaneIdxOffset[t4], t0
     andi ImmLaneIdx4Mask, t0
@@ -4620,7 +4913,7 @@ ipintOp(_simd_f32x4_extract_lane, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f32x4_replace_lane, macro()
+ipintSIMDOp(_simd_f32x4_replace_lane, macro()
     # f32x4.replace_lane (lane)
     loadb ImmLaneIdxOffset[t4], t0
     andi ImmLaneIdx4Mask, t0
@@ -4630,7 +4923,7 @@ ipintOp(_simd_f32x4_replace_lane, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f64x2_extract_lane, macro()
+ipintSIMDOp(_simd_f64x2_extract_lane, macro()
     # f64x2.extract_lane (lane)
     loadb ImmLaneIdxOffset[t4], t0
     andi ImmLaneIdx2Mask, t0
@@ -4641,7 +4934,7 @@ ipintOp(_simd_f64x2_extract_lane, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f64x2_replace_lane, macro()
+ipintSIMDOp(_simd_f64x2_replace_lane, macro()
     # f64x2.replace_lane (lane)
     loadb ImmLaneIdxOffset[t4], t0
     andi ImmLaneIdx2Mask, t0
@@ -4652,7 +4945,7 @@ ipintOp(_simd_f64x2_replace_lane, macro()
 end)
 
 # 0xFD 0x23 - 0xFD 0x2C: i8x16 operations
-ipintOp(_simd_i8x16_eq, macro()
+ipintSIMDOp(_simd_i8x16_eq, macro()
     # i8x16.eq - compare 16 8-bit integers for equality
     popVec(v1)
     popVec(v0)
@@ -4660,6 +4953,8 @@ ipintOp(_simd_i8x16_eq, macro()
         emit "cmeq v16.16b, v16.16b, v17.16b"
     elsif X86_64
         emit "vpcmpeqb %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vcmpequb 0, 0, 1"
     else
         break # Not implemented
     end
@@ -4668,7 +4963,7 @@ ipintOp(_simd_i8x16_eq, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i8x16_ne, macro()
+ipintSIMDOp(_simd_i8x16_ne, macro()
     # i8x16.ne - compare 16 8-bit integers for inequality
     popVec(v1)
     popVec(v0)
@@ -4681,6 +4976,9 @@ ipintOp(_simd_i8x16_ne, macro()
         emit "vpcmpeqb %xmm1, %xmm0, %xmm0"
         emit "vpcmpeqb %xmm2, %xmm2, %xmm2"  # Set all bits to 1
         emit "vpxor %xmm2, %xmm0, %xmm0"     # Invert result
+    elsif PPC64
+        emit "vcmpequb 0, 0, 1"
+        emit "vnor 0, 0, 0"
     else
         break # Not implemented
     end
@@ -4689,7 +4987,7 @@ ipintOp(_simd_i8x16_ne, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i8x16_lt_s, macro()
+ipintSIMDOp(_simd_i8x16_lt_s, macro()
     # i8x16.lt_s - compare 16 8-bit signed integers for less than
     popVec(v1)
     popVec(v0)
@@ -4699,6 +4997,8 @@ ipintOp(_simd_i8x16_lt_s, macro()
     elsif X86_64
         # vpcmpgtb xmm1, xmm0 gives us xmm1 > xmm0, which is equivalent to xmm0 < xmm1
         emit "vpcmpgtb %xmm0, %xmm1, %xmm0"
+    elsif PPC64
+        emit "vcmpgtsb 0, 1, 0"
     else
         break # Not implemented
     end
@@ -4707,7 +5007,7 @@ ipintOp(_simd_i8x16_lt_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i8x16_lt_u, macro()
+ipintSIMDOp(_simd_i8x16_lt_u, macro()
     # i8x16.lt_u - compare 16 8-bit unsigned integers for less than
     popVec(v1)
     popVec(v0)
@@ -4720,6 +5020,8 @@ ipintOp(_simd_i8x16_lt_u, macro()
         emit "vpcmpeqb %xmm0, %xmm2, %xmm2"  # xmm0 == min ? (xmm0 <= xmm1)
         emit "vpcmpeqb %xmm1, %xmm0, %xmm0"  # xmm0 == xmm1 ?
         emit "vpandn %xmm2, %xmm0, %xmm0"    # (xmm0 <= xmm1) && (xmm0 != xmm1) = (xmm0 < xmm1)
+    elsif PPC64
+        emit "vcmpgtub 0, 1, 0"
     else
         break # Not implemented
     end
@@ -4728,7 +5030,7 @@ ipintOp(_simd_i8x16_lt_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i8x16_gt_s, macro()
+ipintSIMDOp(_simd_i8x16_gt_s, macro()
     # i8x16.gt_s - compare 16 8-bit signed integers for greater than
     popVec(v1)
     popVec(v0)
@@ -4736,6 +5038,8 @@ ipintOp(_simd_i8x16_gt_s, macro()
         emit "cmgt v16.16b, v16.16b, v17.16b"
     elsif X86_64
         emit "vpcmpgtb %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vcmpgtsb 0, 0, 1"
     else
         break # Not implemented
     end
@@ -4744,7 +5048,7 @@ ipintOp(_simd_i8x16_gt_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i8x16_gt_u, macro()
+ipintSIMDOp(_simd_i8x16_gt_u, macro()
     # i8x16.gt_u - compare 16 8-bit unsigned integers for greater than
     popVec(v1)
     popVec(v0)
@@ -4756,6 +5060,8 @@ ipintOp(_simd_i8x16_gt_u, macro()
         emit "vpcmpeqb %xmm1, %xmm2, %xmm2"  # xmm1 == min ? (xmm1 <= xmm0)
         emit "vpcmpeqb %xmm1, %xmm0, %xmm0"  # xmm0 == xmm1 ?
         emit "vpandn %xmm2, %xmm0, %xmm0"    # (xmm1 <= xmm0) && (xmm0 != xmm1) = (xmm0 > xmm1)
+    elsif PPC64
+        emit "vcmpgtub 0, 0, 1"
     else
         break # Not implemented
     end
@@ -4764,7 +5070,7 @@ ipintOp(_simd_i8x16_gt_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i8x16_le_s, macro()
+ipintSIMDOp(_simd_i8x16_le_s, macro()
     # i8x16.le_s - compare 16 8-bit signed integers for less than or equal
     popVec(v1)
     popVec(v0)
@@ -4776,6 +5082,9 @@ ipintOp(_simd_i8x16_le_s, macro()
         emit "vpcmpgtb %xmm1, %xmm0, %xmm0"  # xmm0 > xmm1
         emit "vpcmpeqb %xmm2, %xmm2, %xmm2"  # Set all bits to 1
         emit "vpxor %xmm2, %xmm0, %xmm0"     # Invert result: !(xmm0 > xmm1)
+    elsif PPC64
+        emit "vcmpgtsb 0, 0, 1"
+        emit "vnor 0, 0, 0"
     else
         break # Not implemented
     end
@@ -4784,7 +5093,7 @@ ipintOp(_simd_i8x16_le_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i8x16_le_u, macro()
+ipintSIMDOp(_simd_i8x16_le_u, macro()
     # i8x16.le_u - compare 16 8-bit unsigned integers for less than or equal
     popVec(v1)
     popVec(v0)
@@ -4795,6 +5104,9 @@ ipintOp(_simd_i8x16_le_u, macro()
         # xmm0 <= xmm1 iff min(xmm0, xmm1) == xmm0
         emit "vpminub %xmm1, %xmm0, %xmm2"   # min(xmm0, xmm1) -> xmm2
         emit "vpcmpeqb %xmm0, %xmm2, %xmm0"  # xmm0 == min ? (xmm0 <= xmm1)
+    elsif PPC64
+        emit "vcmpgtub 0, 0, 1"
+        emit "vnor 0, 0, 0"
     else
         break # Not implemented
     end
@@ -4803,7 +5115,7 @@ ipintOp(_simd_i8x16_le_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i8x16_ge_s, macro()
+ipintSIMDOp(_simd_i8x16_ge_s, macro()
     # i8x16.ge_s - compare 16 8-bit signed integers for greater than or equal
     popVec(v1)
     popVec(v0)
@@ -4814,6 +5126,9 @@ ipintOp(_simd_i8x16_ge_s, macro()
         emit "vpcmpgtb %xmm0, %xmm1, %xmm0"  # xmm1 > xmm0
         emit "vpcmpeqb %xmm2, %xmm2, %xmm2"  # Set all bits to 1
         emit "vpxor %xmm2, %xmm0, %xmm0"     # Invert result: !(xmm1 > xmm0)
+    elsif PPC64
+        emit "vcmpgtsb 0, 1, 0"
+        emit "vnor 0, 0, 0"
     else
         break # Not implemented
     end
@@ -4822,7 +5137,7 @@ ipintOp(_simd_i8x16_ge_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i8x16_ge_u, macro()
+ipintSIMDOp(_simd_i8x16_ge_u, macro()
     # i8x16.ge_u - compare 16 8-bit unsigned integers for greater than or equal
     popVec(v1)
     popVec(v0)
@@ -4832,6 +5147,9 @@ ipintOp(_simd_i8x16_ge_u, macro()
         # xmm0 >= xmm1 iff min(xmm0, xmm1) == xmm1
         emit "vpminub %xmm1, %xmm0, %xmm2"   # min(xmm0, xmm1) -> xmm2
         emit "vpcmpeqb %xmm1, %xmm2, %xmm0"  # xmm1 == min ? (xmm1 <= xmm0) = (xmm0 >= xmm1)
+    elsif PPC64
+        emit "vcmpgtub 0, 1, 0"
+        emit "vnor 0, 0, 0"
     else
         break # Not implemented
     end
@@ -4842,7 +5160,7 @@ end)
 
 # 0xFD 0x2D - 0xFD 0x36: i8x16 operations
 
-ipintOp(_simd_i16x8_eq, macro()
+ipintSIMDOp(_simd_i16x8_eq, macro()
     # i16x8.eq - compare 8 16-bit integers for equality
     popVec(v1)
     popVec(v0)
@@ -4850,6 +5168,8 @@ ipintOp(_simd_i16x8_eq, macro()
         emit "cmeq v16.8h, v16.8h, v17.8h"
     elsif X86_64
         emit "vpcmpeqw %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vcmpequh 0, 0, 1"
     else
         break # Not implemented
     end
@@ -4858,7 +5178,7 @@ ipintOp(_simd_i16x8_eq, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_ne, macro()
+ipintSIMDOp(_simd_i16x8_ne, macro()
     # i16x8.ne - compare 8 16-bit integers for inequality
     popVec(v1)
     popVec(v0)
@@ -4870,6 +5190,9 @@ ipintOp(_simd_i16x8_ne, macro()
         emit "vpcmpeqw %xmm1, %xmm0, %xmm0"
         emit "vpcmpeqw %xmm2, %xmm2, %xmm2"  # Set all bits to 1
         emit "vpxor %xmm2, %xmm0, %xmm0"     # Invert result
+    elsif PPC64
+        emit "vcmpequh 0, 0, 1"
+        emit "vnor 0, 0, 0"
     else
         break # Not implemented
     end
@@ -4878,7 +5201,7 @@ ipintOp(_simd_i16x8_ne, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_lt_s, macro()
+ipintSIMDOp(_simd_i16x8_lt_s, macro()
     # i16x8.lt_s - compare 8 16-bit signed integers for less than
     popVec(v1)
     popVec(v0)
@@ -4888,6 +5211,8 @@ ipintOp(_simd_i16x8_lt_s, macro()
     elsif X86_64
         # vpcmpgtw xmm1, xmm0 gives us xmm1 > xmm0, which is equivalent to xmm0 < xmm1
         emit "vpcmpgtw %xmm0, %xmm1, %xmm0"
+    elsif PPC64
+        emit "vcmpgtsh 0, 1, 0"
     else
         break # Not implemented
     end
@@ -4896,7 +5221,7 @@ ipintOp(_simd_i16x8_lt_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_lt_u, macro()
+ipintSIMDOp(_simd_i16x8_lt_u, macro()
     # i16x8.lt_u - compare 8 16-bit unsigned integers for less than
     popVec(v1)
     popVec(v0)
@@ -4909,6 +5234,8 @@ ipintOp(_simd_i16x8_lt_u, macro()
         emit "vpcmpeqw %xmm0, %xmm2, %xmm2"  # xmm0 == min ? (xmm0 <= xmm1)
         emit "vpcmpeqw %xmm1, %xmm0, %xmm0"  # xmm0 == xmm1 ?
         emit "vpandn %xmm2, %xmm0, %xmm0"    # (xmm0 <= xmm1) && (xmm0 != xmm1) = (xmm0 < xmm1)
+    elsif PPC64
+        emit "vcmpgtuh 0, 1, 0"
     else
         break # Not implemented
     end
@@ -4917,7 +5244,7 @@ ipintOp(_simd_i16x8_lt_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_gt_s, macro()
+ipintSIMDOp(_simd_i16x8_gt_s, macro()
     # i16x8.gt_s - compare 8 16-bit signed integers for greater than
     popVec(v1)
     popVec(v0)
@@ -4925,6 +5252,8 @@ ipintOp(_simd_i16x8_gt_s, macro()
         emit "cmgt v16.8h, v16.8h, v17.8h"
     elsif X86_64
         emit "vpcmpgtw %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vcmpgtsh 0, 0, 1"
     else
         break # Not implemented
     end
@@ -4933,7 +5262,7 @@ ipintOp(_simd_i16x8_gt_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_gt_u, macro()
+ipintSIMDOp(_simd_i16x8_gt_u, macro()
     # i16x8.gt_u - compare 8 16-bit unsigned integers for greater than
     popVec(v1)
     popVec(v0)
@@ -4945,6 +5274,8 @@ ipintOp(_simd_i16x8_gt_u, macro()
         emit "vpcmpeqw %xmm1, %xmm2, %xmm2"  # xmm1 == min ? (xmm1 <= xmm0)
         emit "vpcmpeqw %xmm1, %xmm0, %xmm0"  # xmm0 == xmm1 ?
         emit "vpandn %xmm2, %xmm0, %xmm0"    # (xmm1 <= xmm0) && (xmm0 != xmm1) = (xmm0 > xmm1)
+    elsif PPC64
+        emit "vcmpgtuh 0, 0, 1"
     else
         break # Not implemented
     end
@@ -4953,7 +5284,7 @@ ipintOp(_simd_i16x8_gt_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_le_s, macro()
+ipintSIMDOp(_simd_i16x8_le_s, macro()
     # i16x8.le_s - compare 8 16-bit signed integers for less than or equal
     popVec(v1)
     popVec(v0)
@@ -4965,6 +5296,9 @@ ipintOp(_simd_i16x8_le_s, macro()
         emit "vpcmpgtw %xmm1, %xmm0, %xmm0"  # xmm0 > xmm1
         emit "vpcmpeqw %xmm2, %xmm2, %xmm2"  # Set all bits to 1
         emit "vpxor %xmm2, %xmm0, %xmm0"     # Invert result: !(xmm0 > xmm1)
+    elsif PPC64
+        emit "vcmpgtsh 0, 0, 1"
+        emit "vnor 0, 0, 0"
     else
         break # Not implemented
     end
@@ -4973,7 +5307,7 @@ ipintOp(_simd_i16x8_le_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_le_u, macro()
+ipintSIMDOp(_simd_i16x8_le_u, macro()
     # i16x8.le_u - compare 8 16-bit unsigned integers for less than or equal
     popVec(v1)
     popVec(v0)
@@ -4984,6 +5318,9 @@ ipintOp(_simd_i16x8_le_u, macro()
         # xmm0 <= xmm1 iff min(xmm0, xmm1) == xmm0
         emit "vpminuw %xmm1, %xmm0, %xmm2"   # min(xmm0, xmm1) -> xmm2
         emit "vpcmpeqw %xmm0, %xmm2, %xmm0"  # xmm0 == min ? (xmm0 <= xmm1)
+    elsif PPC64
+        emit "vcmpgtuh 0, 0, 1"
+        emit "vnor 0, 0, 0"
     else
         break # Not implemented
     end
@@ -4992,7 +5329,7 @@ ipintOp(_simd_i16x8_le_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_ge_s, macro()
+ipintSIMDOp(_simd_i16x8_ge_s, macro()
     # i16x8.ge_s - compare 8 16-bit signed integers for greater than or equal
     popVec(v1)
     popVec(v0)
@@ -5003,6 +5340,9 @@ ipintOp(_simd_i16x8_ge_s, macro()
         emit "vpcmpgtw %xmm0, %xmm1, %xmm0"  # xmm1 > xmm0
         emit "vpcmpeqw %xmm2, %xmm2, %xmm2"  # Set all bits to 1
         emit "vpxor %xmm2, %xmm0, %xmm0"     # Invert result: !(xmm1 > xmm0)
+    elsif PPC64
+        emit "vcmpgtsh 0, 1, 0"
+        emit "vnor 0, 0, 0"
     else
         break # Not implemented
     end
@@ -5011,7 +5351,7 @@ ipintOp(_simd_i16x8_ge_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_ge_u, macro()
+ipintSIMDOp(_simd_i16x8_ge_u, macro()
     # i16x8.ge_u - compare 8 16-bit unsigned integers for greater than or equal
     popVec(v1)
     popVec(v0)
@@ -5021,6 +5361,9 @@ ipintOp(_simd_i16x8_ge_u, macro()
         # xmm0 >= xmm1 iff min(xmm0, xmm1) == xmm1
         emit "vpminuw %xmm1, %xmm0, %xmm2"   # min(xmm0, xmm1) -> xmm2
         emit "vpcmpeqw %xmm1, %xmm2, %xmm0"  # xmm1 == min ? (xmm1 <= xmm0) = (xmm0 >= xmm1)
+    elsif PPC64
+        emit "vcmpgtuh 0, 1, 0"
+        emit "vnor 0, 0, 0"
     else
         break # Not implemented
     end
@@ -5030,7 +5373,7 @@ ipintOp(_simd_i16x8_ge_u, macro()
 end)
 
 # 0xFD 0x37 - 0xFD 0x40: i32x4 operations
-ipintOp(_simd_i32x4_eq, macro()
+ipintSIMDOp(_simd_i32x4_eq, macro()
     # i32x4.eq - compare 4 32-bit integers for equality
     popVec(v1)
     popVec(v0)
@@ -5038,6 +5381,8 @@ ipintOp(_simd_i32x4_eq, macro()
         emit "cmeq v16.4s, v16.4s, v17.4s"
     elsif X86_64
         emit "vpcmpeqd %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vcmpequw 0, 0, 1"
     else
         break # Not implemented
     end
@@ -5046,7 +5391,7 @@ ipintOp(_simd_i32x4_eq, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_ne, macro()
+ipintSIMDOp(_simd_i32x4_ne, macro()
     # i32x4.ne - compare 4 32-bit integers for inequality
     popVec(v1)
     popVec(v0)
@@ -5058,6 +5403,9 @@ ipintOp(_simd_i32x4_ne, macro()
         emit "vpcmpeqd %xmm1, %xmm0, %xmm0"
         emit "vpcmpeqd %xmm2, %xmm2, %xmm2"  # Set all bits to 1
         emit "vpxor %xmm2, %xmm0, %xmm0"     # Invert result
+    elsif PPC64
+        emit "vcmpequw 0, 0, 1"
+        emit "vnor 0, 0, 0"
     else
         break # Not implemented
     end
@@ -5066,7 +5414,7 @@ ipintOp(_simd_i32x4_ne, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_lt_s, macro()
+ipintSIMDOp(_simd_i32x4_lt_s, macro()
     # i32x4.lt_s - compare 4 32-bit signed integers for less than
     popVec(v1)
     popVec(v0)
@@ -5076,6 +5424,8 @@ ipintOp(_simd_i32x4_lt_s, macro()
     elsif X86_64
         # vpcmpgtd xmm1, xmm0 gives us xmm1 > xmm0, which is equivalent to xmm0 < xmm1
         emit "vpcmpgtd %xmm0, %xmm1, %xmm0"
+    elsif PPC64
+        emit "vcmpgtsw 0, 1, 0"
     else
         break # Not implemented
     end
@@ -5084,7 +5434,7 @@ ipintOp(_simd_i32x4_lt_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_lt_u, macro()
+ipintSIMDOp(_simd_i32x4_lt_u, macro()
     # i32x4.lt_u - compare 4 32-bit unsigned integers for less than
     popVec(v1)
     popVec(v0)
@@ -5097,6 +5447,8 @@ ipintOp(_simd_i32x4_lt_u, macro()
         emit "vpcmpeqd %xmm0, %xmm2, %xmm2"  # xmm0 == min ? (xmm0 <= xmm1)
         emit "vpcmpeqd %xmm1, %xmm0, %xmm0"  # xmm0 == xmm1 ?
         emit "vpandn %xmm2, %xmm0, %xmm0"    # (xmm0 <= xmm1) && (xmm0 != xmm1) = (xmm0 < xmm1)
+    elsif PPC64
+        emit "vcmpgtuw 0, 1, 0"
     else
         break # Not implemented
     end
@@ -5105,7 +5457,7 @@ ipintOp(_simd_i32x4_lt_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_gt_s, macro()
+ipintSIMDOp(_simd_i32x4_gt_s, macro()
     # i32x4.gt_s - compare 4 32-bit signed integers for greater than
     popVec(v1)
     popVec(v0)
@@ -5113,6 +5465,8 @@ ipintOp(_simd_i32x4_gt_s, macro()
         emit "cmgt v16.4s, v16.4s, v17.4s"
     elsif X86_64
         emit "vpcmpgtd %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vcmpgtsw 0, 0, 1"
     else
         break # Not implemented
     end
@@ -5121,7 +5475,7 @@ ipintOp(_simd_i32x4_gt_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_gt_u, macro()
+ipintSIMDOp(_simd_i32x4_gt_u, macro()
     # i32x4.gt_u - compare 4 32-bit unsigned integers for greater than
     popVec(v1)
     popVec(v0)
@@ -5133,6 +5487,8 @@ ipintOp(_simd_i32x4_gt_u, macro()
         emit "vpcmpeqd %xmm1, %xmm2, %xmm2"  # xmm1 == min ? (xmm1 <= xmm0)
         emit "vpcmpeqd %xmm1, %xmm0, %xmm0"  # xmm0 == xmm1 ?
         emit "vpandn %xmm2, %xmm0, %xmm0"    # (xmm1 <= xmm0) && (xmm0 != xmm1) = (xmm0 > xmm1)
+    elsif PPC64
+        emit "vcmpgtuw 0, 0, 1"
     else
         break # Not implemented
     end
@@ -5141,7 +5497,7 @@ ipintOp(_simd_i32x4_gt_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_le_s, macro()
+ipintSIMDOp(_simd_i32x4_le_s, macro()
     # i32x4.le_s - compare 4 32-bit signed integers for less than or equal
     popVec(v1)
     popVec(v0)
@@ -5153,6 +5509,9 @@ ipintOp(_simd_i32x4_le_s, macro()
         emit "vpcmpgtd %xmm1, %xmm0, %xmm0"  # xmm0 > xmm1
         emit "vpcmpeqd %xmm2, %xmm2, %xmm2"  # Set all bits to 1
         emit "vpxor %xmm2, %xmm0, %xmm0"     # Invert result: !(xmm0 > xmm1)
+    elsif PPC64
+        emit "vcmpgtsw 0, 0, 1"
+        emit "vnor 0, 0, 0"
     else
         break # Not implemented
     end
@@ -5161,7 +5520,7 @@ ipintOp(_simd_i32x4_le_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_le_u, macro()
+ipintSIMDOp(_simd_i32x4_le_u, macro()
     # i32x4.le_u - compare 4 32-bit unsigned integers for less than or equal
     popVec(v1)
     popVec(v0)
@@ -5172,6 +5531,9 @@ ipintOp(_simd_i32x4_le_u, macro()
         # xmm0 <= xmm1 iff min(xmm0, xmm1) == xmm0
         emit "vpminud %xmm1, %xmm0, %xmm2"   # min(xmm0, xmm1) -> xmm2
         emit "vpcmpeqd %xmm0, %xmm2, %xmm0"  # xmm0 == min ? (xmm0 <= xmm1)
+    elsif PPC64
+        emit "vcmpgtuw 0, 0, 1"
+        emit "vnor 0, 0, 0"
     else
         break # Not implemented
     end
@@ -5180,7 +5542,7 @@ ipintOp(_simd_i32x4_le_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_ge_s, macro()
+ipintSIMDOp(_simd_i32x4_ge_s, macro()
     # i32x4.ge_s - compare 4 32-bit signed integers for greater than or equal
     popVec(v1)
     popVec(v0)
@@ -5191,6 +5553,9 @@ ipintOp(_simd_i32x4_ge_s, macro()
         emit "vpcmpgtd %xmm0, %xmm1, %xmm0"  # xmm1 > xmm0
         emit "vpcmpeqd %xmm2, %xmm2, %xmm2"  # Set all bits to 1
         emit "vpxor %xmm2, %xmm0, %xmm0"     # Invert result: !(xmm1 > xmm0)
+    elsif PPC64
+        emit "vcmpgtsw 0, 1, 0"
+        emit "vnor 0, 0, 0"
     else
         break # Not implemented
     end
@@ -5199,7 +5564,7 @@ ipintOp(_simd_i32x4_ge_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_ge_u, macro()
+ipintSIMDOp(_simd_i32x4_ge_u, macro()
     # i32x4.ge_u - compare 4 32-bit unsigned integers for greater than or equal
     popVec(v1)
     popVec(v0)
@@ -5209,6 +5574,9 @@ ipintOp(_simd_i32x4_ge_u, macro()
         # xmm0 >= xmm1 iff min(xmm0, xmm1) == xmm1
         emit "vpminud %xmm1, %xmm0, %xmm2"   # min(xmm0, xmm1) -> xmm2
         emit "vpcmpeqd %xmm1, %xmm2, %xmm0"  # xmm1 == min ? (xmm1 <= xmm0) = (xmm0 >= xmm1)
+    elsif PPC64
+        emit "vcmpgtuw 0, 1, 0"
+        emit "vnor 0, 0, 0"
     else
         break # Not implemented
     end
@@ -5218,7 +5586,7 @@ ipintOp(_simd_i32x4_ge_u, macro()
 end)
 
 # 0xFD 0x41 - 0xFD 0x46: f32x4 operations
-ipintOp(_simd_f32x4_eq, macro()
+ipintSIMDOp(_simd_f32x4_eq, macro()
     # f32x4.eq - compare 4 32-bit floats for equality
     popVec(v1)
     popVec(v0)
@@ -5226,6 +5594,8 @@ ipintOp(_simd_f32x4_eq, macro()
         emit "fcmeq v16.4s, v16.4s, v17.4s"
     elsif X86_64
         emit "vcmpeqps %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvcmpeqsp 32, 32, 33"
     else
         break # Not implemented
     end
@@ -5234,7 +5604,7 @@ ipintOp(_simd_f32x4_eq, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f32x4_ne, macro()
+ipintSIMDOp(_simd_f32x4_ne, macro()
     # f32x4.ne - compare 4 32-bit floats for inequality
     popVec(v1)
     popVec(v0)
@@ -5243,6 +5613,9 @@ ipintOp(_simd_f32x4_ne, macro()
         emit "mvn v16.16b, v16.16b"
     elsif X86_64
         emit "vcmpneqps %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvcmpeqsp 32, 32, 33"
+        emit "xxlnor 32, 32, 32"
     else
         break # Not implemented
     end
@@ -5251,7 +5624,7 @@ ipintOp(_simd_f32x4_ne, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f32x4_lt, macro()
+ipintSIMDOp(_simd_f32x4_lt, macro()
     # f32x4.lt - compare 4 32-bit floats for less than
     popVec(v1)
     popVec(v0)
@@ -5260,6 +5633,8 @@ ipintOp(_simd_f32x4_lt, macro()
         emit "fcmgt v16.4s, v17.4s, v16.4s"
     elsif X86_64
         emit "vcmpltps %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvcmpgtsp 32, 33, 32"
     else
         break # Not implemented
     end
@@ -5268,7 +5643,7 @@ ipintOp(_simd_f32x4_lt, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f32x4_gt, macro()
+ipintSIMDOp(_simd_f32x4_gt, macro()
     # f32x4.gt - compare 4 32-bit floats for greater than
     popVec(v1)
     popVec(v0)
@@ -5276,6 +5651,8 @@ ipintOp(_simd_f32x4_gt, macro()
         emit "fcmgt v16.4s, v16.4s, v17.4s"
     elsif X86_64
         emit "vcmpgtps %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvcmpgtsp 32, 32, 33"
     else
         break # Not implemented
     end
@@ -5284,7 +5661,7 @@ ipintOp(_simd_f32x4_gt, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f32x4_le, macro()
+ipintSIMDOp(_simd_f32x4_le, macro()
     # f32x4.le - compare 4 32-bit floats for less than or equal
     popVec(v1)
     popVec(v0)
@@ -5293,6 +5670,8 @@ ipintOp(_simd_f32x4_le, macro()
         emit "fcmge v16.4s, v17.4s, v16.4s"
     elsif X86_64
         emit "vcmpleps %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvcmpgesp 32, 33, 32"
     else
         break # Not implemented
     end
@@ -5301,7 +5680,7 @@ ipintOp(_simd_f32x4_le, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f32x4_ge, macro()
+ipintSIMDOp(_simd_f32x4_ge, macro()
     # f32x4.ge - compare 4 32-bit floats for greater than or equal
     popVec(v1)
     popVec(v0)
@@ -5309,6 +5688,8 @@ ipintOp(_simd_f32x4_ge, macro()
         emit "fcmge v16.4s, v16.4s, v17.4s"
     elsif X86_64
         emit "vcmpgeps %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvcmpgesp 32, 32, 33"
     else
         break # Not implemented
     end
@@ -5318,7 +5699,7 @@ ipintOp(_simd_f32x4_ge, macro()
 end)
 
 # 0xFD 0x47 - 0xFD 0x4c: f64x2 operations
-ipintOp(_simd_f64x2_eq, macro()
+ipintSIMDOp(_simd_f64x2_eq, macro()
     # f64x2.eq - compare 2 64-bit floats for equality
     popVec(v1)
     popVec(v0)
@@ -5326,6 +5707,8 @@ ipintOp(_simd_f64x2_eq, macro()
         emit "fcmeq v16.2d, v16.2d, v17.2d"
     elsif X86_64
         emit "vcmpeqpd %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvcmpeqdp 32, 32, 33"
     else
         break # Not implemented
     end
@@ -5334,7 +5717,7 @@ ipintOp(_simd_f64x2_eq, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f64x2_ne, macro()
+ipintSIMDOp(_simd_f64x2_ne, macro()
     # f64x2.ne - compare 2 64-bit floats for inequality
     popVec(v1)
     popVec(v0)
@@ -5343,6 +5726,9 @@ ipintOp(_simd_f64x2_ne, macro()
         emit "mvn v16.16b, v16.16b"
     elsif X86_64
         emit "vcmpneqpd %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvcmpeqdp 32, 32, 33"
+        emit "xxlnor 32, 32, 32"
     else
         break # Not implemented
     end
@@ -5351,7 +5737,7 @@ ipintOp(_simd_f64x2_ne, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f64x2_lt, macro()
+ipintSIMDOp(_simd_f64x2_lt, macro()
     # f64x2.lt - compare 2 64-bit floats for less than
     popVec(v1)
     popVec(v0)
@@ -5360,6 +5746,8 @@ ipintOp(_simd_f64x2_lt, macro()
         emit "fcmgt v16.2d, v17.2d, v16.2d"
     elsif X86_64
         emit "vcmpltpd %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvcmpgtdp 32, 33, 32"
     else
         break # Not implemented
     end
@@ -5368,7 +5756,7 @@ ipintOp(_simd_f64x2_lt, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f64x2_gt, macro()
+ipintSIMDOp(_simd_f64x2_gt, macro()
     # f64x2.gt - compare 2 64-bit floats for greater than
     popVec(v1)
     popVec(v0)
@@ -5376,6 +5764,8 @@ ipintOp(_simd_f64x2_gt, macro()
         emit "fcmgt v16.2d, v16.2d, v17.2d"
     elsif X86_64
         emit "vcmpgtpd %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvcmpgtdp 32, 32, 33"
     else
         break # Not implemented
     end
@@ -5384,7 +5774,7 @@ ipintOp(_simd_f64x2_gt, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f64x2_le, macro()
+ipintSIMDOp(_simd_f64x2_le, macro()
     # f64x2.le - compare 2 64-bit floats for less than or equal
     popVec(v1)
     popVec(v0)
@@ -5393,6 +5783,8 @@ ipintOp(_simd_f64x2_le, macro()
         emit "fcmge v16.2d, v17.2d, v16.2d"
     elsif X86_64
         emit "vcmplepd %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvcmpgedp 32, 33, 32"
     else
         break # Not implemented
     end
@@ -5401,7 +5793,7 @@ ipintOp(_simd_f64x2_le, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f64x2_ge, macro()
+ipintSIMDOp(_simd_f64x2_ge, macro()
     # f64x2.ge - compare 2 64-bit floats for greater than or equal
     popVec(v1)
     popVec(v0)
@@ -5409,6 +5801,8 @@ ipintOp(_simd_f64x2_ge, macro()
         emit "fcmge v16.2d, v16.2d, v17.2d"
     elsif X86_64
         emit "vcmpgepd %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvcmpgedp 32, 32, 33"
     else
         break # Not implemented
     end
@@ -5419,7 +5813,7 @@ end)
 
 # 0xFD 0x4D - 0xFD 0x53: v128 operations
 
-ipintOp(_simd_v128_not, macro()
+ipintSIMDOp(_simd_v128_not, macro()
     # v128.not - bitwise NOT of 128-bit vector
     popVec(v0)
     if ARM64 or ARM64E
@@ -5427,6 +5821,8 @@ ipintOp(_simd_v128_not, macro()
     elsif X86_64
         emit "vpcmpeqb %xmm1, %xmm1, %xmm1"  # Set all bits to 1
         emit "vpxor %xmm1, %xmm0, %xmm0"     # Invert all bits
+    elsif PPC64
+        emit "vnor 0, 0, 0"
     else
         break # Not implemented
     end
@@ -5435,7 +5831,7 @@ ipintOp(_simd_v128_not, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_v128_and, macro()
+ipintSIMDOp(_simd_v128_and, macro()
     # v128.and - bitwise AND of two 128-bit vectors
     popVec(v1)
     popVec(v0)
@@ -5443,6 +5839,8 @@ ipintOp(_simd_v128_and, macro()
         emit "and v16.16b, v16.16b, v17.16b"
     elsif X86_64
         emit "vpand %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vand 0, 0, 1"
     else
         break # Not implemented
     end
@@ -5451,7 +5849,7 @@ ipintOp(_simd_v128_and, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_v128_andnot, macro()
+ipintSIMDOp(_simd_v128_andnot, macro()
     # v128.andnot - bitwise AND NOT of two 128-bit vectors (v0 & ~v1)
     popVec(v1)
     popVec(v0)
@@ -5459,6 +5857,8 @@ ipintOp(_simd_v128_andnot, macro()
         emit "bic v16.16b, v16.16b, v17.16b"
     elsif X86_64
         emit "vpandn %xmm0, %xmm1, %xmm0"
+    elsif PPC64
+        emit "vandc 0, 0, 1"
     else
         break # Not implemented
     end
@@ -5467,7 +5867,7 @@ ipintOp(_simd_v128_andnot, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_v128_or, macro()
+ipintSIMDOp(_simd_v128_or, macro()
     # v128.or - bitwise OR of two 128-bit vectors
     popVec(v1)
     popVec(v0)
@@ -5475,6 +5875,8 @@ ipintOp(_simd_v128_or, macro()
         emit "orr v16.16b, v16.16b, v17.16b"
     elsif X86_64
         emit "vpor %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vor 0, 0, 1"
     else
         break # Not implemented
     end
@@ -5483,7 +5885,7 @@ ipintOp(_simd_v128_or, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_v128_xor, macro()
+ipintSIMDOp(_simd_v128_xor, macro()
     # v128.xor - bitwise XOR of two 128-bit vectors
     popVec(v1)
     popVec(v0)
@@ -5491,6 +5893,8 @@ ipintOp(_simd_v128_xor, macro()
         emit "eor v16.16b, v16.16b, v17.16b"
     elsif X86_64
         emit "vpxor %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vxor 0, 0, 1"
     else
         break # Not implemented
     end
@@ -5499,7 +5903,7 @@ ipintOp(_simd_v128_xor, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_v128_bitselect, macro()
+ipintSIMDOp(_simd_v128_bitselect, macro()
     # v128.bitselect - bitwise select: (a & c) | (b & ~c)
     popVec(v2)  # selector c
     popVec(v1)  # b
@@ -5516,6 +5920,8 @@ ipintOp(_simd_v128_bitselect, macro()
         emit "vpand %xmm2, %xmm0, %xmm3"     # xmm3 = a & c
         emit "vpandn %xmm1, %xmm2, %xmm2"    # xmm2 = b & ~c (vpandn does ~src1 & src2)
         emit "vpor %xmm2, %xmm3, %xmm0"      # xmm0 = (a & c) | (b & ~c)
+    elsif PPC64
+        emit "vsel 0, 1, 0, 14"
     else
         break # Not implemented
     end
@@ -5524,7 +5930,7 @@ ipintOp(_simd_v128_bitselect, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_v128_any_true, macro()
+ipintSIMDOp(_simd_v128_any_true, macro()
     # v128.any_true - return 1 if any bit is set, 0 otherwise
     popVec(v0)
     if ARM64 or ARM64E
@@ -5539,6 +5945,14 @@ ipintOp(_simd_v128_any_true, macro()
         emit "vptest %xmm0, %xmm0"
         emit "setne %al"                  # Set AL to 1 if ZF=0 (any bit set), 0 if ZF=1 (all zero)
         emit "movzbl %al, %eax"           # Zero-extend AL to EAX
+    elsif PPC64
+        emit "mfvsrd 3, 32"
+        emit "xxswapd 34, 32"
+        emit "mfvsrd 4, 34"
+        emit "or 3, 3, 4"
+        emit "neg 4, 3"
+        emit "or 3, 3, 4"
+        emit "srdi 3, 3, 63"
     else
         break # Not implemented
     end
@@ -5554,7 +5968,7 @@ end)
 # extract value from v128 on stack, pop v128, store to memory.
 # Lane index is the last byte of the instruction, right after the memarg.
 
-ipintOp(_simd_v128_load8_lane_mem, macro()
+ipintSIMDOp(_simd_v128_load8_lane_mem, macro()
     popVec(v0)
     popMemoryIndex(t0)
     loadStoreMakePointerFast([t4], 1[t4], t0, 1, t1, t2, .simd_v128_load8_lane_slow_path)
@@ -5567,7 +5981,7 @@ ipintOp(_simd_v128_load8_lane_mem, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_v128_load16_lane_mem, macro()
+ipintSIMDOp(_simd_v128_load16_lane_mem, macro()
     popVec(v0)
     popMemoryIndex(t0)
     loadStoreMakePointerFast([t4], 1[t4], t0, 2, t1, t2, .simd_v128_load16_lane_slow_path)
@@ -5580,7 +5994,7 @@ ipintOp(_simd_v128_load16_lane_mem, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_v128_load32_lane_mem, macro()
+ipintSIMDOp(_simd_v128_load32_lane_mem, macro()
     popVec(v0)
     popMemoryIndex(t0)
     loadStoreMakePointerFast([t4], 1[t4], t0, 4, t1, t2, .simd_v128_load32_lane_slow_path)
@@ -5593,7 +6007,7 @@ ipintOp(_simd_v128_load32_lane_mem, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_v128_load64_lane_mem, macro()
+ipintSIMDOp(_simd_v128_load64_lane_mem, macro()
     popVec(v0)
     popMemoryIndex(t0)
     loadStoreMakePointerFast([t4], 1[t4], t0, 8, t1, t2, .simd_v128_load64_lane_slow_path)
@@ -5606,7 +6020,7 @@ ipintOp(_simd_v128_load64_lane_mem, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_v128_store8_lane_mem, macro()
+ipintSIMDOp(_simd_v128_store8_lane_mem, macro()
     # Stack: [addr, v128] with v128 on top. Pop both, parse memarg, extract lane, store.
     popVec(v0)
     popMemoryIndex(t0)
@@ -5622,7 +6036,7 @@ ipintOp(_simd_v128_store8_lane_mem, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_v128_store16_lane_mem, macro()
+ipintSIMDOp(_simd_v128_store16_lane_mem, macro()
     popVec(v0)
     popMemoryIndex(t0)
     loadStoreMakePointerFast([t4], 1[t4], t0, 2, t1, t2, .simd_v128_store16_lane_slow_path)
@@ -5636,7 +6050,7 @@ ipintOp(_simd_v128_store16_lane_mem, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_v128_store32_lane_mem, macro()
+ipintSIMDOp(_simd_v128_store32_lane_mem, macro()
     popVec(v0)
     popMemoryIndex(t0)
     loadStoreMakePointerFast([t4], 1[t4], t0, 4, t1, t2, .simd_v128_store32_lane_slow_path)
@@ -5650,7 +6064,7 @@ ipintOp(_simd_v128_store32_lane_mem, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_v128_store64_lane_mem, macro()
+ipintSIMDOp(_simd_v128_store64_lane_mem, macro()
     popVec(v0)
     popMemoryIndex(t0)
     loadStoreMakePointerFast([t4], 1[t4], t0, 8, t1, t2, .simd_v128_store64_lane_slow_path)
@@ -5664,7 +6078,7 @@ ipintOp(_simd_v128_store64_lane_mem, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_v128_load32_zero_mem, macro()
+ipintSIMDOp(_simd_v128_load32_zero_mem, macro()
     # v128.load32_zero - load 32-bit value from memory and zero-pad to 128 bits
     popMemoryIndex(t0)
     loadStoreMakePointerFast([t4], 1[t4], t0, 4, t1, t2, .simd_v128_load32_zero_slow_path)
@@ -5677,7 +6091,7 @@ ipintOp(_simd_v128_load32_zero_mem, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_v128_load64_zero_mem, macro()
+ipintSIMDOp(_simd_v128_load64_zero_mem, macro()
     # v128.load64_zero - load 64-bit value from memory and zero-pad to 128 bits
     popMemoryIndex(t0)
     loadStoreMakePointerFast([t4], 1[t4], t0, 8, t1, t2, .simd_v128_load64_zero_slow_path)
@@ -5691,7 +6105,7 @@ end)
 
 # 0xFD 0x5E - 0xFD 0x5F: f32x4/f64x2 conversion
 
-ipintOp(_simd_f32x4_demote_f64x2_zero, macro()
+ipintSIMDOp(_simd_f32x4_demote_f64x2_zero, macro()
     # f32x4.demote_f64x2_zero - demote 2 f64 values to f32, zero upper 2 lanes
     popVec(v0)
     if ARM64 or ARM64E
@@ -5701,6 +6115,12 @@ ipintOp(_simd_f32x4_demote_f64x2_zero, macro()
         emit "mov v16.d[1], xzr"
     elsif X86_64
         emit "vcvtpd2ps %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvcvdpsp 34, 32"
+        emit "xxswapd 35, 34"
+        emit "xxmrghw 35, 35, 34"
+        emit "xxlxor 36, 36, 36"
+        emit "xxpermdi 32, 35, 36, 0"
     else
         break # Not implemented
     end
@@ -5709,13 +6129,17 @@ ipintOp(_simd_f32x4_demote_f64x2_zero, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f64x2_promote_low_f32x4, macro()
+ipintSIMDOp(_simd_f64x2_promote_low_f32x4, macro()
     # f64x2.promote_low_f32x4 - promote lower 2 f32 values to f64
     popVec(v0)
     if ARM64 or ARM64E
         emit "fcvtl v16.2d, v16.2s"
     elsif X86_64
         emit "vcvtps2pd %xmm0, %xmm0"
+    elsif PPC64
+        emit "xxmrghw 34, 32, 32"
+        emit "xvcvspdp 34, 34"
+        emit "xxswapd 32, 34"
     else
         break # Not implemented
     end
@@ -5726,13 +6150,17 @@ end)
 
 # 0xFD 0x60 - 0x66: i8x16 operations
 
-ipintOp(_simd_i8x16_abs, macro()
+ipintSIMDOp(_simd_i8x16_abs, macro()
     # i8x16.abs - absolute value of 16 8-bit signed integers
     popVec(v0)
     if ARM64 or ARM64E
         emit "abs v16.16b, v16.16b"
     elsif X86_64
         emit "vpabsb %xmm0, %xmm0"
+    elsif PPC64
+        emit "vxor 2, 2, 2"
+        emit "vsububm 2, 2, 0"
+        emit "vmaxsb 0, 0, 2"
     else
         break # Not implemented
     end
@@ -5741,7 +6169,7 @@ ipintOp(_simd_i8x16_abs, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i8x16_neg, macro()
+ipintSIMDOp(_simd_i8x16_neg, macro()
     # i8x16.neg - negate 16 8-bit integers
     popVec(v0)
     if ARM64 or ARM64E
@@ -5750,6 +6178,9 @@ ipintOp(_simd_i8x16_neg, macro()
         # Negate by subtracting from zero
         emit "vpxor %xmm1, %xmm1, %xmm1"
         emit "vpsubb %xmm0, %xmm1, %xmm0"
+    elsif PPC64
+        emit "vxor 2, 2, 2"
+        emit "vsububm 0, 2, 0"
     else
         break # Not implemented
     end
@@ -5758,7 +6189,7 @@ ipintOp(_simd_i8x16_neg, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i8x16_popcnt, macro()
+ipintSIMDOp(_simd_i8x16_popcnt, macro()
     # i8x16.popcnt - population count (count set bits) for 16 8-bit integers
     popVec(v0)
     if ARM64 or ARM64E
@@ -5792,6 +6223,8 @@ ipintOp(_simd_i8x16_popcnt, macro()
 
         # Add the results
         emit "vpaddb %xmm3, %xmm0, %xmm0"        # Add popcount of low and high nibbles
+    elsif PPC64
+        emit "vpopcntb 0, 0"
     else
         break # Not implemented
     end
@@ -5800,7 +6233,7 @@ ipintOp(_simd_i8x16_popcnt, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i8x16_all_true, macro()
+ipintSIMDOp(_simd_i8x16_all_true, macro()
     # i8x16.all_true - return 1 if all 16 8-bit lanes are non-zero, 0 otherwise
     popVec(v0)
     if ARM64 or ARM64E
@@ -5817,6 +6250,17 @@ ipintOp(_simd_i8x16_all_true, macro()
         emit "test %eax, %eax"                # Test if any bit is set (any lane was zero)
         emit "sete %al"                       # Set AL to 1 if no bits set (all lanes non-zero), 0 otherwise
         emit "movzbl %al, %eax"               # Zero-extend to full 32-bit register
+    elsif PPC64
+        emit "vxor 2, 2, 2"
+        emit "vcmpequb 0, 0, 2"
+        emit "mfvsrd 3, 32"
+        emit "xxswapd 34, 32"
+        emit "mfvsrd 4, 34"
+        emit "or 3, 3, 4"
+        emit "neg 4, 3"
+        emit "or 3, 3, 4"
+        emit "srdi 3, 3, 63"
+        emit "xori 3, 3, 1"
     else
         break # Not implemented
     end
@@ -5825,7 +6269,7 @@ ipintOp(_simd_i8x16_all_true, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i8x16_bitmask, macro()
+ipintSIMDOp(_simd_i8x16_bitmask, macro()
     # i8x16.bitmask - extract most significant bit from each 8-bit lane into a 16-bit integer
     # Simple loop over the 16 bytes on the stack
 
@@ -5853,7 +6297,7 @@ ipintOp(_simd_i8x16_bitmask, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i8x16_narrow_i16x8_s, macro()
+ipintSIMDOp(_simd_i8x16_narrow_i16x8_s, macro()
     # i8x16.narrow_i16x8_s - narrow 2 i16x8 vectors to 1 i8x16 vector with signed saturation
     popVec(v1)  # Second operand
     popVec(v0)  # First operand
@@ -5863,6 +6307,10 @@ ipintOp(_simd_i8x16_narrow_i16x8_s, macro()
         emit "sqxtn2 v16.16b, v17.8h"  # Narrow second vector (v1) to upper 8 bytes
     elsif X86_64
         emit "vpacksswb %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xxswapd 32, 32"
+        emit "xxswapd 33, 33"
+        emit "vpkshss 0, 0, 1"
     else
         break # Not implemented
     end
@@ -5871,7 +6319,7 @@ ipintOp(_simd_i8x16_narrow_i16x8_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i8x16_narrow_i16x8_u, macro()
+ipintSIMDOp(_simd_i8x16_narrow_i16x8_u, macro()
     # i8x16.narrow_i16x8_u - narrow 2 i16x8 vectors to 1 i8x16 vector with unsigned saturation
     popVec(v1)  # Second operand
     popVec(v0)  # First operand
@@ -5881,6 +6329,10 @@ ipintOp(_simd_i8x16_narrow_i16x8_u, macro()
         emit "sqxtun2 v16.16b, v17.8h"  # Narrow second vector (v1) to upper 8 bytes
     elsif X86_64
         emit "vpackuswb %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xxswapd 32, 32"
+        emit "xxswapd 33, 33"
+        emit "vpkshus 0, 0, 1"
     else
         break # Not implemented
     end
@@ -5891,13 +6343,15 @@ end)
 
 # 0xFD 0x67 - 0xFD 0x6A: f32x4 operations
 
-ipintOp(_simd_f32x4_ceil, macro()
+ipintSIMDOp(_simd_f32x4_ceil, macro()
     # f32x4.ceil - ceiling of 4 32-bit floats
     popVec(v0)
     if ARM64 or ARM64E
         emit "frintp v16.4s, v16.4s"
     elsif X86_64
         emit "vroundps $0x2, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvrspip 32, 32"
     else
         break # Not implemented
     end
@@ -5906,13 +6360,15 @@ ipintOp(_simd_f32x4_ceil, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f32x4_floor, macro()
+ipintSIMDOp(_simd_f32x4_floor, macro()
     # f32x4.floor - floor of 4 32-bit floats
     popVec(v0)
     if ARM64 or ARM64E
         emit "frintm v16.4s, v16.4s"
     elsif X86_64
         emit "vroundps $0x1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvrspim 32, 32"
     else
         break # Not implemented
     end
@@ -5921,13 +6377,15 @@ ipintOp(_simd_f32x4_floor, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f32x4_trunc, macro()
+ipintSIMDOp(_simd_f32x4_trunc, macro()
     # f32x4.trunc - truncate 4 32-bit floats
     popVec(v0)
     if ARM64 or ARM64E
         emit "frintz v16.4s, v16.4s"
     elsif X86_64
         emit "vroundps $0x3, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvrspiz 32, 32"
     else
         break # Not implemented
     end
@@ -5936,13 +6394,15 @@ ipintOp(_simd_f32x4_trunc, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f32x4_nearest, macro()
+ipintSIMDOp(_simd_f32x4_nearest, macro()
     # f32x4.nearest - round to nearest integer (ties to even) for 4 32-bit floats
     popVec(v0)
     if ARM64 or ARM64E
         emit "frintn v16.4s, v16.4s"
     elsif X86_64
         emit "vroundps $0x0, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvrspic 32, 32"
     else
         break # Not implemented
     end
@@ -5953,7 +6413,7 @@ end)
 
 # 0xFD 0x6B - 0xFD 0x73: i8x16 binary operations
 
-ipintOp(_simd_i8x16_shl, macro()
+ipintSIMDOp(_simd_i8x16_shl, macro()
     # i8x16.shl - left shift 16 8-bit integers
     popInt32(t0)  # shift count
     popVec(v0)        # vector
@@ -5991,6 +6451,10 @@ ipintOp(_simd_i8x16_shl, macro()
 
         # Pack low and high results back to bytes
         emit "vpackuswb %xmm3, %xmm2, %xmm0"
+    elsif PPC64
+        emit "mtvsrwz 33, 3"
+        emit "vspltb 1, 1, 7"
+        emit "vslb 0, 0, 1"
     else
         break # Not implemented
     end
@@ -5999,7 +6463,7 @@ ipintOp(_simd_i8x16_shl, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i8x16_shr_s, macro()
+ipintSIMDOp(_simd_i8x16_shr_s, macro()
     # i8x16.shr_s - arithmetic right shift 16 8-bit signed integers
     popInt32(t0)  # shift count
     popVec(v0)        # vector
@@ -6033,6 +6497,10 @@ ipintOp(_simd_i8x16_shr_s, macro()
 
         # Pack low and high results back to signed bytes
         emit "vpacksswb %xmm3, %xmm2, %xmm0"
+    elsif PPC64
+        emit "mtvsrwz 33, 3"
+        emit "vspltb 1, 1, 7"
+        emit "vsrab 0, 0, 1"
     else
         break # Not implemented
     end
@@ -6041,7 +6509,7 @@ ipintOp(_simd_i8x16_shr_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i8x16_shr_u, macro()
+ipintSIMDOp(_simd_i8x16_shr_u, macro()
     # i8x16.shr_u - logical right shift 16 8-bit unsigned integers
     popInt32(t0)  # shift count
     popVec(v0)        # vector
@@ -6075,6 +6543,10 @@ ipintOp(_simd_i8x16_shr_u, macro()
 
         # Pack low and high results back to unsigned bytes
         emit "vpackuswb %xmm3, %xmm2, %xmm0"
+    elsif PPC64
+        emit "mtvsrwz 33, 3"
+        emit "vspltb 1, 1, 7"
+        emit "vsrb 0, 0, 1"
     else
         break # Not implemented
     end
@@ -6083,7 +6555,7 @@ ipintOp(_simd_i8x16_shr_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i8x16_add, macro()
+ipintSIMDOp(_simd_i8x16_add, macro()
     # i8x16.add - add 16 8-bit integers
     popVec(v1)
     popVec(v0)
@@ -6091,6 +6563,8 @@ ipintOp(_simd_i8x16_add, macro()
         emit "add v16.16b, v16.16b, v17.16b"
     elsif X86_64
         emit "vpaddb %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vaddubm 0, 0, 1"
     else
         break # Not implemented
     end
@@ -6099,7 +6573,7 @@ ipintOp(_simd_i8x16_add, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i8x16_add_sat_s, macro()
+ipintSIMDOp(_simd_i8x16_add_sat_s, macro()
     # i8x16.add_sat_s - add 16 8-bit signed integers with saturation
     popVec(v1)
     popVec(v0)
@@ -6107,6 +6581,8 @@ ipintOp(_simd_i8x16_add_sat_s, macro()
         emit "sqadd v16.16b, v16.16b, v17.16b"
     elsif X86_64
         emit "vpaddsb %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vaddsbs 0, 0, 1"
     else
         break # Not implemented
     end
@@ -6115,7 +6591,7 @@ ipintOp(_simd_i8x16_add_sat_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i8x16_add_sat_u, macro()
+ipintSIMDOp(_simd_i8x16_add_sat_u, macro()
     # i8x16.add_sat_u - add 16 8-bit unsigned integers with saturation
     popVec(v1)
     popVec(v0)
@@ -6123,6 +6599,8 @@ ipintOp(_simd_i8x16_add_sat_u, macro()
         emit "uqadd v16.16b, v16.16b, v17.16b"
     elsif X86_64
         emit "vpaddusb %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vaddubs 0, 0, 1"
     else
         break # Not implemented
     end
@@ -6131,7 +6609,7 @@ ipintOp(_simd_i8x16_add_sat_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i8x16_sub, macro()
+ipintSIMDOp(_simd_i8x16_sub, macro()
     # i8x16.sub - subtract 16 8-bit integers
     popVec(v1)
     popVec(v0)
@@ -6139,6 +6617,8 @@ ipintOp(_simd_i8x16_sub, macro()
         emit "sub v16.16b, v16.16b, v17.16b"
     elsif X86_64
         emit "vpsubb %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vsububm 0, 0, 1"
     else
         break # Not implemented
     end
@@ -6147,7 +6627,7 @@ ipintOp(_simd_i8x16_sub, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i8x16_sub_sat_s, macro()
+ipintSIMDOp(_simd_i8x16_sub_sat_s, macro()
     # i8x16.sub_sat_s - subtract 16 8-bit signed integers with saturation
     popVec(v1)
     popVec(v0)
@@ -6155,6 +6635,8 @@ ipintOp(_simd_i8x16_sub_sat_s, macro()
         emit "sqsub v16.16b, v16.16b, v17.16b"
     elsif X86_64
         emit "vpsubsb %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vsubsbs 0, 0, 1"
     else
         break # Not implemented
     end
@@ -6163,7 +6645,7 @@ ipintOp(_simd_i8x16_sub_sat_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i8x16_sub_sat_u, macro()
+ipintSIMDOp(_simd_i8x16_sub_sat_u, macro()
     # i8x16.sub_sat_u - subtract 16 8-bit unsigned integers with saturation
     popVec(v1)
     popVec(v0)
@@ -6171,6 +6653,8 @@ ipintOp(_simd_i8x16_sub_sat_u, macro()
         emit "uqsub v16.16b, v16.16b, v17.16b"
     elsif X86_64
         emit "vpsubusb %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vsububs 0, 0, 1"
     else
         break # Not implemented
     end
@@ -6181,13 +6665,15 @@ end)
 
 # 0xFD 0x74 - 0xFD 0x75: f64x2 operations
 
-ipintOp(_simd_f64x2_ceil, macro()
+ipintSIMDOp(_simd_f64x2_ceil, macro()
     # f64x2.ceil - ceiling of 2 64-bit floats
     popVec(v0)
     if ARM64 or ARM64E
         emit "frintp v16.2d, v16.2d"
     elsif X86_64
         emit "vroundpd $0x2, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvrdpip 32, 32"
     else
         break # Not implemented
     end
@@ -6196,13 +6682,15 @@ ipintOp(_simd_f64x2_ceil, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f64x2_floor, macro()
+ipintSIMDOp(_simd_f64x2_floor, macro()
     # f64x2.floor - floor of 2 64-bit floats
     popVec(v0)
     if ARM64 or ARM64E
         emit "frintm v16.2d, v16.2d"
     elsif X86_64
         emit "vroundpd $0x1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvrdpim 32, 32"
     else
         break # Not implemented
     end
@@ -6212,7 +6700,7 @@ ipintOp(_simd_f64x2_floor, macro()
 end)
 
 # 0xFD 0x76 - 0xFD 0x79: i8x16 binary operations
-ipintOp(_simd_i8x16_min_s, macro()
+ipintSIMDOp(_simd_i8x16_min_s, macro()
     # i8x16.min_s - minimum of 16 8-bit signed integers
     popVec(v1)
     popVec(v0)
@@ -6220,6 +6708,8 @@ ipintOp(_simd_i8x16_min_s, macro()
         emit "smin v16.16b, v16.16b, v17.16b"
     elsif X86_64
         emit "vpminsb %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vminsb 0, 0, 1"
     else
         break # Not implemented
     end
@@ -6228,7 +6718,7 @@ ipintOp(_simd_i8x16_min_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i8x16_min_u, macro()
+ipintSIMDOp(_simd_i8x16_min_u, macro()
     # i8x16.min_u - minimum of 16 8-bit unsigned integers
     popVec(v1)
     popVec(v0)
@@ -6236,6 +6726,8 @@ ipintOp(_simd_i8x16_min_u, macro()
         emit "umin v16.16b, v16.16b, v17.16b"
     elsif X86_64
         emit "vpminub %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vminub 0, 0, 1"
     else
         break # Not implemented
     end
@@ -6244,7 +6736,7 @@ ipintOp(_simd_i8x16_min_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i8x16_max_s, macro()
+ipintSIMDOp(_simd_i8x16_max_s, macro()
     # i8x16.max_s - maximum of 16 8-bit signed integers
     popVec(v1)
     popVec(v0)
@@ -6252,6 +6744,8 @@ ipintOp(_simd_i8x16_max_s, macro()
         emit "smax v16.16b, v16.16b, v17.16b"
     elsif X86_64
         emit "vpmaxsb %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vmaxsb 0, 0, 1"
     else
         break # Not implemented
     end
@@ -6260,7 +6754,7 @@ ipintOp(_simd_i8x16_max_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i8x16_max_u, macro()
+ipintSIMDOp(_simd_i8x16_max_u, macro()
     # i8x16.max_u - maximum of 16 8-bit unsigned integers
     popVec(v1)
     popVec(v0)
@@ -6268,6 +6762,8 @@ ipintOp(_simd_i8x16_max_u, macro()
         emit "umax v16.16b, v16.16b, v17.16b"
     elsif X86_64
         emit "vpmaxub %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vmaxub 0, 0, 1"
     else
         break # Not implemented
     end
@@ -6278,13 +6774,15 @@ end)
 
 # 0xFD 0x7A: f64x2 trunc
 
-ipintOp(_simd_f64x2_trunc, macro()
+ipintSIMDOp(_simd_f64x2_trunc, macro()
     # f64x2.trunc - truncate 2 64-bit floats
     popVec(v0)
     if ARM64 or ARM64E
         emit "frintz v16.2d, v16.2d"
     elsif X86_64
         emit "vroundpd $0x3, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvrdpiz 32, 32"
     else
         break # Not implemented
     end
@@ -6295,7 +6793,7 @@ end)
 
 # 0xFD 0x7B: i8x16 avgr_u
 
-ipintOp(_simd_i8x16_avgr_u, macro()
+ipintSIMDOp(_simd_i8x16_avgr_u, macro()
     # i8x16.avgr_u - average of 16 8-bit unsigned integers with rounding
     popVec(v1)
     popVec(v0)
@@ -6303,6 +6801,8 @@ ipintOp(_simd_i8x16_avgr_u, macro()
         emit "urhadd v16.16b, v16.16b, v17.16b"
     elsif X86_64
         emit "vpavgb %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vavgub 0, 0, 1"
     else
         break # Not implemented
     end
@@ -6313,7 +6813,7 @@ end)
 
 # 0xFD 0x7C - 0xFD 0x7F: extadd_pairwise
 
-ipintOp(_simd_i16x8_extadd_pairwise_i8x16_s, macro()
+ipintSIMDOp(_simd_i16x8_extadd_pairwise_i8x16_s, macro()
     # i16x8.extadd_pairwise_i8x16_s - pairwise addition of signed 8-bit integers to 16-bit
     popVec(v0)
     if ARM64 or ARM64E
@@ -6323,6 +6823,11 @@ ipintOp(_simd_i16x8_extadd_pairwise_i8x16_s, macro()
         emit "vpsrlw $15, %xmm1, %xmm1"       # Shift to get 0x0001 in each 16-bit lane
         emit "vpackuswb %xmm1, %xmm1, %xmm1"  # Pack to get 0x01 in each 8-bit lane
         emit "vpmaddubsw %xmm0, %xmm1, %xmm0" # Pairwise multiply-add (signed)
+    elsif PPC64
+        emit "vspltisb 2, 1"
+        emit "vmulesb 3, 0, 2"
+        emit "vmulosb 4, 0, 2"
+        emit "vadduhm 0, 3, 4"
     else
         break # Not implemented
     end
@@ -6331,7 +6836,7 @@ ipintOp(_simd_i16x8_extadd_pairwise_i8x16_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_extadd_pairwise_i8x16_u, macro()
+ipintSIMDOp(_simd_i16x8_extadd_pairwise_i8x16_u, macro()
     # i16x8.extadd_pairwise_i8x16_u - pairwise addition of unsigned 8-bit integers to 16-bit
     popVec(v0)
     if ARM64 or ARM64E
@@ -6341,6 +6846,11 @@ ipintOp(_simd_i16x8_extadd_pairwise_i8x16_u, macro()
         emit "vpsrlw $15, %xmm1, %xmm1"       # Shift to get 0x0001 in each 16-bit lane
         emit "vpackuswb %xmm1, %xmm1, %xmm1"  # Pack to get 0x01 in each 8-bit lane
         emit "vpmaddubsw %xmm1, %xmm0, %xmm0" # Pairwise multiply-add (unsigned)
+    elsif PPC64
+        emit "vspltisb 2, 1"
+        emit "vmuleub 3, 0, 2"
+        emit "vmuloub 4, 0, 2"
+        emit "vadduhm 0, 3, 4"
     else
         break # Not implemented
     end
@@ -6349,7 +6859,7 @@ ipintOp(_simd_i16x8_extadd_pairwise_i8x16_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_extadd_pairwise_i16x8_s, macro()
+ipintSIMDOp(_simd_i32x4_extadd_pairwise_i16x8_s, macro()
     # i32x4.extadd_pairwise_i16x8_s - pairwise addition of signed 16-bit integers to 32-bit
     popVec(v0)
     if ARM64 or ARM64E
@@ -6359,6 +6869,10 @@ ipintOp(_simd_i32x4_extadd_pairwise_i16x8_s, macro()
         emit "vpsrld $31, %xmm1, %xmm1"       # Shift to get 0x00000001 in each 32-bit lane
         emit "vpackssdw %xmm1, %xmm1, %xmm1"  # Pack to get 0x0001 in each 16-bit lane
         emit "vpmaddwd %xmm0, %xmm1, %xmm0"   # Pairwise multiply-add
+    elsif PPC64
+        emit "vspltish 2, 1"
+        emit "vxor 3, 3, 3"
+        emit "vmsumshm 0, 0, 2, 3"
     else
         break # Not implemented
     end
@@ -6367,7 +6881,7 @@ ipintOp(_simd_i32x4_extadd_pairwise_i16x8_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_extadd_pairwise_i16x8_u, macro()
+ipintSIMDOp(_simd_i32x4_extadd_pairwise_i16x8_u, macro()
     # i32x4.extadd_pairwise_i16x8_u - pairwise addition of unsigned 16-bit integers to 32-bit
     popVec(v0)
     if ARM64 or ARM64E
@@ -6376,6 +6890,10 @@ ipintOp(_simd_i32x4_extadd_pairwise_i16x8_u, macro()
         emit "vpsrld $16, %xmm0, %xmm1"            # Shift right to get high 16-bits in low position
         emit "vpblendw $0xAA, %xmm1, %xmm0, %xmm0" # Blend: keep low 16-bits from src, high 16-bits from shifted
         emit "vpaddd %xmm1, %xmm0, %xmm0"          # Add the pairs
+    elsif PPC64
+        emit "vspltish 2, 1"
+        emit "vxor 3, 3, 3"
+        emit "vmsumuhm 0, 0, 2, 3"
     else
         break # Not implemented
     end
@@ -6386,13 +6904,17 @@ end)
 
 # 0xFD 0x80 0x01 - 0xFD 0x93 0x01: i16x8 operations
 
-ipintOp(_simd_i16x8_abs, macro()
+ipintSIMDOp(_simd_i16x8_abs, macro()
     # i16x8.abs - absolute value of 8 16-bit signed integers
     popVec(v0)
     if ARM64 or ARM64E
         emit "abs v16.8h, v16.8h"
     elsif X86_64
         emit "vpabsw %xmm0, %xmm0"
+    elsif PPC64
+        emit "vxor 2, 2, 2"
+        emit "vsubuhm 2, 2, 0"
+        emit "vmaxsh 0, 0, 2"
     else
         break # Not implemented
     end
@@ -6401,7 +6923,7 @@ ipintOp(_simd_i16x8_abs, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_neg, macro()
+ipintSIMDOp(_simd_i16x8_neg, macro()
     # i16x8.neg - negate 8 16-bit integers
     popVec(v0)
     if ARM64 or ARM64E
@@ -6410,6 +6932,9 @@ ipintOp(_simd_i16x8_neg, macro()
         # Negate by subtracting from zero
         emit "vpxor %xmm1, %xmm1, %xmm1"
         emit "vpsubw %xmm0, %xmm1, %xmm0"
+    elsif PPC64
+        emit "vxor 2, 2, 2"
+        emit "vsubuhm 0, 2, 0"
     else
         break # Not implemented
     end
@@ -6418,7 +6943,7 @@ ipintOp(_simd_i16x8_neg, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_q15mulr_sat_s, macro()
+ipintSIMDOp(_simd_i16x8_q15mulr_sat_s, macro()
     # i16x8.q15mulr_sat_s - Q15 multiply with rounding and saturation
     # Q15 format: multiply two 16-bit values, shift right by 15, round and saturate
     popVec(v1)
@@ -6434,6 +6959,9 @@ ipintOp(_simd_i16x8_q15mulr_sat_s, macro()
         emit "vpshufd $0x00, %xmm2, %xmm2"          # Splat to all 8 words
         emit "vpcmpeqw %xmm2, %xmm0, %xmm2"         # Compare result with -32768
         emit "vpxor %xmm2, %xmm0, %xmm0"            # Fix saturation: -32768 becomes 32767
+    elsif PPC64
+        emit "vxor 2, 2, 2"
+        emit "vmhraddshs 0, 0, 1, 2"
     else
         break # Not implemented
     end
@@ -6442,7 +6970,7 @@ ipintOp(_simd_i16x8_q15mulr_sat_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_all_true, macro()
+ipintSIMDOp(_simd_i16x8_all_true, macro()
     # i16x8.all_true - return 1 if all 8 16-bit lanes are non-zero, 0 otherwise
     popVec(v0)
     if ARM64 or ARM64E
@@ -6461,6 +6989,17 @@ ipintOp(_simd_i16x8_all_true, macro()
         emit "testl %eax, %eax"              # Test if any bits are set
         emit "sete %al"                      # Set AL to 1 if no bits set (all lanes non-zero), 0 otherwise
         emit "movzbl %al, %eax"              # Zero-extend to 32-bit
+    elsif PPC64
+        emit "vxor 2, 2, 2"
+        emit "vcmpequh 0, 0, 2"
+        emit "mfvsrd 3, 32"
+        emit "xxswapd 34, 32"
+        emit "mfvsrd 4, 34"
+        emit "or 3, 3, 4"
+        emit "neg 4, 3"
+        emit "or 3, 3, 4"
+        emit "srdi 3, 3, 63"
+        emit "xori 3, 3, 1"
     else
         break # Not implemented
     end
@@ -6469,7 +7008,7 @@ ipintOp(_simd_i16x8_all_true, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_bitmask, macro()
+ipintSIMDOp(_simd_i16x8_bitmask, macro()
     # i16x8.bitmask - extract most significant bit from each 16-bit lane into an 8-bit integer
     # Simple loop over the 8 16-bit values on the stack
 
@@ -6497,7 +7036,7 @@ ipintOp(_simd_i16x8_bitmask, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_narrow_i32x4_s, macro()
+ipintSIMDOp(_simd_i16x8_narrow_i32x4_s, macro()
     # i16x8.narrow_i32x4_s - narrow 2 i32x4 vectors to 1 i16x8 vector with signed saturation
     popVec(v1)  # Second operand
     popVec(v0)  # First operand
@@ -6507,6 +7046,10 @@ ipintOp(_simd_i16x8_narrow_i32x4_s, macro()
         emit "sqxtn2 v16.8h, v17.4s"   # Narrow second vector (v1) to upper 4 halfwords
     elsif X86_64
         emit "vpackssdw %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xxswapd 32, 32"
+        emit "xxswapd 33, 33"
+        emit "vpkswss 0, 0, 1"
     else
         break # Not implemented
     end
@@ -6515,7 +7058,7 @@ ipintOp(_simd_i16x8_narrow_i32x4_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_narrow_i32x4_u, macro()
+ipintSIMDOp(_simd_i16x8_narrow_i32x4_u, macro()
     # i16x8.narrow_i32x4_u - narrow 2 i32x4 vectors to 1 i16x8 vector with unsigned saturation
     popVec(v1)  # Second operand
     popVec(v0)  # First operand
@@ -6525,6 +7068,10 @@ ipintOp(_simd_i16x8_narrow_i32x4_u, macro()
         emit "sqxtun2 v16.8h, v17.4s"   # Narrow second vector (v1) to upper 4 halfwords
     elsif X86_64
         emit "vpackusdw %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xxswapd 32, 32"
+        emit "xxswapd 33, 33"
+        emit "vpkswus 0, 0, 1"
     else
         break # Not implemented
     end
@@ -6533,13 +7080,16 @@ ipintOp(_simd_i16x8_narrow_i32x4_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_extend_low_i8x16_s, macro()
+ipintSIMDOp(_simd_i16x8_extend_low_i8x16_s, macro()
     # i16x8.extend_low_i8x16_s - sign-extend lower 8 i8 values to i16
     popVec(v0)
     if ARM64 or ARM64E
         emit "sxtl v16.8h, v16.8b"
     elsif X86_64
         emit "vpmovsxbw %xmm0, %xmm0"
+    elsif PPC64
+        emit "vupkhsb 0, 0"
+        emit "xxswapd 32, 32"
     else
         break # Not implemented
     end
@@ -6548,7 +7098,7 @@ ipintOp(_simd_i16x8_extend_low_i8x16_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_extend_high_i8x16_s, macro()
+ipintSIMDOp(_simd_i16x8_extend_high_i8x16_s, macro()
     # i16x8.extend_high_i8x16_s - sign-extend upper 8 i8 values to i16
     popVec(v0)
     if ARM64 or ARM64E
@@ -6557,6 +7107,9 @@ ipintOp(_simd_i16x8_extend_high_i8x16_s, macro()
         # Move high 64 bits to low, then sign extend
         emit "vpsrldq $8, %xmm0, %xmm0"   # Shift right 8 bytes to get high half
         emit "vpmovsxbw %xmm0, %xmm0"     # Sign extend
+    elsif PPC64
+        emit "vupklsb 0, 0"
+        emit "xxswapd 32, 32"
     else
         break # Not implemented
     end
@@ -6565,13 +7118,17 @@ ipintOp(_simd_i16x8_extend_high_i8x16_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_extend_low_i8x16_u, macro()
+ipintSIMDOp(_simd_i16x8_extend_low_i8x16_u, macro()
     # i16x8.extend_low_i8x16_u - zero-extend lower 8 i8 values to i16
     popVec(v0)
     if ARM64 or ARM64E
         emit "uxtl v16.8h, v16.8b"
     elsif X86_64
         emit "vpmovzxbw %xmm0, %xmm0"
+    elsif PPC64
+        emit "vxor 2, 2, 2"
+        emit "vmrghb 0, 2, 0"
+        emit "xxswapd 32, 32"
     else
         break # Not implemented
     end
@@ -6580,7 +7137,7 @@ ipintOp(_simd_i16x8_extend_low_i8x16_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_extend_high_i8x16_u, macro()
+ipintSIMDOp(_simd_i16x8_extend_high_i8x16_u, macro()
     # i16x8.extend_high_i8x16_u - zero-extend upper 8 i8 values to i16
     popVec(v0)
     if ARM64 or ARM64E
@@ -6589,6 +7146,10 @@ ipintOp(_simd_i16x8_extend_high_i8x16_u, macro()
         # Move high 64 bits to low, then zero extend
         emit "vpsrldq $8, %xmm0, %xmm0"   # Shift right 8 bytes to get high half
         emit "vpmovzxbw %xmm0, %xmm0"     # Zero extend
+    elsif PPC64
+        emit "vxor 2, 2, 2"
+        emit "vmrglb 0, 2, 0"
+        emit "xxswapd 32, 32"
     else
         break # Not implemented
     end
@@ -6597,7 +7158,7 @@ ipintOp(_simd_i16x8_extend_high_i8x16_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_shl, macro()
+ipintSIMDOp(_simd_i16x8_shl, macro()
     # i16x8.shl - left shift 8 16-bit integers
     popInt32(t0)  # shift count
     popVec(v0)        # vector
@@ -6614,6 +7175,10 @@ ipintOp(_simd_i16x8_shl, macro()
         emit "movd %eax, %xmm1"
         # Perform left shift on 16-bit words
         emit "vpsllw %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "mtvsrwz 33, 3"
+        emit "vspltb 1, 1, 7"
+        emit "vslh 0, 0, 1"
     else
         break # Not implemented
     end
@@ -6622,7 +7187,7 @@ ipintOp(_simd_i16x8_shl, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_shr_s, macro()
+ipintSIMDOp(_simd_i16x8_shr_s, macro()
     # i16x8.shr_s - arithmetic right shift 8 16-bit signed integers
     popInt32(t0)  # shift count
     popVec(v0)        # vector
@@ -6641,6 +7206,10 @@ ipintOp(_simd_i16x8_shr_s, macro()
         emit "movd %eax, %xmm1"
         # Perform arithmetic right shift on 16-bit words
         emit "vpsraw %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "mtvsrwz 33, 3"
+        emit "vspltb 1, 1, 7"
+        emit "vsrah 0, 0, 1"
     else
         break # Not implemented
     end
@@ -6649,7 +7218,7 @@ ipintOp(_simd_i16x8_shr_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_shr_u, macro()
+ipintSIMDOp(_simd_i16x8_shr_u, macro()
     # i16x8.shr_u - logical right shift 8 16-bit unsigned integers
     popInt32(t0)  # shift count
     popVec(v0)        # vector
@@ -6666,6 +7235,10 @@ ipintOp(_simd_i16x8_shr_u, macro()
         andi 15, t0
         emit "movd %eax, %xmm1"
         emit "vpsrlw %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "mtvsrwz 33, 3"
+        emit "vspltb 1, 1, 7"
+        emit "vsrh 0, 0, 1"
     else
         break # Not implemented
     end
@@ -6674,7 +7247,7 @@ ipintOp(_simd_i16x8_shr_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_add, macro()
+ipintSIMDOp(_simd_i16x8_add, macro()
     # i16x8.add - add 8 16-bit integers
     popVec(v1)
     popVec(v0)
@@ -6682,6 +7255,8 @@ ipintOp(_simd_i16x8_add, macro()
         emit "add v16.8h, v16.8h, v17.8h"
     elsif X86_64
         emit "vpaddw %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vadduhm 0, 0, 1"
     else
         break # Not implemented
     end
@@ -6690,7 +7265,7 @@ ipintOp(_simd_i16x8_add, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_add_sat_s, macro()
+ipintSIMDOp(_simd_i16x8_add_sat_s, macro()
     # i16x8.add_sat_s - add 8 16-bit signed integers with saturation
     popVec(v1)
     popVec(v0)
@@ -6698,6 +7273,8 @@ ipintOp(_simd_i16x8_add_sat_s, macro()
         emit "sqadd v16.8h, v16.8h, v17.8h"
     elsif X86_64
         emit "vpaddsw %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vaddshs 0, 0, 1"
     else
         break # Not implemented
     end
@@ -6706,7 +7283,7 @@ ipintOp(_simd_i16x8_add_sat_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_add_sat_u, macro()
+ipintSIMDOp(_simd_i16x8_add_sat_u, macro()
     # i16x8.add_sat_u - add 8 16-bit unsigned integers with saturation
     popVec(v1)
     popVec(v0)
@@ -6714,6 +7291,8 @@ ipintOp(_simd_i16x8_add_sat_u, macro()
         emit "uqadd v16.8h, v16.8h, v17.8h"
     elsif X86_64
         emit "vpaddusw %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vadduhs 0, 0, 1"
     else
         break # Not implemented
     end
@@ -6722,7 +7301,7 @@ ipintOp(_simd_i16x8_add_sat_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_sub, macro()
+ipintSIMDOp(_simd_i16x8_sub, macro()
     # i16x8.sub - subtract 8 16-bit integers
     popVec(v1)
     popVec(v0)
@@ -6730,6 +7309,8 @@ ipintOp(_simd_i16x8_sub, macro()
         emit "sub v16.8h, v16.8h, v17.8h"
     elsif X86_64
         emit "vpsubw %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vsubuhm 0, 0, 1"
     else
         break # Not implemented
     end
@@ -6738,7 +7319,7 @@ ipintOp(_simd_i16x8_sub, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_sub_sat_s, macro()
+ipintSIMDOp(_simd_i16x8_sub_sat_s, macro()
     # i16x8.sub_sat_s - subtract 8 16-bit signed integers with saturation
     popVec(v1)
     popVec(v0)
@@ -6746,6 +7327,8 @@ ipintOp(_simd_i16x8_sub_sat_s, macro()
         emit "sqsub v16.8h, v16.8h, v17.8h"
     elsif X86_64
         emit "vpsubsw %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vsubshs 0, 0, 1"
     else
         break # Not implemented
     end
@@ -6754,7 +7337,7 @@ ipintOp(_simd_i16x8_sub_sat_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_sub_sat_u, macro()
+ipintSIMDOp(_simd_i16x8_sub_sat_u, macro()
     # i16x8.sub_sat_u - subtract 8 16-bit unsigned integers with saturation
     popVec(v1)
     popVec(v0)
@@ -6762,6 +7345,8 @@ ipintOp(_simd_i16x8_sub_sat_u, macro()
         emit "uqsub v16.8h, v16.8h, v17.8h"
     elsif X86_64
         emit "vpsubusw %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vsubuhs 0, 0, 1"
     else
         break # Not implemented
     end
@@ -6772,13 +7357,15 @@ end)
 
 # 0xFD 0x94 0x01: f64x2.nearest
 
-ipintOp(_simd_f64x2_nearest, macro()
+ipintSIMDOp(_simd_f64x2_nearest, macro()
     # f64x2.nearest - round to nearest integer (ties to even) for 2 64-bit floats
     popVec(v0)
     if ARM64 or ARM64E
         emit "frintn v16.2d, v16.2d"
     elsif X86_64
         emit "vroundpd $0x0, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvrdpic 32, 32"
     else
         break # Not implemented
     end
@@ -6789,7 +7376,7 @@ end)
 
 # 0xFD 0x95 0x01 - 0xFD 0x9F 0x01: i16x8 operations
 
-ipintOp(_simd_i16x8_mul, macro()
+ipintSIMDOp(_simd_i16x8_mul, macro()
     # i16x8.mul - multiply 8 16-bit integers
     popVec(v1)
     popVec(v0)
@@ -6797,6 +7384,9 @@ ipintOp(_simd_i16x8_mul, macro()
         emit "mul v16.8h, v16.8h, v17.8h"
     elsif X86_64
         emit "vpmullw %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vxor 2, 2, 2"
+        emit "vmladduhm 0, 0, 1, 2"
     else
         break # Not implemented
     end
@@ -6805,7 +7395,7 @@ ipintOp(_simd_i16x8_mul, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_min_s, macro()
+ipintSIMDOp(_simd_i16x8_min_s, macro()
     # i16x8.min_s - minimum of 8 16-bit signed integers
     popVec(v1)
     popVec(v0)
@@ -6813,6 +7403,8 @@ ipintOp(_simd_i16x8_min_s, macro()
         emit "smin v16.8h, v16.8h, v17.8h"
     elsif X86_64
         emit "vpminsw %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vminsh 0, 0, 1"
     else
         break # Not implemented
     end
@@ -6821,7 +7413,7 @@ ipintOp(_simd_i16x8_min_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_min_u, macro()
+ipintSIMDOp(_simd_i16x8_min_u, macro()
     # i16x8.min_u - minimum of 8 16-bit unsigned integers
     popVec(v1)
     popVec(v0)
@@ -6829,6 +7421,8 @@ ipintOp(_simd_i16x8_min_u, macro()
         emit "umin v16.8h, v16.8h, v17.8h"
     elsif X86_64
         emit "vpminuw %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vminuh 0, 0, 1"
     else
         break # Not implemented
     end
@@ -6837,7 +7431,7 @@ ipintOp(_simd_i16x8_min_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_max_s, macro()
+ipintSIMDOp(_simd_i16x8_max_s, macro()
     # i16x8.max_s - maximum of 8 16-bit signed integers
     popVec(v1)
     popVec(v0)
@@ -6845,6 +7439,8 @@ ipintOp(_simd_i16x8_max_s, macro()
         emit "smax v16.8h, v16.8h, v17.8h"
     elsif X86_64
         emit "vpmaxsw %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vmaxsh 0, 0, 1"
     else
         break # Not implemented
     end
@@ -6853,7 +7449,7 @@ ipintOp(_simd_i16x8_max_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_max_u, macro()
+ipintSIMDOp(_simd_i16x8_max_u, macro()
     # i16x8.max_u - maximum of 8 16-bit unsigned integers
     popVec(v1)
     popVec(v0)
@@ -6861,6 +7457,8 @@ ipintOp(_simd_i16x8_max_u, macro()
         emit "umax v16.8h, v16.8h, v17.8h"
     elsif X86_64
         emit "vpmaxuw %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vmaxuh 0, 0, 1"
     else
         break # Not implemented
     end
@@ -6871,7 +7469,7 @@ end)
 
 reservedOpcode(0xfd9a01)
 
-ipintOp(_simd_i16x8_avgr_u, macro()
+ipintSIMDOp(_simd_i16x8_avgr_u, macro()
     # i16x8.avgr_u - average of 8 16-bit unsigned integers with rounding
     popVec(v1)
     popVec(v0)
@@ -6879,6 +7477,8 @@ ipintOp(_simd_i16x8_avgr_u, macro()
         emit "urhadd v16.8h, v16.8h, v17.8h"
     elsif X86_64
         emit "vpavgw %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vavguh 0, 0, 1"
     else
         break # Not implemented
     end
@@ -6887,7 +7487,7 @@ ipintOp(_simd_i16x8_avgr_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_extmul_low_i8x16_s, macro()
+ipintSIMDOp(_simd_i16x8_extmul_low_i8x16_s, macro()
     # i16x8.extmul_low_i8x16_s - multiply lower 8 i8 elements and extend to i16
     popVec(v1)
     popVec(v0)
@@ -6898,6 +7498,12 @@ ipintOp(_simd_i16x8_extmul_low_i8x16_s, macro()
         emit "vpmovsxbw %xmm0, %xmm2"     # Sign extend left to scratch
         emit "vpmovsxbw %xmm1, %xmm0"     # Sign extend right to dest
         emit "vpmullw %xmm2, %xmm0, %xmm0" # Multiply
+    elsif PPC64
+        emit "vupkhsb 0, 0"
+        emit "vupkhsb 1, 1"
+        emit "vxor 2, 2, 2"
+        emit "vmladduhm 0, 0, 1, 2"
+        emit "xxswapd 32, 32"
     else
         break # Not implemented
     end
@@ -6906,7 +7512,7 @@ ipintOp(_simd_i16x8_extmul_low_i8x16_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_extmul_high_i8x16_s, macro()
+ipintSIMDOp(_simd_i16x8_extmul_high_i8x16_s, macro()
     # i16x8.extmul_high_i8x16_s - multiply upper 8 i8 elements and extend to i16
     popVec(v1)
     popVec(v0)
@@ -6919,6 +7525,12 @@ ipintOp(_simd_i16x8_extmul_high_i8x16_s, macro()
         emit "vpunpckhbw %xmm1, %xmm1, %xmm0"  # Unpack high bytes of right
         emit "vpsraw $8, %xmm0, %xmm0"         # Arithmetic shift to sign extend
         emit "vpmullw %xmm2, %xmm0, %xmm0"     # Multiply
+    elsif PPC64
+        emit "vupklsb 0, 0"
+        emit "vupklsb 1, 1"
+        emit "vxor 2, 2, 2"
+        emit "vmladduhm 0, 0, 1, 2"
+        emit "xxswapd 32, 32"
     else
         break # Not implemented
     end
@@ -6927,7 +7539,7 @@ ipintOp(_simd_i16x8_extmul_high_i8x16_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_extmul_low_i8x16_u, macro()
+ipintSIMDOp(_simd_i16x8_extmul_low_i8x16_u, macro()
     # i16x8.extmul_low_i8x16_u - multiply lower 8 u8 elements and extend to i16
     popVec(v1)
     popVec(v0)
@@ -6938,6 +7550,12 @@ ipintOp(_simd_i16x8_extmul_low_i8x16_u, macro()
         emit "vpmovzxbw %xmm0, %xmm2"      # Zero extend left to scratch
         emit "vpmovzxbw %xmm1, %xmm0"      # Zero extend right to dest
         emit "vpmullw %xmm2, %xmm0, %xmm0" # Multiply
+    elsif PPC64
+        emit "vxor 2, 2, 2"
+        emit "vmrghb 0, 2, 0"
+        emit "vmrghb 1, 2, 1"
+        emit "vmladduhm 0, 0, 1, 2"
+        emit "xxswapd 32, 32"
     else
         break # Not implemented
     end
@@ -6946,7 +7564,7 @@ ipintOp(_simd_i16x8_extmul_low_i8x16_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_extmul_high_i8x16_u, macro()
+ipintSIMDOp(_simd_i16x8_extmul_high_i8x16_u, macro()
     # i16x8.extmul_high_i8x16_u - multiply upper 8 u8 elements and extend to i16
     popVec(v1)
     popVec(v0)
@@ -6958,6 +7576,12 @@ ipintOp(_simd_i16x8_extmul_high_i8x16_u, macro()
         emit "vpunpckhbw %xmm2, %xmm1, %xmm1"  # Unpack high bytes of right with zeros  
         emit "vpunpckhbw %xmm2, %xmm0, %xmm0"  # Unpack high bytes of left with zeros
         emit "vpmullw %xmm1, %xmm0, %xmm0"     # Multiply
+    elsif PPC64
+        emit "vxor 2, 2, 2"
+        emit "vmrglb 0, 2, 0"
+        emit "vmrglb 1, 2, 1"
+        emit "vmladduhm 0, 0, 1, 2"
+        emit "xxswapd 32, 32"
     else
         break # Not implemented
     end
@@ -6968,13 +7592,17 @@ end)
 
 # 0xFD 0xA0 0x01 - 0xFD 0xBF 0x01: i32x4 operations
 
-ipintOp(_simd_i32x4_abs, macro()
+ipintSIMDOp(_simd_i32x4_abs, macro()
     # i32x4.abs - absolute value of 4 32-bit signed integers
     popVec(v0)
     if ARM64 or ARM64E
         emit "abs v16.4s, v16.4s"
     elsif X86_64
         emit "vpabsd %xmm0, %xmm0"
+    elsif PPC64
+        emit "vxor 2, 2, 2"
+        emit "vsubuwm 2, 2, 0"
+        emit "vmaxsw 0, 0, 2"
     else
         break # Not implemented
     end
@@ -6983,7 +7611,7 @@ ipintOp(_simd_i32x4_abs, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_neg, macro()
+ipintSIMDOp(_simd_i32x4_neg, macro()
     # i32x4.neg - negate 4 32-bit integers
     popVec(v0)
     if ARM64 or ARM64E
@@ -6992,6 +7620,9 @@ ipintOp(_simd_i32x4_neg, macro()
         # Negate by subtracting from zero
         emit "vpxor %xmm1, %xmm1, %xmm1"
         emit "vpsubd %xmm0, %xmm1, %xmm0"
+    elsif PPC64
+        emit "vxor 2, 2, 2"
+        emit "vsubuwm 0, 2, 0"
     else
         break # Not implemented
     end
@@ -7002,7 +7633,7 @@ end)
 
 reservedOpcode(0xfda201)
 
-ipintOp(_simd_i32x4_all_true, macro()
+ipintSIMDOp(_simd_i32x4_all_true, macro()
     # i32x4.all_true - return 1 if all 4 32-bit lanes are non-zero, 0 otherwise
     popVec(v0)
     if ARM64 or ARM64E
@@ -7021,6 +7652,17 @@ ipintOp(_simd_i32x4_all_true, macro()
         emit "testl %eax, %eax"              # Test if any bits are set
         emit "sete %al"                      # Set AL to 1 if no bits set (all lanes non-zero), 0 otherwise
         emit "movzbl %al, %eax"              # Zero-extend to 32-bit
+    elsif PPC64
+        emit "vxor 2, 2, 2"
+        emit "vcmpequw 0, 0, 2"
+        emit "mfvsrd 3, 32"
+        emit "xxswapd 34, 32"
+        emit "mfvsrd 4, 34"
+        emit "or 3, 3, 4"
+        emit "neg 4, 3"
+        emit "or 3, 3, 4"
+        emit "srdi 3, 3, 63"
+        emit "xori 3, 3, 1"
     else
         break # Not implemented
     end
@@ -7029,7 +7671,7 @@ ipintOp(_simd_i32x4_all_true, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_bitmask, macro()
+ipintSIMDOp(_simd_i32x4_bitmask, macro()
     # i32x4.bitmask - extract most significant bit from each 32-bit lane into a 4-bit integer
     # Simple loop over the 4 32-bit values on the stack
 
@@ -7060,13 +7702,16 @@ end)
 reservedOpcode(0xfda501)
 reservedOpcode(0xfda601)
 
-ipintOp(_simd_i32x4_extend_low_i16x8_s, macro()
+ipintSIMDOp(_simd_i32x4_extend_low_i16x8_s, macro()
     # i32x4.extend_low_i16x8_s - sign-extend lower 4 i16 values to i32
     popVec(v0)
     if ARM64 or ARM64E
         emit "sxtl v16.4s, v16.4h"
     elsif X86_64
         emit "vpmovsxwd %xmm0, %xmm0"
+    elsif PPC64
+        emit "vupkhsh 0, 0"
+        emit "xxswapd 32, 32"
     else
         break # Not implemented
     end
@@ -7075,7 +7720,7 @@ ipintOp(_simd_i32x4_extend_low_i16x8_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_extend_high_i16x8_s, macro()
+ipintSIMDOp(_simd_i32x4_extend_high_i16x8_s, macro()
     # i32x4.extend_high_i16x8_s - sign-extend upper 4 i16 values to i32
     popVec(v0)
     if ARM64 or ARM64E
@@ -7084,6 +7729,9 @@ ipintOp(_simd_i32x4_extend_high_i16x8_s, macro()
         # Move high 64 bits to low, then sign extend
         emit "vpsrldq $8, %xmm0, %xmm0"   # Shift right 8 bytes to get high half
         emit "vpmovsxwd %xmm0, %xmm0"     # Sign extend
+    elsif PPC64
+        emit "vupklsh 0, 0"
+        emit "xxswapd 32, 32"
     else
         break # Not implemented
     end
@@ -7092,13 +7740,17 @@ ipintOp(_simd_i32x4_extend_high_i16x8_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_extend_low_i16x8_u, macro()
+ipintSIMDOp(_simd_i32x4_extend_low_i16x8_u, macro()
     # i32x4.extend_low_i16x8_u - zero-extend lower 4 i16 values to i32
     popVec(v0)
     if ARM64 or ARM64E
         emit "uxtl v16.4s, v16.4h"
     elsif X86_64
         emit "vpmovzxwd %xmm0, %xmm0"
+    elsif PPC64
+        emit "vxor 2, 2, 2"
+        emit "vmrghh 0, 2, 0"
+        emit "xxswapd 32, 32"
     else
         break # Not implemented
     end
@@ -7107,7 +7759,7 @@ ipintOp(_simd_i32x4_extend_low_i16x8_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_extend_high_i16x8_u, macro()
+ipintSIMDOp(_simd_i32x4_extend_high_i16x8_u, macro()
     # i32x4.extend_high_i16x8_u - zero-extend upper 4 i16 values to i32
     popVec(v0)
     if ARM64 or ARM64E
@@ -7116,6 +7768,10 @@ ipintOp(_simd_i32x4_extend_high_i16x8_u, macro()
         # Move high 64 bits to low, then zero extend
         emit "vpsrldq $8, %xmm0, %xmm0"   # Shift right 8 bytes to get high half
         emit "vpmovzxwd %xmm0, %xmm0"     # Zero extend
+    elsif PPC64
+        emit "vxor 2, 2, 2"
+        emit "vmrglh 0, 2, 0"
+        emit "xxswapd 32, 32"
     else
         break # Not implemented
     end
@@ -7124,7 +7780,7 @@ ipintOp(_simd_i32x4_extend_high_i16x8_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_shl, macro()
+ipintSIMDOp(_simd_i32x4_shl, macro()
     # i32x4.shl - left shift 4 32-bit integers
     popInt32(t0)  # shift count
     popVec(v0)        # vector
@@ -7139,6 +7795,10 @@ ipintOp(_simd_i32x4_shl, macro()
         andi 31, t0
         emit "vmovd %eax, %xmm1"
         emit "vpslld %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "mtvsrwz 33, 3"
+        emit "vspltb 1, 1, 7"
+        emit "vslw 0, 0, 1"
     else
         break # Not implemented
     end
@@ -7147,7 +7807,7 @@ ipintOp(_simd_i32x4_shl, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_shr_s, macro()
+ipintSIMDOp(_simd_i32x4_shr_s, macro()
     # i32x4.shr_s - arithmetic right shift 4 32-bit signed integers
     popInt32(t0)  # shift count
     popVec(v0)        # vector
@@ -7164,6 +7824,10 @@ ipintOp(_simd_i32x4_shr_s, macro()
         andi 31, t0
         emit "vmovd %eax, %xmm1"
         emit "vpsrad %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "mtvsrwz 33, 3"
+        emit "vspltb 1, 1, 7"
+        emit "vsraw 0, 0, 1"
     else
         break # Not implemented
     end
@@ -7172,7 +7836,7 @@ ipintOp(_simd_i32x4_shr_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_shr_u, macro()
+ipintSIMDOp(_simd_i32x4_shr_u, macro()
     # i32x4.shr_u - logical right shift 4 32-bit unsigned integers
     popInt32(t0)  # shift count
     popVec(v0)        # vector
@@ -7189,6 +7853,10 @@ ipintOp(_simd_i32x4_shr_u, macro()
         andi 31, t0
         emit "vmovd %eax, %xmm1"
         emit "vpsrld %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "mtvsrwz 33, 3"
+        emit "vspltb 1, 1, 7"
+        emit "vsrw 0, 0, 1"
     else
         break # Not implemented
     end
@@ -7197,7 +7865,7 @@ ipintOp(_simd_i32x4_shr_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_add, macro()
+ipintSIMDOp(_simd_i32x4_add, macro()
     # i32x4.add - add 4 32-bit integers
     popVec(v1)
     popVec(v0)
@@ -7205,6 +7873,8 @@ ipintOp(_simd_i32x4_add, macro()
         emit "add v16.4s, v16.4s, v17.4s"
     elsif X86_64
         emit "vpaddd %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vadduwm 0, 0, 1"
     else
         break # Not implemented
     end
@@ -7216,7 +7886,7 @@ end)
 reservedOpcode(0xfdaf01)
 reservedOpcode(0xfdb001)
 
-ipintOp(_simd_i32x4_sub, macro()
+ipintSIMDOp(_simd_i32x4_sub, macro()
     # i32x4.sub - subtract 4 32-bit integers
     popVec(v1)
     popVec(v0)
@@ -7224,6 +7894,8 @@ ipintOp(_simd_i32x4_sub, macro()
         emit "sub v16.4s, v16.4s, v17.4s"
     elsif X86_64
         emit "vpsubd %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vsubuwm 0, 0, 1"
     else
         break # Not implemented
     end
@@ -7236,7 +7908,7 @@ reservedOpcode(0xfdb201)
 reservedOpcode(0xfdb301)
 reservedOpcode(0xfdb401)
 
-ipintOp(_simd_i32x4_mul, macro()
+ipintSIMDOp(_simd_i32x4_mul, macro()
     # i32x4.mul - multiply 4 32-bit integers
     popVec(v1)
     popVec(v0)
@@ -7244,6 +7916,8 @@ ipintOp(_simd_i32x4_mul, macro()
         emit "mul v16.4s, v16.4s, v17.4s"
     elsif X86_64
         emit "vpmulld %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vmuluwm 0, 0, 1"
     else
         break # Not implemented
     end
@@ -7252,7 +7926,7 @@ ipintOp(_simd_i32x4_mul, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_min_s, macro()
+ipintSIMDOp(_simd_i32x4_min_s, macro()
     # i32x4.min_s - minimum of 4 32-bit signed integers
     popVec(v1)
     popVec(v0)
@@ -7260,6 +7934,8 @@ ipintOp(_simd_i32x4_min_s, macro()
         emit "smin v16.4s, v16.4s, v17.4s"
     elsif X86_64
         emit "vpminsd %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vminsw 0, 0, 1"
     else
         break # Not implemented
     end
@@ -7268,7 +7944,7 @@ ipintOp(_simd_i32x4_min_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_min_u, macro()
+ipintSIMDOp(_simd_i32x4_min_u, macro()
     # i32x4.min_u - minimum of 4 32-bit unsigned integers
     popVec(v1)
     popVec(v0)
@@ -7276,6 +7952,8 @@ ipintOp(_simd_i32x4_min_u, macro()
         emit "umin v16.4s, v16.4s, v17.4s"
     elsif X86_64
         emit "vpminud %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vminuw 0, 0, 1"
     else
         break # Not implemented
     end
@@ -7284,7 +7962,7 @@ ipintOp(_simd_i32x4_min_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_max_s, macro()
+ipintSIMDOp(_simd_i32x4_max_s, macro()
     # i32x4.max_s - maximum of 4 32-bit signed integers
     popVec(v1)
     popVec(v0)
@@ -7292,6 +7970,8 @@ ipintOp(_simd_i32x4_max_s, macro()
         emit "smax v16.4s, v16.4s, v17.4s"
     elsif X86_64
         emit "vpmaxsd %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vmaxsw 0, 0, 1"
     else
         break # Not implemented
     end
@@ -7300,7 +7980,7 @@ ipintOp(_simd_i32x4_max_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_max_u, macro()
+ipintSIMDOp(_simd_i32x4_max_u, macro()
     # i32x4.max_u - maximum of 4 32-bit unsigned integers
     popVec(v1)
     popVec(v0)
@@ -7308,6 +7988,8 @@ ipintOp(_simd_i32x4_max_u, macro()
         emit "umax v16.4s, v16.4s, v17.4s"
     elsif X86_64
         emit "vpmaxud %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vmaxuw 0, 0, 1"
     else
         break # Not implemented
     end
@@ -7316,7 +7998,7 @@ ipintOp(_simd_i32x4_max_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_dot_i16x8_s, macro()
+ipintSIMDOp(_simd_i32x4_dot_i16x8_s, macro()
     # i32x4.dot_i16x8_s - dot product of signed 16-bit integers to 32-bit
     # Multiplies pairs of adjacent 16-bit elements and adds the results
     popVec(v1)
@@ -7329,6 +8011,9 @@ ipintOp(_simd_i32x4_dot_i16x8_s, macro()
         emit "addp v16.4s, v18.4s, v16.4s"       # pairwise add to get final dot product result
     elsif X86_64
         emit "vpmaddwd %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vxor 2, 2, 2"
+        emit "vmsumshm 0, 0, 1, 2"
     else
         break # Not implemented
     end
@@ -7338,7 +8023,7 @@ ipintOp(_simd_i32x4_dot_i16x8_s, macro()
 end)
 reservedOpcode(0xfdbb01)
 
-ipintOp(_simd_i32x4_extmul_low_i16x8_s, macro()
+ipintSIMDOp(_simd_i32x4_extmul_low_i16x8_s, macro()
     # i32x4.extmul_low_i16x8_s - multiply lower 4 i16 elements and extend to i32
     popVec(v1)
     popVec(v0)
@@ -7349,6 +8034,11 @@ ipintOp(_simd_i32x4_extmul_low_i16x8_s, macro()
         emit "vpmullw %xmm1, %xmm0, %xmm2"     # Low multiply to scratch
         emit "vpmulhw %xmm1, %xmm0, %xmm0"     # High multiply (signed) to dest
         emit "vpunpcklwd %xmm0, %xmm2, %xmm0"  # Interleave low words
+    elsif PPC64
+        emit "vupkhsh 0, 0"
+        emit "vupkhsh 1, 1"
+        emit "vmuluwm 0, 0, 1"
+        emit "xxswapd 32, 32"
     else
         break # Not implemented
     end
@@ -7357,7 +8047,7 @@ ipintOp(_simd_i32x4_extmul_low_i16x8_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_extmul_high_i16x8_s, macro()
+ipintSIMDOp(_simd_i32x4_extmul_high_i16x8_s, macro()
     # i32x4.extmul_high_i16x8_s - multiply upper 4 i16 elements and extend to i32
     popVec(v1)
     popVec(v0)
@@ -7368,6 +8058,11 @@ ipintOp(_simd_i32x4_extmul_high_i16x8_s, macro()
         emit "vpmullw %xmm1, %xmm0, %xmm2"     # Low multiply to scratch
         emit "vpmulhw %xmm1, %xmm0, %xmm0"     # High multiply (signed) to dest
         emit "vpunpckhwd %xmm0, %xmm2, %xmm0"  # Interleave high words
+    elsif PPC64
+        emit "vupklsh 0, 0"
+        emit "vupklsh 1, 1"
+        emit "vmuluwm 0, 0, 1"
+        emit "xxswapd 32, 32"
     else
         break # Not implemented
     end
@@ -7376,7 +8071,7 @@ ipintOp(_simd_i32x4_extmul_high_i16x8_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_extmul_low_i16x8_u, macro()
+ipintSIMDOp(_simd_i32x4_extmul_low_i16x8_u, macro()
     # i32x4.extmul_low_i16x8_u - multiply lower 4 u16 elements and extend to i32
     popVec(v1)
     popVec(v0)
@@ -7387,6 +8082,12 @@ ipintOp(_simd_i32x4_extmul_low_i16x8_u, macro()
         emit "vpmullw %xmm1, %xmm0, %xmm2"     # Low multiply to scratch
         emit "vpmulhuw %xmm1, %xmm0, %xmm0"    # High multiply (unsigned) to dest
         emit "vpunpcklwd %xmm0, %xmm2, %xmm0"  # Interleave low words
+    elsif PPC64
+        emit "vxor 2, 2, 2"
+        emit "vmrghh 0, 2, 0"
+        emit "vmrghh 1, 2, 1"
+        emit "vmuluwm 0, 0, 1"
+        emit "xxswapd 32, 32"
     else
         break # Not implemented
     end
@@ -7395,7 +8096,7 @@ ipintOp(_simd_i32x4_extmul_low_i16x8_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_extmul_high_i16x8_u, macro()
+ipintSIMDOp(_simd_i32x4_extmul_high_i16x8_u, macro()
     # i32x4.extmul_high_i16x8_u - multiply upper 4 u16 elements and extend to i32
     popVec(v1)
     popVec(v0)
@@ -7406,6 +8107,12 @@ ipintOp(_simd_i32x4_extmul_high_i16x8_u, macro()
         emit "vpmullw %xmm1, %xmm0, %xmm2"     # Low multiply to scratch
         emit "vpmulhuw %xmm1, %xmm0, %xmm0"    # High multiply (unsigned) to dest
         emit "vpunpckhwd %xmm0, %xmm2, %xmm0"  # Interleave high words
+    elsif PPC64
+        emit "vxor 2, 2, 2"
+        emit "vmrglh 0, 2, 0"
+        emit "vmrglh 1, 2, 1"
+        emit "vmuluwm 0, 0, 1"
+        emit "xxswapd 32, 32"
     else
         break # Not implemented
     end
@@ -7416,7 +8123,7 @@ end)
 
 # 0xFD 0xC0 0x01 - 0xFD 0xDF 0x01: i64x2 operations
 
-ipintOp(_simd_i64x2_abs, macro()
+ipintSIMDOp(_simd_i64x2_abs, macro()
     # i64x2.abs - absolute value of 2 64-bit signed integers
     popVec(v0)
     if ARM64 or ARM64E
@@ -7428,6 +8135,10 @@ ipintOp(_simd_i64x2_abs, macro()
         emit "vpcmpgtq %xmm0, %xmm1, %xmm2"  # xmm2 = mask where x < 0 (0 > x)
         emit "vpsubq %xmm0, %xmm1, %xmm1"    # xmm1 = -x
         emit "vpblendvb %xmm2, %xmm1, %xmm0, %xmm0" # blend: use -x where mask is true, x otherwise
+    elsif PPC64
+        emit "vxor 2, 2, 2"
+        emit "vsubudm 2, 2, 0"
+        emit "vmaxsd 0, 0, 2"
     else
         break # Not implemented
     end
@@ -7436,7 +8147,7 @@ ipintOp(_simd_i64x2_abs, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i64x2_neg, macro()
+ipintSIMDOp(_simd_i64x2_neg, macro()
     # i64x2.neg - negate 2 64-bit integers
     popVec(v0)
     if ARM64 or ARM64E
@@ -7445,6 +8156,9 @@ ipintOp(_simd_i64x2_neg, macro()
         # Negate by subtracting from zero
         emit "vpxor %xmm1, %xmm1, %xmm1"
         emit "vpsubq %xmm0, %xmm1, %xmm0"
+    elsif PPC64
+        emit "vxor 2, 2, 2"
+        emit "vsubudm 0, 2, 0"
     else
         break # Not implemented
     end
@@ -7455,7 +8169,7 @@ end)
 
 reservedOpcode(0xfdc201)
 
-ipintOp(_simd_i64x2_all_true, macro()
+ipintSIMDOp(_simd_i64x2_all_true, macro()
     # i64x2.all_true - return 1 if all 2 64-bit lanes are non-zero, 0 otherwise
     popVec(v0)
     if ARM64 or ARM64E
@@ -7474,6 +8188,17 @@ ipintOp(_simd_i64x2_all_true, macro()
         emit "testl %eax, %eax"              # Test if any bits are set
         emit "sete %al"                      # Set AL to 1 if no bits set (all lanes non-zero), 0 otherwise
         emit "movzbl %al, %eax"              # Zero-extend to 32-bit
+    elsif PPC64
+        emit "vxor 2, 2, 2"
+        emit "vcmpequd 0, 0, 2"
+        emit "mfvsrd 3, 32"
+        emit "xxswapd 34, 32"
+        emit "mfvsrd 4, 34"
+        emit "or 3, 3, 4"
+        emit "neg 4, 3"
+        emit "or 3, 3, 4"
+        emit "srdi 3, 3, 63"
+        emit "xori 3, 3, 1"
     else
         break # Not implemented
     end
@@ -7482,7 +8207,7 @@ ipintOp(_simd_i64x2_all_true, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i64x2_bitmask, macro()
+ipintSIMDOp(_simd_i64x2_bitmask, macro()
     # i64x2.bitmask - extract most significant bit from each 64-bit lane into a 2-bit integer
     # Handle both 64-bit values directly
 
@@ -7515,13 +8240,16 @@ end)
 reservedOpcode(0xfdc501)
 reservedOpcode(0xfdc601)
 
-ipintOp(_simd_i64x2_extend_low_i32x4_s, macro()
+ipintSIMDOp(_simd_i64x2_extend_low_i32x4_s, macro()
     # i64x2.extend_low_i32x4_s - sign-extend lower 2 i32 values to i64
     popVec(v0)
     if ARM64 or ARM64E
         emit "sxtl v16.2d, v16.2s"
     elsif X86_64
         emit "vpmovsxdq %xmm0, %xmm0"
+    elsif PPC64
+        emit "vupkhsw 0, 0"
+        emit "xxswapd 32, 32"
     else
         break # Not implemented
     end
@@ -7530,7 +8258,7 @@ ipintOp(_simd_i64x2_extend_low_i32x4_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i64x2_extend_high_i32x4_s, macro()
+ipintSIMDOp(_simd_i64x2_extend_high_i32x4_s, macro()
     # i64x2.extend_high_i32x4_s - sign-extend upper 2 i32 values to i64
     popVec(v0)
     if ARM64 or ARM64E
@@ -7539,6 +8267,9 @@ ipintOp(_simd_i64x2_extend_high_i32x4_s, macro()
         # Move high 64 bits to low, then sign extend
         emit "vpsrldq $8, %xmm0, %xmm0"   # Shift right 8 bytes to get high half
         emit "vpmovsxdq %xmm0, %xmm0"     # Sign extend
+    elsif PPC64
+        emit "vupklsw 0, 0"
+        emit "xxswapd 32, 32"
     else
         break # Not implemented
     end
@@ -7547,13 +8278,17 @@ ipintOp(_simd_i64x2_extend_high_i32x4_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i64x2_extend_low_i32x4_u, macro()
+ipintSIMDOp(_simd_i64x2_extend_low_i32x4_u, macro()
     # i64x2.extend_low_i32x4_u - zero-extend lower 2 i32 values to i64
     popVec(v0)
     if ARM64 or ARM64E
         emit "uxtl v16.2d, v16.2s"
     elsif X86_64
         emit "vpmovzxdq %xmm0, %xmm0"
+    elsif PPC64
+        emit "vxor 2, 2, 2"
+        emit "vmrghw 0, 2, 0"
+        emit "xxswapd 32, 32"
     else
         break # Not implemented
     end
@@ -7562,7 +8297,7 @@ ipintOp(_simd_i64x2_extend_low_i32x4_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i64x2_extend_high_i32x4_u, macro()
+ipintSIMDOp(_simd_i64x2_extend_high_i32x4_u, macro()
     # i64x2.extend_high_i32x4_u - zero-extend upper 2 i32 values to i64
     popVec(v0)
     if ARM64 or ARM64E
@@ -7571,6 +8306,10 @@ ipintOp(_simd_i64x2_extend_high_i32x4_u, macro()
         # Move high 64 bits to low, then zero extend
         emit "vpsrldq $8, %xmm0, %xmm0"   # Shift right 8 bytes to get high half
         emit "vpmovzxdq %xmm0, %xmm0"     # Zero extend
+    elsif PPC64
+        emit "vxor 2, 2, 2"
+        emit "vmrglw 0, 2, 0"
+        emit "xxswapd 32, 32"
     else
         break # Not implemented
     end
@@ -7579,7 +8318,7 @@ ipintOp(_simd_i64x2_extend_high_i32x4_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i64x2_shl, macro()
+ipintSIMDOp(_simd_i64x2_shl, macro()
     # i64x2.shl - left shift 2 64-bit integers
     popInt32(t0)  # shift count
     popVec(v0)        # vector
@@ -7594,6 +8333,10 @@ ipintOp(_simd_i64x2_shl, macro()
         andi 63, t0
         emit "movd %eax, %xmm1"
         emit "vpsllq %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "mtvsrwz 33, 3"
+        emit "vspltb 1, 1, 7"
+        emit "vsld 0, 0, 1"
     else
         break # Not implemented
     end
@@ -7602,7 +8345,7 @@ ipintOp(_simd_i64x2_shl, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i64x2_shr_s, macro()
+ipintSIMDOp(_simd_i64x2_shr_s, macro()
     # i64x2.shr_s - arithmetic right shift 2 64-bit signed integers
     popInt32(t0)  # shift count
     # Mask shift count to 0-63 range for 64-bit elements
@@ -7620,7 +8363,7 @@ ipintOp(_simd_i64x2_shr_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i64x2_shr_u, macro()
+ipintSIMDOp(_simd_i64x2_shr_u, macro()
     # i64x2.shr_u - logical right shift 2 64-bit unsigned integers
     popInt32(t0)  # shift count
     popVec(v0)        # vector
@@ -7637,6 +8380,10 @@ ipintOp(_simd_i64x2_shr_u, macro()
         andi 63, t0
         emit "movd %eax, %xmm1"
         emit "vpsrlq %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "mtvsrwz 33, 3"
+        emit "vspltb 1, 1, 7"
+        emit "vsrd 0, 0, 1"
     else
         break # Not implemented
     end
@@ -7645,7 +8392,7 @@ ipintOp(_simd_i64x2_shr_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i64x2_add, macro()
+ipintSIMDOp(_simd_i64x2_add, macro()
     # i64x2.add - add 2 64-bit integers
     popVec(v1)
     popVec(v0)
@@ -7653,6 +8400,8 @@ ipintOp(_simd_i64x2_add, macro()
         emit "add v16.2d, v16.2d, v17.2d"
     elsif X86_64
         emit "vpaddq %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vaddudm 0, 0, 1"
     else
         break # Not implemented
     end
@@ -7664,7 +8413,7 @@ end)
 reservedOpcode(0xfdcf01)
 reservedOpcode(0xfdd001)
 
-ipintOp(_simd_i64x2_sub, macro()
+ipintSIMDOp(_simd_i64x2_sub, macro()
     # i64x2.sub - subtract 2 64-bit integers
     popVec(v1)
     popVec(v0)
@@ -7672,6 +8421,8 @@ ipintOp(_simd_i64x2_sub, macro()
         emit "sub v16.2d, v16.2d, v17.2d"
     elsif X86_64
         emit "vpsubq %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vsubudm 0, 0, 1"
     else
         break # Not implemented
     end
@@ -7684,7 +8435,7 @@ reservedOpcode(0xfdd201)
 reservedOpcode(0xfdd301)
 reservedOpcode(0xfdd401)
 
-ipintOp(_simd_i64x2_mul, macro()
+ipintSIMDOp(_simd_i64x2_mul, macro()
     # i64x2.mul - multiply 2 64-bit integers (low 64 bits of result)
 
     # Extract and multiply lane 0 (first 64-bit element)
@@ -7705,7 +8456,7 @@ ipintOp(_simd_i64x2_mul, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i64x2_eq, macro()
+ipintSIMDOp(_simd_i64x2_eq, macro()
     # i64x2.eq - compare 2 64-bit integers for equality
     popVec(v1)
     popVec(v0)
@@ -7713,6 +8464,8 @@ ipintOp(_simd_i64x2_eq, macro()
         emit "cmeq v16.2d, v16.2d, v17.2d"
     elsif X86_64
         emit "vpcmpeqq %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vcmpequd 0, 0, 1"
     else
         break # Not implemented
     end
@@ -7721,7 +8474,7 @@ ipintOp(_simd_i64x2_eq, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i64x2_ne, macro()
+ipintSIMDOp(_simd_i64x2_ne, macro()
     # i64x2.ne - compare 2 64-bit integers for inequality
     popVec(v1)
     popVec(v0)
@@ -7733,6 +8486,9 @@ ipintOp(_simd_i64x2_ne, macro()
         emit "vpcmpeqq %xmm1, %xmm0, %xmm0"
         emit "vpcmpeqq %xmm2, %xmm2, %xmm2"  # Set all bits to 1
         emit "vpxor %xmm2, %xmm0, %xmm0"     # Invert result
+    elsif PPC64
+        emit "vcmpequd 0, 0, 1"
+        emit "vnor 0, 0, 0"
     else
         break # Not implemented
     end
@@ -7741,7 +8497,7 @@ ipintOp(_simd_i64x2_ne, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i64x2_lt_s, macro()
+ipintSIMDOp(_simd_i64x2_lt_s, macro()
     # i64x2.lt_s - compare 2 64-bit signed integers for less than
     popVec(v1)
     popVec(v0)
@@ -7751,6 +8507,8 @@ ipintOp(_simd_i64x2_lt_s, macro()
     elsif X86_64
         # vpcmpgtq xmm1, xmm0 gives us xmm1 > xmm0, which is equivalent to xmm0 < xmm1
         emit "vpcmpgtq %xmm0, %xmm1, %xmm0"
+    elsif PPC64
+        emit "vcmpgtsd 0, 1, 0"
     else
         break # Not implemented
     end
@@ -7759,7 +8517,7 @@ ipintOp(_simd_i64x2_lt_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i64x2_gt_s, macro()
+ipintSIMDOp(_simd_i64x2_gt_s, macro()
     # i64x2.gt_s - compare 2 64-bit signed integers for greater than
     popVec(v1)
     popVec(v0)
@@ -7767,6 +8525,8 @@ ipintOp(_simd_i64x2_gt_s, macro()
         emit "cmgt v16.2d, v16.2d, v17.2d"
     elsif X86_64
         emit "vpcmpgtq %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vcmpgtsd 0, 0, 1"
     else
         break # Not implemented
     end
@@ -7775,7 +8535,7 @@ ipintOp(_simd_i64x2_gt_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i64x2_le_s, macro()
+ipintSIMDOp(_simd_i64x2_le_s, macro()
     # i64x2.le_s - compare 2 64-bit signed integers for less than or equal
     popVec(v1)
     popVec(v0)
@@ -7787,6 +8547,9 @@ ipintOp(_simd_i64x2_le_s, macro()
         emit "vpcmpgtq %xmm1, %xmm0, %xmm0"  # xmm0 > xmm1
         emit "vpcmpeqq %xmm2, %xmm2, %xmm2"  # Set all bits to 1
         emit "vpxor %xmm2, %xmm0, %xmm0"     # Invert result: !(xmm0 > xmm1)
+    elsif PPC64
+        emit "vcmpgtsd 0, 0, 1"
+        emit "vnor 0, 0, 0"
     else
         break # Not implemented
     end
@@ -7795,7 +8558,7 @@ ipintOp(_simd_i64x2_le_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i64x2_ge_s, macro()
+ipintSIMDOp(_simd_i64x2_ge_s, macro()
     # i64x2.ge_s - compare 2 64-bit signed integers for greater than or equal
     popVec(v1)
     popVec(v0)
@@ -7806,6 +8569,9 @@ ipintOp(_simd_i64x2_ge_s, macro()
         emit "vpcmpgtq %xmm0, %xmm1, %xmm0"  # xmm1 > xmm0
         emit "vpcmpeqq %xmm2, %xmm2, %xmm2"  # Set all bits to 1
         emit "vpxor %xmm2, %xmm0, %xmm0"     # Invert result: !(xmm1 > xmm0)
+    elsif PPC64
+        emit "vcmpgtsd 0, 1, 0"
+        emit "vnor 0, 0, 0"
     else
         break # Not implemented
     end
@@ -7814,7 +8580,7 @@ ipintOp(_simd_i64x2_ge_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i64x2_extmul_low_i32x4_s, macro()
+ipintSIMDOp(_simd_i64x2_extmul_low_i32x4_s, macro()
     # i64x2.extmul_low_i32x4_s - multiply lower 2 i32 elements and extend to i64
     popVec(v1)
     popVec(v0)
@@ -7825,6 +8591,10 @@ ipintOp(_simd_i64x2_extmul_low_i32x4_s, macro()
         emit "vpunpckldq %xmm0, %xmm0, %xmm2"  # Duplicate low dwords of left
         emit "vpunpckldq %xmm1, %xmm1, %xmm0"  # Duplicate low dwords of right
         emit "vpmuldq %xmm2, %xmm0, %xmm0"     # Signed multiply
+    elsif PPC64
+        emit "vmulosw 2, 0, 1"
+        emit "vmulesw 3, 0, 1"
+        emit "xxpermdi 32, 34, 35, 0"
     else
         break # Not implemented
     end
@@ -7833,7 +8603,7 @@ ipintOp(_simd_i64x2_extmul_low_i32x4_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i64x2_extmul_high_i32x4_s, macro()
+ipintSIMDOp(_simd_i64x2_extmul_high_i32x4_s, macro()
     # i64x2.extmul_high_i32x4_s - multiply upper 2 i32 elements and extend to i64
     popVec(v1)
     popVec(v0)
@@ -7844,6 +8614,10 @@ ipintOp(_simd_i64x2_extmul_high_i32x4_s, macro()
         emit "vpunpckhdq %xmm0, %xmm0, %xmm2"  # Duplicate high dwords of left
         emit "vpunpckhdq %xmm1, %xmm1, %xmm0"  # Duplicate high dwords of right
         emit "vpmuldq %xmm2, %xmm0, %xmm0"     # Signed multiply
+    elsif PPC64
+        emit "vmulosw 2, 0, 1"
+        emit "vmulesw 3, 0, 1"
+        emit "xxpermdi 32, 34, 35, 3"
     else
         break # Not implemented
     end
@@ -7852,7 +8626,7 @@ ipintOp(_simd_i64x2_extmul_high_i32x4_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i64x2_extmul_low_i32x4_u, macro()
+ipintSIMDOp(_simd_i64x2_extmul_low_i32x4_u, macro()
     # i64x2.extmul_low_i32x4_u - multiply lower 2 u32 elements and extend to i64
     popVec(v1)
     popVec(v0)
@@ -7863,6 +8637,10 @@ ipintOp(_simd_i64x2_extmul_low_i32x4_u, macro()
         emit "vpunpckldq %xmm0, %xmm0, %xmm2"  # Duplicate low dwords of left
         emit "vpunpckldq %xmm1, %xmm1, %xmm0"  # Duplicate low dwords of right
         emit "vpmuludq %xmm2, %xmm0, %xmm0"    # Unsigned multiply
+    elsif PPC64
+        emit "vmulouw 2, 0, 1"
+        emit "vmuleuw 3, 0, 1"
+        emit "xxpermdi 32, 34, 35, 0"
     else
         break # Not implemented
     end
@@ -7871,7 +8649,7 @@ ipintOp(_simd_i64x2_extmul_low_i32x4_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i64x2_extmul_high_i32x4_u, macro()
+ipintSIMDOp(_simd_i64x2_extmul_high_i32x4_u, macro()
     # i64x2.extmul_high_i32x4_u - multiply upper 2 u32 elements and extend to i64
     popVec(v1)
     popVec(v0)
@@ -7882,6 +8660,10 @@ ipintOp(_simd_i64x2_extmul_high_i32x4_u, macro()
         emit "vpunpckhdq %xmm0, %xmm0, %xmm2"  # Duplicate high dwords of left
         emit "vpunpckhdq %xmm1, %xmm1, %xmm0"  # Duplicate high dwords of right
         emit "vpmuludq %xmm2, %xmm0, %xmm0"    # Unsigned multiply
+    elsif PPC64
+        emit "vmulouw 2, 0, 1"
+        emit "vmuleuw 3, 0, 1"
+        emit "xxpermdi 32, 34, 35, 3"
     else
         break # Not implemented
     end
@@ -7892,7 +8674,7 @@ end)
 
 # 0xFD 0xE0 0x01 - 0xFD 0xEB 0x01: f32x4 operations
 
-ipintOp(_simd_f32x4_abs, macro()
+ipintSIMDOp(_simd_f32x4_abs, macro()
     # f32x4.abs - absolute value of 4 32-bit floats
     popVec(v0)
     if ARM64 or ARM64E
@@ -7903,6 +8685,8 @@ ipintOp(_simd_f32x4_abs, macro()
         emit "vmovq %rax, %xmm1"
         emit "vpunpcklqdq %xmm1, %xmm1, %xmm1"
         emit "vandps %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvabssp 32, 32"
     else
         break # Not implemented
     end
@@ -7911,7 +8695,7 @@ ipintOp(_simd_f32x4_abs, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f32x4_neg, macro()
+ipintSIMDOp(_simd_f32x4_neg, macro()
     # f32x4.neg - negate 4 32-bit floats
     popVec(v0)
     if ARM64 or ARM64E
@@ -7922,6 +8706,8 @@ ipintOp(_simd_f32x4_neg, macro()
         emit "vmovq %rax, %xmm1"
         emit "vpunpcklqdq %xmm1, %xmm1, %xmm1"
         emit "vxorps %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvnegsp 32, 32"
     else
         break # Not implemented
     end
@@ -7932,13 +8718,15 @@ end)
 
 reservedOpcode(0xfde201)
 
-ipintOp(_simd_f32x4_sqrt, macro()
+ipintSIMDOp(_simd_f32x4_sqrt, macro()
     # f32x4.sqrt - square root of 4 32-bit floats
     popVec(v0)
     if ARM64 or ARM64E
         emit "fsqrt v16.4s, v16.4s"
     elsif X86_64
         emit "vsqrtps %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvsqrtsp 32, 32"
     else
         break # Not implemented
     end
@@ -7947,7 +8735,7 @@ ipintOp(_simd_f32x4_sqrt, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f32x4_add, macro()
+ipintSIMDOp(_simd_f32x4_add, macro()
     # f32x4.add - add 4 32-bit floats
     popVec(v1)
     popVec(v0)
@@ -7955,6 +8743,8 @@ ipintOp(_simd_f32x4_add, macro()
         emit "fadd v16.4s, v16.4s, v17.4s"
     elsif X86_64
         emit "vaddps %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvaddsp 32, 32, 33"
     else
         break # Not implemented
     end
@@ -7963,7 +8753,7 @@ ipintOp(_simd_f32x4_add, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f32x4_sub, macro()
+ipintSIMDOp(_simd_f32x4_sub, macro()
     # f32x4.sub - subtract 4 32-bit floats
     popVec(v1)
     popVec(v0)
@@ -7971,6 +8761,8 @@ ipintOp(_simd_f32x4_sub, macro()
         emit "fsub v16.4s, v16.4s, v17.4s"
     elsif X86_64
         emit "vsubps %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvsubsp 32, 32, 33"
     else
         break # Not implemented
     end
@@ -7979,7 +8771,7 @@ ipintOp(_simd_f32x4_sub, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f32x4_mul, macro()
+ipintSIMDOp(_simd_f32x4_mul, macro()
     # f32x4.mul - multiply 4 32-bit floats
     popVec(v1)
     popVec(v0)
@@ -7987,6 +8779,8 @@ ipintOp(_simd_f32x4_mul, macro()
         emit "fmul v16.4s, v16.4s, v17.4s"
     elsif X86_64
         emit "vmulps %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvmulsp 32, 32, 33"
     else
         break # Not implemented
     end
@@ -7995,7 +8789,7 @@ ipintOp(_simd_f32x4_mul, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f32x4_div, macro()
+ipintSIMDOp(_simd_f32x4_div, macro()
     # f32x4.div - divide 4 32-bit floats
     popVec(v1)
     popVec(v0)
@@ -8003,6 +8797,8 @@ ipintOp(_simd_f32x4_div, macro()
         emit "fdiv v16.4s, v16.4s, v17.4s"
     elsif X86_64
         emit "vdivps %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvdivsp 32, 32, 33"
     else
         break # Not implemented
     end
@@ -8011,7 +8807,7 @@ ipintOp(_simd_f32x4_div, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f32x4_min, macro()
+ipintSIMDOp(_simd_f32x4_min, macro()
     # f32x4.min - minimum of 4 32-bit floats (IEEE 754-2008 semantics)
     popVec(v1)
     popVec(v0)
@@ -8032,6 +8828,13 @@ ipintOp(_simd_f32x4_min, macro()
         emit "vorps %xmm0, %xmm2, %xmm2"        # xmm2 |= NaN mask
         emit "vpsrld $10, %xmm0, %xmm0"         # Shift mask to clear mantissa bits (f32 uses 10)
         emit "vpandn %xmm2, %xmm0, %xmm0"       # Clear mantissa to canonicalize NaN
+    elsif PPC64
+        emit "xvminsp 34, 32, 33"
+        emit "xvaddsp 35, 32, 33"
+        emit "xvcmpeqsp 36, 32, 32"
+        emit "xvcmpeqsp 37, 33, 33"
+        emit "xxland 36, 36, 37"
+        emit "xxsel 32, 35, 34, 36"
     else
         break # Not implemented
     end
@@ -8040,7 +8843,7 @@ ipintOp(_simd_f32x4_min, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f32x4_max, macro()
+ipintSIMDOp(_simd_f32x4_max, macro()
     # f32x4.max - maximum of 4 32-bit floats (IEEE 754-2008 semantics)
     popVec(v1)
     popVec(v0)
@@ -8066,6 +8869,13 @@ ipintOp(_simd_f32x4_max, macro()
         emit "vcmpunordps %xmm2, %xmm0, %xmm0" # xmm0 = NaN mask (all 1's where NaN)
         emit "vpsrld $10, %xmm0, %xmm0"         # Shift mask to clear mantissa bits (f32 uses 10)
         emit "vpandn %xmm2, %xmm0, %xmm0"       # Clear mantissa to canonicalize NaN
+    elsif PPC64
+        emit "xvmaxsp 34, 32, 33"
+        emit "xvaddsp 35, 32, 33"
+        emit "xvcmpeqsp 36, 32, 32"
+        emit "xvcmpeqsp 37, 33, 33"
+        emit "xxland 36, 36, 37"
+        emit "xxsel 32, 35, 34, 36"
     else
         break # Not implemented
     end
@@ -8074,7 +8884,7 @@ ipintOp(_simd_f32x4_max, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f32x4_pmin, macro()
+ipintSIMDOp(_simd_f32x4_pmin, macro()
     # f32x4.pmin - pseudo-minimum of 4 32-bit floats (b < a ? b : a)
     popVec(v1)
     popVec(v0)
@@ -8086,6 +8896,9 @@ ipintOp(_simd_f32x4_pmin, macro()
     elsif X86_64
         emit "vcmpgtps %xmm1, %xmm0, %xmm2"          # xmm2 = (a > b) ? 0xFFFFFFFF : 0x00000000
         emit "vblendvps %xmm2, %xmm1, %xmm0, %xmm0"  # select b if mask is true, a if false
+    elsif PPC64
+        emit "xvcmpgtsp 34, 32, 33"
+        emit "xxsel 32, 32, 33, 34"
     else
         break # Not implemented
     end
@@ -8094,7 +8907,7 @@ ipintOp(_simd_f32x4_pmin, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f32x4_pmax, macro()
+ipintSIMDOp(_simd_f32x4_pmax, macro()
     # f32x4.pmax - pseudo-maximum of 4 32-bit floats (a < b ? b : a)
     popVec(v1)
     popVec(v0)
@@ -8106,6 +8919,9 @@ ipintOp(_simd_f32x4_pmax, macro()
     elsif X86_64
         emit "vcmpgtps %xmm0, %xmm1, %xmm2"          # xmm2 = (b > a) ? 0xFFFFFFFF : 0x00000000
         emit "vblendvps %xmm2, %xmm1, %xmm0, %xmm0"  # select b if mask is true, a if false
+    elsif PPC64
+        emit "xvcmpgtsp 34, 33, 32"
+        emit "xxsel 32, 32, 33, 34"
     else
         break # Not implemented
     end
@@ -8116,7 +8932,7 @@ end)
 
 # 0xFD 0xEC 0x01 - 0xFD 0xF7 0x01: f64x2 operations
 
-ipintOp(_simd_f64x2_abs, macro()
+ipintSIMDOp(_simd_f64x2_abs, macro()
     # f64x2.abs - absolute value of 2 64-bit floats
     popVec(v0)
     if ARM64 or ARM64E
@@ -8127,6 +8943,8 @@ ipintOp(_simd_f64x2_abs, macro()
         emit "vmovq %rax, %xmm1"
         emit "vpunpcklqdq %xmm1, %xmm1, %xmm1"
         emit "vandpd %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvabsdp 32, 32"
     else
         break # Not implemented
     end
@@ -8135,7 +8953,7 @@ ipintOp(_simd_f64x2_abs, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f64x2_neg, macro()
+ipintSIMDOp(_simd_f64x2_neg, macro()
     # f64x2.neg - negate 2 64-bit floats
     popVec(v0)
     if ARM64 or ARM64E
@@ -8146,6 +8964,8 @@ ipintOp(_simd_f64x2_neg, macro()
         emit "vmovq %rax, %xmm1"
         emit "vpunpcklqdq %xmm1, %xmm1, %xmm1"
         emit "vxorpd %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvnegdp 32, 32"
     else
         break # Not implemented
     end
@@ -8156,13 +8976,15 @@ end)
 
 reservedOpcode(0xfdee01)
 
-ipintOp(_simd_f64x2_sqrt, macro()
+ipintSIMDOp(_simd_f64x2_sqrt, macro()
     # f64x2.sqrt - square root of 2 64-bit floats
     popVec(v0)
     if ARM64 or ARM64E
         emit "fsqrt v16.2d, v16.2d"
     elsif X86_64
         emit "vsqrtpd %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvsqrtdp 32, 32"
     else
         break # Not implemented
     end
@@ -8171,7 +8993,7 @@ ipintOp(_simd_f64x2_sqrt, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f64x2_add, macro()
+ipintSIMDOp(_simd_f64x2_add, macro()
     # f64x2.add - add 2 64-bit floats
     popVec(v1)
     popVec(v0)
@@ -8179,6 +9001,8 @@ ipintOp(_simd_f64x2_add, macro()
         emit "fadd v16.2d, v16.2d, v17.2d"
     elsif X86_64
         emit "vaddpd %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvadddp 32, 32, 33"
     else
         break # Not implemented
     end
@@ -8187,7 +9011,7 @@ ipintOp(_simd_f64x2_add, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f64x2_sub, macro()
+ipintSIMDOp(_simd_f64x2_sub, macro()
     # f64x2.sub - subtract 2 64-bit floats
     popVec(v1)
     popVec(v0)
@@ -8195,6 +9019,8 @@ ipintOp(_simd_f64x2_sub, macro()
         emit "fsub v16.2d, v16.2d, v17.2d"
     elsif X86_64
         emit "vsubpd %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvsubdp 32, 32, 33"
     else
         break # Not implemented
     end
@@ -8203,7 +9029,7 @@ ipintOp(_simd_f64x2_sub, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f64x2_mul, macro()
+ipintSIMDOp(_simd_f64x2_mul, macro()
     # f64x2.mul - multiply 2 64-bit floats
     popVec(v1)
     popVec(v0)
@@ -8211,6 +9037,8 @@ ipintOp(_simd_f64x2_mul, macro()
         emit "fmul v16.2d, v16.2d, v17.2d"
     elsif X86_64
         emit "vmulpd %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvmuldp 32, 32, 33"
     else
         break # Not implemented
     end
@@ -8219,7 +9047,7 @@ ipintOp(_simd_f64x2_mul, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f64x2_div, macro()
+ipintSIMDOp(_simd_f64x2_div, macro()
     # f64x2.div - divide 2 64-bit floats
     popVec(v1)
     popVec(v0)
@@ -8227,6 +9055,8 @@ ipintOp(_simd_f64x2_div, macro()
         emit "fdiv v16.2d, v16.2d, v17.2d"
     elsif X86_64
         emit "vdivpd %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvdivdp 32, 32, 33"
     else
         break # Not implemented
     end
@@ -8235,7 +9065,7 @@ ipintOp(_simd_f64x2_div, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f64x2_min, macro()
+ipintSIMDOp(_simd_f64x2_min, macro()
     # f64x2.min - minimum of 2 64-bit floats (IEEE 754-2008 semantics)
     popVec(v1)
     popVec(v0)
@@ -8256,6 +9086,13 @@ ipintOp(_simd_f64x2_min, macro()
         emit "vorpd %xmm0, %xmm2, %xmm2"        # xmm2 |= NaN mask
         emit "vpsrlq $13, %xmm0, %xmm0"         # Shift mask to clear mantissa bits
         emit "vpandn %xmm2, %xmm0, %xmm0"       # Clear mantissa to canonicalize NaN
+    elsif PPC64
+        emit "xvmindp 34, 32, 33"
+        emit "xvadddp 35, 32, 33"
+        emit "xvcmpeqdp 36, 32, 32"
+        emit "xvcmpeqdp 37, 33, 33"
+        emit "xxland 36, 36, 37"
+        emit "xxsel 32, 35, 34, 36"
     else
         break # Not implemented
     end
@@ -8264,7 +9101,7 @@ ipintOp(_simd_f64x2_min, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f64x2_max, macro()
+ipintSIMDOp(_simd_f64x2_max, macro()
     # f64x2.max - maximum of 2 64-bit floats (IEEE 754-2008 semantics)
     popVec(v1)
     popVec(v0)
@@ -8290,6 +9127,13 @@ ipintOp(_simd_f64x2_max, macro()
         emit "vcmpunordpd %xmm2, %xmm0, %xmm0" # xmm0 = NaN mask (all 1's where NaN)
         emit "vpsrlq $13, %xmm0, %xmm0"         # Shift mask to clear mantissa bits
         emit "vpandn %xmm2, %xmm0, %xmm0"       # Clear mantissa to canonicalize NaN
+    elsif PPC64
+        emit "xvmaxdp 34, 32, 33"
+        emit "xvadddp 35, 32, 33"
+        emit "xvcmpeqdp 36, 32, 32"
+        emit "xvcmpeqdp 37, 33, 33"
+        emit "xxland 36, 36, 37"
+        emit "xxsel 32, 35, 34, 36"
     else
         break # Not implemented
     end
@@ -8298,7 +9142,7 @@ ipintOp(_simd_f64x2_max, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f64x2_pmin, macro()
+ipintSIMDOp(_simd_f64x2_pmin, macro()
     # f64x2.pmin - pseudo-minimum of 2 64-bit floats (b < a ? b : a)
     popVec(v1)
     popVec(v0)
@@ -8310,6 +9154,9 @@ ipintOp(_simd_f64x2_pmin, macro()
     elsif X86_64
         emit "vcmpgtpd %xmm1, %xmm0, %xmm2"          # xmm2 = (a > b) ? 0xFFFFFFFF : 0x00000000
         emit "vblendvpd %xmm2, %xmm1, %xmm0, %xmm0"  # select b if mask is true, a if false
+    elsif PPC64
+        emit "xvcmpgtdp 34, 32, 33"
+        emit "xxsel 32, 32, 33, 34"
     else
         break # Not implemented
     end
@@ -8318,7 +9165,7 @@ ipintOp(_simd_f64x2_pmin, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f64x2_pmax, macro()
+ipintSIMDOp(_simd_f64x2_pmax, macro()
     # f64x2.pmax - pseudo-maximum of 2 64-bit floats (a < b ? b : a)
     popVec(v1)
     popVec(v0)
@@ -8330,6 +9177,9 @@ ipintOp(_simd_f64x2_pmax, macro()
     elsif X86_64
         emit "vcmpgtpd %xmm0, %xmm1, %xmm2"          # xmm2 = (b > a) ? 0xFFFFFFFF : 0x00000000
         emit "vblendvpd %xmm2, %xmm1, %xmm0, %xmm0"  # select b if mask is true, a if false
+    elsif PPC64
+        emit "xvcmpgtdp 34, 33, 32"
+        emit "xxsel 32, 32, 33, 34"
     else
         break # Not implemented
     end
@@ -8340,7 +9190,7 @@ end)
 
 # 0xFD 0xF8 0x01 - 0xFD 0xFF 0x01: trunc/convert
 
-ipintOp(_simd_i32x4_trunc_sat_f32x4_s, macro()
+ipintSIMDOp(_simd_i32x4_trunc_sat_f32x4_s, macro()
     # i32x4.trunc_sat_f32x4_s - truncate 4 f32 values to signed i32 with saturation
     popVec(v0)
     if ARM64 or ARM64E
@@ -8359,6 +9209,10 @@ ipintOp(_simd_i32x4_trunc_sat_f32x4_s, macro()
         emit "vcmpnltps %xmm2, %xmm1, %xmm3"                 # xmm3 = positive overflow mask (src >= 0x80000000)
         emit "vcvttps2dq %xmm1, %xmm1"                       # Convert with overflow saturated to 0x80000000
         emit "vpxor %xmm3, %xmm1, %xmm0"                     # Convert positive overflow to 0x7FFFFFFF
+    elsif PPC64
+        emit "xvcvspsxws 34, 32"
+        emit "xvcmpeqsp 35, 32, 32"
+        emit "xxland 32, 34, 35"
     else
         break # Not implemented
     end
@@ -8367,7 +9221,7 @@ ipintOp(_simd_i32x4_trunc_sat_f32x4_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_trunc_sat_f32x4_u, macro()
+ipintSIMDOp(_simd_i32x4_trunc_sat_f32x4_u, macro()
     # i32x4.trunc_sat_f32x4_u - truncate 4 f32 values to unsigned i32 with saturation
     popVec(v0)
     if ARM64 or ARM64E
@@ -8393,6 +9247,10 @@ ipintOp(_simd_i32x4_trunc_sat_f32x4_u, macro()
         
         emit "vcvttps2dq %xmm0, %xmm0"                       # Convert original src
         emit "vpaddd %xmm3, %xmm0, %xmm0"                    # Add correction
+    elsif PPC64
+        emit "xvcvspuxws 34, 32"
+        emit "xvcmpeqsp 35, 32, 32"
+        emit "xxland 32, 34, 35"
     else
         break # Not implemented
     end
@@ -8401,13 +9259,15 @@ ipintOp(_simd_i32x4_trunc_sat_f32x4_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f32x4_convert_i32x4_s, macro()
+ipintSIMDOp(_simd_f32x4_convert_i32x4_s, macro()
     # f32x4.convert_i32x4_s - convert 4 signed i32 values to f32
     popVec(v0)
     if ARM64 or ARM64E
         emit "scvtf v16.4s, v16.4s"
     elsif X86_64
         emit "vcvtdq2ps %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvcvsxwsp 32, 32"
     else
         break # Not implemented
     end
@@ -8416,7 +9276,7 @@ ipintOp(_simd_f32x4_convert_i32x4_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f32x4_convert_i32x4_u, macro()
+ipintSIMDOp(_simd_f32x4_convert_i32x4_u, macro()
     # f32x4.convert_i32x4_u - convert 4 unsigned i32 values to f32
     popVec(v0)
     if ARM64 or ARM64E
@@ -8431,6 +9291,8 @@ ipintOp(_simd_f32x4_convert_i32x4_u, macro()
         emit "vcvtdq2ps %xmm0, %xmm0"                    # f_half_high = convertToF32(i_half_high)
         emit "vaddps %xmm0, %xmm0, %xmm0"                # dst = f_half_high + f_half_high + f_low
         emit "vaddps %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvcvuxwsp 32, 32"
     else
         break # Not implemented
     end
@@ -8439,7 +9301,7 @@ ipintOp(_simd_f32x4_convert_i32x4_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_trunc_sat_f64x2_s_zero, macro()
+ipintSIMDOp(_simd_i32x4_trunc_sat_f64x2_s_zero, macro()
     # i32x4.trunc_sat_f64x2_s_zero - truncate 2 f64 values to signed i32, zero upper 2 lanes
     popVec(v0)
     if ARM64 or ARM64E
@@ -8460,6 +9322,14 @@ ipintOp(_simd_i32x4_trunc_sat_f64x2_s_zero, macro()
         emit "vandpd %xmm2, %xmm1, %xmm1"                    # xmm1 = 2147483647.0 where not NaN, 0 where NaN
         emit "vminpd %xmm1, %xmm0, %xmm0"                    # Clamp to max value and handle NaN
         emit "vcvttpd2dq %xmm0, %xmm0"                       # Convert to i32 (result in lower 64 bits, upper zeroed)
+    elsif PPC64
+        emit "xvcvdpsxws 34, 32"
+        emit "xvcmpeqdp 35, 32, 32"
+        emit "xxland 34, 34, 35"
+        emit "xxswapd 35, 34"
+        emit "xxmrghw 35, 35, 34"
+        emit "xxlxor 36, 36, 36"
+        emit "xxpermdi 32, 35, 36, 0"
     else
         break # Not implemented
     end
@@ -8468,7 +9338,7 @@ ipintOp(_simd_i32x4_trunc_sat_f64x2_s_zero, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_trunc_sat_f64x2_u_zero, macro()
+ipintSIMDOp(_simd_i32x4_trunc_sat_f64x2_u_zero, macro()
     # i32x4.trunc_sat_f64x2_u_zero - truncate 2 f64 values to unsigned i32, zero upper 2 lanes
     popVec(v0)
     if ARM64 or ARM64E
@@ -8495,6 +9365,14 @@ ipintOp(_simd_i32x4_trunc_sat_f64x2_u_zero, macro()
         emit "vroundpd $3, %xmm0, %xmm0"                     # Truncate toward zero
         emit "vaddpd %xmm3, %xmm0, %xmm0"                    # Add 0x1.0p+52 (magic number conversion)
         emit "vshufps $0x88, %xmm1, %xmm0, %xmm0"            # Pack to i32 and zero upper
+    elsif PPC64
+        emit "xvcvdpuxws 34, 32"
+        emit "xvcmpeqdp 35, 32, 32"
+        emit "xxland 34, 34, 35"
+        emit "xxswapd 35, 34"
+        emit "xxmrghw 35, 35, 34"
+        emit "xxlxor 36, 36, 36"
+        emit "xxpermdi 32, 35, 36, 0"
     else
         break # Not implemented
     end
@@ -8503,7 +9381,7 @@ ipintOp(_simd_i32x4_trunc_sat_f64x2_u_zero, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f64x2_convert_low_i32x4_s, macro()
+ipintSIMDOp(_simd_f64x2_convert_low_i32x4_s, macro()
     # f64x2.convert_low_i32x4_s - convert lower 2 signed i32 values to f64
     popVec(v0)
     if ARM64 or ARM64E
@@ -8512,6 +9390,10 @@ ipintOp(_simd_f64x2_convert_low_i32x4_s, macro()
         emit "scvtf v16.2d, v16.2d"
     elsif X86_64
         emit "vcvtdq2pd %xmm0, %xmm0"
+    elsif PPC64
+        emit "xxmrghw 34, 32, 32"
+        emit "xvcvsxwdp 34, 34"
+        emit "xxswapd 32, 34"
     else
         break # Not implemented
     end
@@ -8520,7 +9402,7 @@ ipintOp(_simd_f64x2_convert_low_i32x4_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f64x2_convert_low_i32x4_u, macro()
+ipintSIMDOp(_simd_f64x2_convert_low_i32x4_u, macro()
     # f64x2.convert_low_i32x4_u - convert lower 2 unsigned i32 values to f64
     popVec(v0)
     if ARM64 or ARM64E
@@ -8544,6 +9426,10 @@ ipintOp(_simd_f64x2_convert_low_i32x4_u, macro()
 
         # Subtract to get the correct unsigned values
         emit "vsubpd %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xxmrghw 34, 32, 32"
+        emit "xvcvuxwdp 34, 34"
+        emit "xxswapd 32, 34"
     else
         break # Not implemented
     end
@@ -8557,7 +9443,7 @@ end)
     ## Opcodes 0x100 - 0x113         ##
     ###################################
 
-ipintOp(_simd_i8x16_relaxed_swizzle, macro()
+ipintSIMDOp(_simd_i8x16_relaxed_swizzle, macro()
     # i8x16.relaxed_swizzle - swizzle bytes (relaxed semantics: out-of-range indices are implementation defined)
     popVec(v1)  # indices
     popVec(v0)  # table
@@ -8568,6 +9454,13 @@ ipintOp(_simd_i8x16_relaxed_swizzle, macro()
         # x86-64 vpshufb returns 0 for indices with bit 7 set
         # For relaxed semantics, we can use it directly
         emit "vpshufb %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vspltisb 2, 7"
+        emit "vxor 3, 1, 2"
+        emit "vperm 3, 0, 0, 3"
+        emit "vspltisb 2, 15"
+        emit "vcmpgtub 4, 1, 2"
+        emit "vandc 0, 3, 4"
     else
         break # Not implemented
     end
@@ -8576,13 +9469,17 @@ ipintOp(_simd_i8x16_relaxed_swizzle, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_relaxed_trunc_f32x4_s, macro()
+ipintSIMDOp(_simd_i32x4_relaxed_trunc_f32x4_s, macro()
     # i32x4.relaxed_trunc_f32x4_s - truncate f32 to signed i32 (relaxed: NaN/overflow is implementation defined)
     popVec(v0)
     if ARM64 or ARM64E
         emit "fcvtzs v16.4s, v16.4s"
     elsif X86_64
         emit "vcvttps2dq %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvcvspsxws 34, 32"
+        emit "xvcmpeqsp 35, 32, 32"
+        emit "xxland 32, 34, 35"
     else
         break # Not implemented
     end
@@ -8591,7 +9488,7 @@ ipintOp(_simd_i32x4_relaxed_trunc_f32x4_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_relaxed_trunc_f32x4_u, macro()
+ipintSIMDOp(_simd_i32x4_relaxed_trunc_f32x4_u, macro()
     # i32x4.relaxed_trunc_f32x4_u - truncate f32 to unsigned i32 (relaxed semantics)
     popVec(v0)
     if ARM64 or ARM64E
@@ -8602,6 +9499,10 @@ ipintOp(_simd_i32x4_relaxed_trunc_f32x4_u, macro()
         emit "vxorps %xmm1, %xmm1, %xmm1"
         emit "vmaxps %xmm1, %xmm0, %xmm0"
         emit "vcvttps2dq %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvcvspuxws 34, 32"
+        emit "xvcmpeqsp 35, 32, 32"
+        emit "xxland 32, 34, 35"
     else
         break # Not implemented
     end
@@ -8610,7 +9511,7 @@ ipintOp(_simd_i32x4_relaxed_trunc_f32x4_u, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_relaxed_trunc_f64x2_s_zero, macro()
+ipintSIMDOp(_simd_i32x4_relaxed_trunc_f64x2_s_zero, macro()
     # i32x4.relaxed_trunc_f64x2_s_zero - truncate 2 f64 to signed i32, zero upper lanes
     popVec(v0)
     if ARM64 or ARM64E
@@ -8618,6 +9519,14 @@ ipintOp(_simd_i32x4_relaxed_trunc_f64x2_s_zero, macro()
         emit "sqxtn v16.2s, v16.2d"
     elsif X86_64
         emit "vcvttpd2dq %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvcvdpsxws 34, 32"
+        emit "xvcmpeqdp 35, 32, 32"
+        emit "xxland 34, 34, 35"
+        emit "xxswapd 35, 34"
+        emit "xxmrghw 35, 35, 34"
+        emit "xxlxor 36, 36, 36"
+        emit "xxpermdi 32, 35, 36, 0"
     else
         break # Not implemented
     end
@@ -8626,7 +9535,7 @@ ipintOp(_simd_i32x4_relaxed_trunc_f64x2_s_zero, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_relaxed_trunc_f64x2_u_zero, macro()
+ipintSIMDOp(_simd_i32x4_relaxed_trunc_f64x2_u_zero, macro()
     # i32x4.relaxed_trunc_f64x2_u_zero - truncate 2 f64 to unsigned i32, zero upper lanes
     popVec(v0)
     if ARM64 or ARM64E
@@ -8643,6 +9552,14 @@ ipintOp(_simd_i32x4_relaxed_trunc_f64x2_u_zero, macro()
         emit "vroundpd $3, %xmm0, %xmm0"
         emit "vaddpd %xmm1, %xmm0, %xmm0"
         emit "vshufps $0x88, %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvcvdpuxws 34, 32"
+        emit "xvcmpeqdp 35, 32, 32"
+        emit "xxland 34, 34, 35"
+        emit "xxswapd 35, 34"
+        emit "xxmrghw 35, 35, 34"
+        emit "xxlxor 36, 36, 36"
+        emit "xxpermdi 32, 35, 36, 0"
     else
         break # Not implemented
     end
@@ -8651,7 +9568,7 @@ ipintOp(_simd_i32x4_relaxed_trunc_f64x2_u_zero, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f32x4_relaxed_madd, macro()
+ipintSIMDOp(_simd_f32x4_relaxed_madd, macro()
     # f32x4.relaxed_madd - fused multiply-add: a * b + c (or unfused)
     popVec(v2)  # c (addend)
     popVec(v1)  # b
@@ -8667,6 +9584,9 @@ ipintOp(_simd_f32x4_relaxed_madd, macro()
         # We have: xmm0=a, xmm1=b, xmm2=c, want: a*b+c
         emit "vmulps %xmm1, %xmm0, %xmm0"
         emit "vaddps %xmm2, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvmaddasp 46, 32, 33"
+        emit "xxlor 32, 46, 46"
     else
         break # Not implemented
     end
@@ -8675,7 +9595,7 @@ ipintOp(_simd_f32x4_relaxed_madd, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f32x4_relaxed_nmadd, macro()
+ipintSIMDOp(_simd_f32x4_relaxed_nmadd, macro()
     # f32x4.relaxed_nmadd - fused negative multiply-add: -(a * b) + c (or unfused)
     popVec(v2)  # c (addend)
     popVec(v1)  # b
@@ -8689,6 +9609,9 @@ ipintOp(_simd_f32x4_relaxed_nmadd, macro()
         # vfnmadd213ps does: dest = -(dest * src1) + src2
         emit "vmulps %xmm1, %xmm0, %xmm0"
         emit "vsubps %xmm0, %xmm2, %xmm0"
+    elsif PPC64
+        emit "xvnmsubasp 46, 32, 33"
+        emit "xxlor 32, 46, 46"
     else
         break # Not implemented
     end
@@ -8697,7 +9620,7 @@ ipintOp(_simd_f32x4_relaxed_nmadd, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f64x2_relaxed_madd, macro()
+ipintSIMDOp(_simd_f64x2_relaxed_madd, macro()
     # f64x2.relaxed_madd - fused multiply-add for f64
     popVec(v2)  # c (addend)
     popVec(v1)  # b
@@ -8708,6 +9631,9 @@ ipintOp(_simd_f64x2_relaxed_madd, macro()
     elsif X86_64
         emit "vmulpd %xmm1, %xmm0, %xmm0"
         emit "vaddpd %xmm2, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvmaddadp 46, 32, 33"
+        emit "xxlor 32, 46, 46"
     else
         break # Not implemented
     end
@@ -8716,7 +9642,7 @@ ipintOp(_simd_f64x2_relaxed_madd, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f64x2_relaxed_nmadd, macro()
+ipintSIMDOp(_simd_f64x2_relaxed_nmadd, macro()
     # f64x2.relaxed_nmadd - fused negative multiply-add for f64
     popVec(v2)  # c (addend)
     popVec(v1)  # b
@@ -8727,6 +9653,9 @@ ipintOp(_simd_f64x2_relaxed_nmadd, macro()
     elsif X86_64
         emit "vmulpd %xmm1, %xmm0, %xmm0"
         emit "vsubpd %xmm0, %xmm2, %xmm0"
+    elsif PPC64
+        emit "xvnmsubadp 46, 32, 33"
+        emit "xxlor 32, 46, 46"
     else
         break # Not implemented
     end
@@ -8735,7 +9664,7 @@ ipintOp(_simd_f64x2_relaxed_nmadd, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i8x16_relaxed_laneselect, macro()
+ipintSIMDOp(_simd_i8x16_relaxed_laneselect, macro()
     # i8x16.relaxed_laneselect - select lanes based on mask (relaxed: may use top bit only)
     popVec(v2)  # mask (c)
     popVec(v1)  # b (false lanes)
@@ -8749,6 +9678,8 @@ ipintOp(_simd_i8x16_relaxed_laneselect, macro()
     elsif X86_64
         # vpblendvb uses high bit of each byte in mask
         emit "vpblendvb %xmm2, %xmm0, %xmm1, %xmm0"
+    elsif PPC64
+        emit "vsel 0, 1, 0, 14"
     else
         break # Not implemented
     end
@@ -8757,7 +9688,7 @@ ipintOp(_simd_i8x16_relaxed_laneselect, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_relaxed_laneselect, macro()
+ipintSIMDOp(_simd_i16x8_relaxed_laneselect, macro()
     # i16x8.relaxed_laneselect - same as i8x16 (works on bits)
     popVec(v2)  # mask
     popVec(v1)  # b
@@ -8767,6 +9698,8 @@ ipintOp(_simd_i16x8_relaxed_laneselect, macro()
         emit "mov v16.16b, v18.16b"
     elsif X86_64
         emit "vpblendvb %xmm2, %xmm0, %xmm1, %xmm0"
+    elsif PPC64
+        emit "vsel 0, 1, 0, 14"
     else
         break # Not implemented
     end
@@ -8775,7 +9708,7 @@ ipintOp(_simd_i16x8_relaxed_laneselect, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_relaxed_laneselect, macro()
+ipintSIMDOp(_simd_i32x4_relaxed_laneselect, macro()
     # i32x4.relaxed_laneselect - same as i8x16 (works on bits)
     popVec(v2)  # mask
     popVec(v1)  # b
@@ -8785,6 +9718,8 @@ ipintOp(_simd_i32x4_relaxed_laneselect, macro()
         emit "mov v16.16b, v18.16b"
     elsif X86_64
         emit "vpblendvb %xmm2, %xmm0, %xmm1, %xmm0"
+    elsif PPC64
+        emit "vsel 0, 1, 0, 14"
     else
         break # Not implemented
     end
@@ -8793,7 +9728,7 @@ ipintOp(_simd_i32x4_relaxed_laneselect, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i64x2_relaxed_laneselect, macro()
+ipintSIMDOp(_simd_i64x2_relaxed_laneselect, macro()
     # i64x2.relaxed_laneselect - same as i8x16 (works on bits)
     popVec(v2)  # mask
     popVec(v1)  # b
@@ -8803,6 +9738,8 @@ ipintOp(_simd_i64x2_relaxed_laneselect, macro()
         emit "mov v16.16b, v18.16b"
     elsif X86_64
         emit "vpblendvb %xmm2, %xmm0, %xmm1, %xmm0"
+    elsif PPC64
+        emit "vsel 0, 1, 0, 14"
     else
         break # Not implemented
     end
@@ -8811,7 +9748,7 @@ ipintOp(_simd_i64x2_relaxed_laneselect, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f32x4_relaxed_min, macro()
+ipintSIMDOp(_simd_f32x4_relaxed_min, macro()
     # f32x4.relaxed_min - minimum (relaxed: NaN behavior is implementation defined)
     popVec(v1)
     popVec(v0)
@@ -8819,6 +9756,13 @@ ipintOp(_simd_f32x4_relaxed_min, macro()
         emit "fmin v16.4s, v16.4s, v17.4s"
     elsif X86_64
         emit "vminps %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvminsp 34, 32, 33"
+        emit "xvaddsp 35, 32, 33"
+        emit "xvcmpeqsp 36, 32, 32"
+        emit "xvcmpeqsp 37, 33, 33"
+        emit "xxland 36, 36, 37"
+        emit "xxsel 32, 35, 34, 36"
     else
         break # Not implemented
     end
@@ -8827,7 +9771,7 @@ ipintOp(_simd_f32x4_relaxed_min, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f32x4_relaxed_max, macro()
+ipintSIMDOp(_simd_f32x4_relaxed_max, macro()
     # f32x4.relaxed_max - maximum (relaxed: NaN behavior is implementation defined)
     popVec(v1)
     popVec(v0)
@@ -8835,6 +9779,13 @@ ipintOp(_simd_f32x4_relaxed_max, macro()
         emit "fmax v16.4s, v16.4s, v17.4s"
     elsif X86_64
         emit "vmaxps %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvmaxsp 34, 32, 33"
+        emit "xvaddsp 35, 32, 33"
+        emit "xvcmpeqsp 36, 32, 32"
+        emit "xvcmpeqsp 37, 33, 33"
+        emit "xxland 36, 36, 37"
+        emit "xxsel 32, 35, 34, 36"
     else
         break # Not implemented
     end
@@ -8843,7 +9794,7 @@ ipintOp(_simd_f32x4_relaxed_max, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f64x2_relaxed_min, macro()
+ipintSIMDOp(_simd_f64x2_relaxed_min, macro()
     # f64x2.relaxed_min - minimum for f64
     popVec(v1)
     popVec(v0)
@@ -8851,6 +9802,13 @@ ipintOp(_simd_f64x2_relaxed_min, macro()
         emit "fmin v16.2d, v16.2d, v17.2d"
     elsif X86_64
         emit "vminpd %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvmindp 34, 32, 33"
+        emit "xvadddp 35, 32, 33"
+        emit "xvcmpeqdp 36, 32, 32"
+        emit "xvcmpeqdp 37, 33, 33"
+        emit "xxland 36, 36, 37"
+        emit "xxsel 32, 35, 34, 36"
     else
         break # Not implemented
     end
@@ -8859,7 +9817,7 @@ ipintOp(_simd_f64x2_relaxed_min, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_f64x2_relaxed_max, macro()
+ipintSIMDOp(_simd_f64x2_relaxed_max, macro()
     # f64x2.relaxed_max - maximum for f64
     popVec(v1)
     popVec(v0)
@@ -8867,6 +9825,13 @@ ipintOp(_simd_f64x2_relaxed_max, macro()
         emit "fmax v16.2d, v16.2d, v17.2d"
     elsif X86_64
         emit "vmaxpd %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "xvmaxdp 34, 32, 33"
+        emit "xvadddp 35, 32, 33"
+        emit "xvcmpeqdp 36, 32, 32"
+        emit "xvcmpeqdp 37, 33, 33"
+        emit "xxland 36, 36, 37"
+        emit "xxsel 32, 35, 34, 36"
     else
         break # Not implemented
     end
@@ -8875,7 +9840,7 @@ ipintOp(_simd_f64x2_relaxed_max, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_relaxed_q15mulr_s, macro()
+ipintSIMDOp(_simd_i16x8_relaxed_q15mulr_s, macro()
     # i16x8.relaxed_q15mulr_s - Q15 multiply with rounding (relaxed: saturation behavior is implementation defined)
     popVec(v1)
     popVec(v0)
@@ -8883,6 +9848,9 @@ ipintOp(_simd_i16x8_relaxed_q15mulr_s, macro()
         emit "sqrdmulh v16.8h, v16.8h, v17.8h"
     elsif X86_64
         emit "vpmulhrsw %xmm1, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vxor 2, 2, 2"
+        emit "vmhraddshs 0, 0, 1, 2"
     else
         break # Not implemented
     end
@@ -8891,7 +9859,7 @@ ipintOp(_simd_i16x8_relaxed_q15mulr_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i16x8_relaxed_dot_i8x16_i7x16_s, macro()
+ipintSIMDOp(_simd_i16x8_relaxed_dot_i8x16_i7x16_s, macro()
     # i16x8.relaxed_dot_i8x16_i7x16_s - dot product of signed i8 and unsigned i7, producing i16
     popVec(v1)  # b (interpreted as i7x16, which fits in unsigned byte)
     popVec(v0)  # a (signed i8x16)
@@ -8907,6 +9875,10 @@ ipintOp(_simd_i16x8_relaxed_dot_i8x16_i7x16_s, macro()
         # vpmaddubsw: treats first operand as unsigned, second as signed
         # Swapped order: xmm0=signed, xmm1=unsigned-like
         emit "vpmaddubsw %xmm0, %xmm1, %xmm0"
+    elsif PPC64
+        emit "vmulesb 2, 0, 1"
+        emit "vmulosb 3, 0, 1"
+        emit "vadduhm 0, 2, 3"
     else
         break # Not implemented
     end
@@ -8915,7 +9887,7 @@ ipintOp(_simd_i16x8_relaxed_dot_i8x16_i7x16_s, macro()
     nextIPIntInstruction()
 end)
 
-ipintOp(_simd_i32x4_relaxed_dot_i8x16_i7x16_add_s, macro()
+ipintSIMDOp(_simd_i32x4_relaxed_dot_i8x16_i7x16_add_s, macro()
     # i32x4.relaxed_dot_i8x16_i7x16_add_s - dot product + add
     # Computes: sum of (a[i] * b[i]) for groups of 4, then adds c
     popVec(v2)  # c (addend)
@@ -8936,6 +9908,12 @@ ipintOp(_simd_i32x4_relaxed_dot_i8x16_i7x16_add_s, macro()
         emit "vpsrlw $15, %xmm3, %xmm3"
         emit "vpmaddwd %xmm3, %xmm0, %xmm0"
         emit "vpaddd %xmm2, %xmm0, %xmm0"
+    elsif PPC64
+        emit "vmulesb 2, 0, 1"
+        emit "vmulosb 3, 0, 1"
+        emit "vadduhm 2, 2, 3"
+        emit "vspltish 3, 1"
+        emit "vmsumshm 0, 2, 3, 14"
     else
         break # Not implemented
     end
@@ -8991,7 +9969,9 @@ macro weakCASLoopHalf(mem, value, scratch1AndOldValue, scratch2, fn)
     else
     .loop:
         loadlinkacqh [mem], scratch1AndOldValue
+        wasmSwaph(scratch1AndOldValue)
         fn(value, scratch1AndOldValue, scratch2)
+        wasmSwaph(scratch2)
         storecondrelh ws2, scratch2, [mem]
         bineq ws2, 0, .loop
     end
@@ -9008,7 +9988,9 @@ macro weakCASLoopInt(mem, value, scratch1AndOldValue, scratch2, fn)
     else
     .loop:
         loadlinkacqi [mem], scratch1AndOldValue
+        wasmSwapi(scratch1AndOldValue)
         fn(value, scratch1AndOldValue, scratch2)
+        wasmSwapi(scratch2)
         storecondreli ws2, scratch2, [mem]
         bineq ws2, 0, .loop
     end
@@ -9025,16 +10007,50 @@ macro weakCASLoopQuad(mem, value, scratch1AndOldValue, scratch2, fn)
     else
     .loop:
         loadlinkacqq [mem], scratch1AndOldValue
+        wasmSwapq(scratch1AndOldValue)
         fn(value, scratch1AndOldValue, scratch2)
+        wasmSwapq(scratch2)
         storecondrelq ws2, scratch2, [mem]
         bineq ws2, 0, .loop
     end
 end
 
+# PPC64 note for the doI{32,64}AtomicLoad* family below.
+#
+# ARM64 lowers atomicload{b,h,i,q} to ldar{b,h,,}, i.e. a sequentially
+# consistent load; x86-64 lowers them to a plain mov (which is already
+# seq-cst-for-loads there). The ppc64 offlineasm backend implements
+# neither atomicload* nor any lwsync-strength barrier opcode, so PPC64
+# gets an explicit sequence built only from opcodes that do exist:
+#
+#     fence ; <plain naturally-aligned load> ; fence
+#
+# `fence` lowers to hwsync on ppc64 (offlineasm/ppc64.rb, "memfence",
+# "fence" -> sync). This is the standard "leading sync" Power mapping of a
+# C11 seq_cst load, with the trailing acquire barrier strengthened from
+# lwsync to sync because offlineasm exposes no lwsync-strength opcode. Strictly stronger than required, never weaker.
+#
+# The leading sync is load-bearing, not belt-and-braces: the atomic stores
+# and RMWs on this path go through the LL/SC weakCASLoop*/weakCASExchange*
+# helpers, whose store-conditional carries only an lwsync (release). Without
+# a sync on the load side there would be nothing ordering a prior atomic
+# store against a subsequent atomic load, which seq_cst requires. (The
+# backend's load-reserve also issues a sync first, which orders a prior
+# atomic store against a following RMW; it does nothing for a plain load.)
+#
+# The load itself is single-copy atomic because it is naturally aligned:
+# every caller runs checkAlignment{2,4,8} first (a byte is always aligned),
+# and PPC guarantees atomicity for aligned halfword/word/doubleword accesses.
+# loadb/loadh/loadi lower to lbz/lhz/lwz, which zero-extend into the full
+# 64-bit register, matching ARM64's ldarb/ldarh/ldar writes to a W register.
 macro doI32AtomicLoad(mem, dst)
     checkAlignment4(mem, _ipint_throw_UnalignedMemoryAccess)
     if ARM64 or ARM64E or X86_64
         atomicloadi [mem], dst
+    elsif PPC64
+        fence
+        wasmLoadi([mem], dst)
+        fence
     else
         error
     end
@@ -9044,6 +10060,10 @@ macro doI64AtomicLoad(mem, dst)
     checkAlignment8(mem, _ipint_throw_UnalignedMemoryAccess)
     if ARM64 or ARM64E or X86_64
         atomicloadq [mem], dst
+    elsif PPC64
+        fence
+        wasmLoadq([mem], dst)
+        fence
     else
         error
     end
@@ -9053,6 +10073,10 @@ macro doI32AtomicLoad8(mem, dst)
     noAlignmentCheck(mem, _ipint_throw_UnalignedMemoryAccess)
     if ARM64 or ARM64E or X86_64
         atomicloadb [mem], dst
+    elsif PPC64
+        fence
+        loadb [mem], dst
+        fence
     else
         error
     end
@@ -9062,6 +10086,10 @@ macro doI32AtomicLoad16(mem, dst)
     checkAlignment2(mem, _ipint_throw_UnalignedMemoryAccess)
     if ARM64 or ARM64E or X86_64
         atomicloadh [mem], dst
+    elsif PPC64
+        fence
+        wasmLoadh([mem], dst)
+        fence
     else
         error
     end
@@ -9071,6 +10099,10 @@ macro doI64AtomicLoad8(mem, dst)
     noAlignmentCheck(mem, _ipint_throw_UnalignedMemoryAccess)
     if ARM64 or ARM64E or X86_64
         atomicloadb [mem], dst
+    elsif PPC64
+        fence
+        loadb [mem], dst
+        fence
     else
         error
     end
@@ -9080,6 +10112,10 @@ macro doI64AtomicLoad16(mem, dst)
     checkAlignment2(mem, _ipint_throw_UnalignedMemoryAccess)
     if ARM64 or ARM64E or X86_64
         atomicloadh [mem], dst
+    elsif PPC64
+        fence
+        wasmLoadh([mem], dst)
+        fence
     else
         error
     end
@@ -9089,6 +10125,10 @@ macro doI64AtomicLoad32(mem, dst)
     checkAlignment4(mem, _ipint_throw_UnalignedMemoryAccess)
     if ARM64 or ARM64E or X86_64
         atomicloadi [mem], dst
+    elsif PPC64
+        fence
+        wasmLoadi([mem], dst)
+        fence
     else
         error
     end
@@ -9101,7 +10141,7 @@ macro doI32AtomicStore(mem, val, memCopy, scratch)
         atomicxchgi val, [memCopy], val
     elsif X86_64
         atomicxchgi val, [memCopy]
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopInt(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             move value, newValue
         end)
@@ -9117,7 +10157,7 @@ macro doI64AtomicStore(mem, val, memCopy, scratch)
         atomicxchgq val, [memCopy], val
     elsif X86_64
         atomicxchgq val, [memCopy]
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopQuad(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             move value, newValue
         end)
@@ -9133,7 +10173,7 @@ macro doI32AtomicStore8(mem, val, memCopy, scratch)
         atomicxchgb val, [memCopy], val
     elsif X86_64
         atomicxchgb val, [memCopy]
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopByte(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             move value, newValue
         end)
@@ -9149,7 +10189,7 @@ macro doI32AtomicStore16(mem, val, memCopy, scratch)
         atomicxchgh val, [memCopy], val
     elsif X86_64
         atomicxchgh val, [memCopy]
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopHalf(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             move value, newValue
         end)
@@ -9165,7 +10205,7 @@ macro doI64AtomicStore8(mem, val, memCopy, scratch)
         atomicxchgb val, [memCopy], val
     elsif X86_64
         atomicxchgb val, [memCopy]
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopByte(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             move value, newValue
         end)
@@ -9181,7 +10221,7 @@ macro doI64AtomicStore16(mem, val, memCopy, scratch)
         atomicxchgh val, [memCopy], val
     elsif X86_64
         atomicxchgh val, [memCopy]
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopHalf(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             move value, newValue
         end)
@@ -9197,7 +10237,7 @@ macro doI64AtomicStore32(mem, val, memCopy, scratch)
         atomicxchgi val, [memCopy], val
     elsif X86_64
         atomicxchgi val, [memCopy]
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopInt(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             move value, newValue
         end)
@@ -9214,7 +10254,7 @@ macro doI32AtomicRmwAdd(mem, val, memCopy, scratch)
     elsif X86_64
         atomicxchgaddi val, [memCopy]
         move val, mem
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopInt(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             addi value, oldValue, newValue
         end)
@@ -9231,7 +10271,7 @@ macro doI64AtomicRmwAdd(mem, val, memCopy, scratch)
     elsif X86_64
         atomicxchgaddq val, [memCopy]
         move val, mem
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopQuad(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             addq value, oldValue, newValue
         end)
@@ -9249,7 +10289,7 @@ macro doI32AtomicRmwAdd8(mem, val, memCopy, scratch)
         atomicxchgaddb val, [memCopy]
         move val, mem
         andi 0xff, mem
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopByte(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             addi value, oldValue, newValue
         end)
@@ -9267,7 +10307,7 @@ macro doI32AtomicRmwAdd16(mem, val, memCopy, scratch)
         atomicxchgaddh val, [memCopy]
         move val, mem
         andi 0xffff, mem
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopHalf(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             addi value, oldValue, newValue
         end)
@@ -9285,7 +10325,7 @@ macro doI64AtomicRmwAdd8(mem, val, memCopy, scratch)
         atomicxchgaddb val, [memCopy]
         move val, mem
         andi 0xff, mem
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopByte(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             addi value, oldValue, newValue
         end)
@@ -9303,7 +10343,7 @@ macro doI64AtomicRmwAdd16(mem, val, memCopy, scratch)
         atomicxchgaddh val, [memCopy]
         move val, mem
         andi 0xffff, mem
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopHalf(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             addi value, oldValue, newValue
         end)
@@ -9321,7 +10361,7 @@ macro doI64AtomicRmwAdd32(mem, val, memCopy, scratch)
         atomicxchgaddi val, [memCopy]
         move val, mem
         ori 0, mem
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopInt(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             addi value, oldValue, newValue
         end)
@@ -9340,7 +10380,7 @@ macro doI32AtomicRmwSub(mem, val, memCopy, scratch)
         negi val
         atomicxchgaddi val, [memCopy]
         move val, mem
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopInt(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             subi oldValue, value, newValue
         end)
@@ -9359,7 +10399,7 @@ macro doI64AtomicRmwSub(mem, val, memCopy, scratch)
         negq val
         atomicxchgaddq val, [memCopy]
         move val, mem
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopQuad(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             subq oldValue, value, newValue
         end)
@@ -9379,7 +10419,7 @@ macro doI32AtomicRmwSub8(mem, val, memCopy, scratch)
         atomicxchgaddb val, [memCopy]
         move val, mem
         andi 0xff, mem
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopByte(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             subi oldValue, value, newValue
         end)
@@ -9399,7 +10439,7 @@ macro doI32AtomicRmwSub16(mem, val, memCopy, scratch)
         atomicxchgaddh val, [memCopy]
         move val, mem
         andi 0xffff, mem
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopHalf(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             subi oldValue, value, newValue
         end)
@@ -9419,7 +10459,7 @@ macro doI64AtomicRmwSub8(mem, val, memCopy, scratch)
         atomicxchgaddb val, [memCopy]
         move val, mem
         andi 0xff, mem
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopByte(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             subi oldValue, value, newValue
         end)
@@ -9439,7 +10479,7 @@ macro doI64AtomicRmwSub16(mem, val, memCopy, scratch)
         atomicxchgaddh val, [memCopy]
         move val, mem
         andi 0xffff, mem
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopHalf(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             subi oldValue, value, newValue
         end)
@@ -9459,7 +10499,7 @@ macro doI64AtomicRmwSub32(mem, val, memCopy, scratch)
         atomicxchgaddi val, [memCopy]
         move val, mem
         ori 0, mem
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopInt(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             subi oldValue, value, newValue
         end)
@@ -9478,7 +10518,7 @@ macro doI32AtomicRmwAnd(mem, val, memCopy, scratch)
         weakCASLoopInt(memCopy, val, mem, scratch, macro (value, dst)
             andq value, dst
         end)
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopInt(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             andi value, oldValue, newValue
         end)
@@ -9497,7 +10537,7 @@ macro doI64AtomicRmwAnd(mem, val, memCopy, scratch)
         weakCASLoopQuad(memCopy, val, mem, scratch, macro (value, dst)
             andq value, dst
         end)
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopQuad(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             andq value, oldValue, newValue
         end)
@@ -9516,7 +10556,7 @@ macro doI32AtomicRmwAnd8(mem, val, memCopy, scratch)
         weakCASLoopByte(memCopy, val, mem, scratch, macro (value, dst)
             andq value, dst
         end)
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopByte(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             andi value, oldValue, newValue
         end)
@@ -9535,7 +10575,7 @@ macro doI32AtomicRmwAnd16(mem, val, memCopy, scratch)
         weakCASLoopHalf(memCopy, val, mem, scratch, macro (value, dst)
             andq value, dst
         end)
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopHalf(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             andi value, oldValue, newValue
         end)
@@ -9554,7 +10594,7 @@ macro doI64AtomicRmwAnd8(mem, val, memCopy, scratch)
         weakCASLoopByte(memCopy, val, mem, scratch, macro (value, dst)
             andq value, dst
         end)
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopByte(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             andi value, oldValue, newValue
         end)
@@ -9573,7 +10613,7 @@ macro doI64AtomicRmwAnd16(mem, val, memCopy, scratch)
         weakCASLoopHalf(memCopy, val, mem, scratch, macro (value, dst)
             andq value, dst
         end)
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopHalf(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             andi value, oldValue, newValue
         end)
@@ -9592,7 +10632,7 @@ macro doI64AtomicRmwAnd32(mem, val, memCopy, scratch)
         weakCASLoopInt(memCopy, val, mem, scratch, macro (value, dst)
             andq value, dst
         end)
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopInt(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             andi value, oldValue, newValue
         end)
@@ -9610,7 +10650,7 @@ macro doI32AtomicRmwOr(mem, val, memCopy, scratch)
         weakCASLoopInt(memCopy, val, mem, scratch, macro (value, dst)
             ori value, dst
         end)
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopInt(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             ori value, oldValue, newValue
         end)
@@ -9628,7 +10668,7 @@ macro doI64AtomicRmwOr(mem, val, memCopy, scratch)
         weakCASLoopQuad(memCopy, val, mem, scratch, macro (value, dst)
             orq value, dst
         end)
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopQuad(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             orq value, oldValue, newValue
         end)
@@ -9646,7 +10686,7 @@ macro doI32AtomicRmwOr8(mem, val, memCopy, scratch)
         weakCASLoopByte(memCopy, val, mem, scratch, macro (value, dst)
             orq value, dst
         end)
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopByte(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             ori value, oldValue, newValue
         end)
@@ -9664,7 +10704,7 @@ macro doI32AtomicRmwOr16(mem, val, memCopy, scratch)
         weakCASLoopHalf(memCopy, val, mem, scratch, macro (value, dst)
             orq value, dst
         end)
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopHalf(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             ori value, oldValue, newValue
         end)
@@ -9682,7 +10722,7 @@ macro doI64AtomicRmwOr8(mem, val, memCopy, scratch)
         weakCASLoopByte(memCopy, val, mem, scratch, macro (value, dst)
             orq value, dst
         end)
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopByte(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             ori value, oldValue, newValue
         end)
@@ -9700,7 +10740,7 @@ macro doI64AtomicRmwOr16(mem, val, memCopy, scratch)
         weakCASLoopHalf(memCopy, val, mem, scratch, macro (value, dst)
             orq value, dst
         end)
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopHalf(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             ori value, oldValue, newValue
         end)
@@ -9718,7 +10758,7 @@ macro doI64AtomicRmwOr32(mem, val, memCopy, scratch)
         weakCASLoopInt(memCopy, val, mem, scratch, macro (value, dst)
             orq value, dst
         end)
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopInt(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             ori value, oldValue, newValue
         end)
@@ -9736,7 +10776,7 @@ macro doI32AtomicRmwXor(mem, val, memCopy, scratch)
         weakCASLoopInt(memCopy, val, mem, scratch, macro (value, dst)
             xorq value, dst
         end)
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopInt(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             xori value, oldValue, newValue
         end)
@@ -9754,7 +10794,7 @@ macro doI64AtomicRmwXor(mem, val, memCopy, scratch)
         weakCASLoopQuad(memCopy, val, mem, scratch, macro (value, dst)
             xorq value, dst
         end)
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopQuad(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             xorq value, oldValue, newValue
         end)
@@ -9772,7 +10812,7 @@ macro doI32AtomicRmwXor8(mem, val, memCopy, scratch)
         weakCASLoopByte(memCopy, val, mem, scratch, macro (value, dst)
             xorq value, dst
         end)
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopByte(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             xori value, oldValue, newValue
         end)
@@ -9790,7 +10830,7 @@ macro doI32AtomicRmwXor16(mem, val, memCopy, scratch)
         weakCASLoopHalf(memCopy, val, mem, scratch, macro (value, dst)
             xorq value, dst
         end)
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopHalf(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             xori value, oldValue, newValue
         end)
@@ -9808,7 +10848,7 @@ macro doI64AtomicRmwXor8(mem, val, memCopy, scratch)
         weakCASLoopByte(memCopy, val, mem, scratch, macro (value, dst)
             xorq value, dst
         end)
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopByte(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             xori value, oldValue, newValue
         end)
@@ -9826,7 +10866,7 @@ macro doI64AtomicRmwXor16(mem, val, memCopy, scratch)
         weakCASLoopHalf(memCopy, val, mem, scratch, macro (value, dst)
             xorq value, dst
         end)
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopHalf(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             xori value, oldValue, newValue
         end)
@@ -9844,7 +10884,7 @@ macro doI64AtomicRmwXor32(mem, val, memCopy, scratch)
         weakCASLoopInt(memCopy, val, mem, scratch, macro (value, dst)
             xorq value, dst
         end)
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopInt(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             xori value, oldValue, newValue
         end)
@@ -9862,7 +10902,7 @@ macro doI32AtomicRmwXchg(mem, val, memCopy, scratch)
         weakCASLoopInt(memCopy, val, mem, scratch, macro (value, dst)
             move value, dst
         end)
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopInt(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             move value, newValue
         end)
@@ -9880,7 +10920,7 @@ macro doI64AtomicRmwXchg(mem, val, memCopy, scratch)
         weakCASLoopQuad(memCopy, val, mem, scratch, macro (value, dst)
             move value, dst
         end)
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopQuad(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             move value, newValue
         end)
@@ -9898,7 +10938,7 @@ macro doI32AtomicRmwXchg8(mem, val, memCopy, scratch)
         weakCASLoopByte(memCopy, val, mem, scratch, macro (value, dst)
             move value, dst
         end)
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopByte(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             move value, newValue
         end)
@@ -9916,7 +10956,7 @@ macro doI32AtomicRmwXchg16(mem, val, memCopy, scratch)
         weakCASLoopHalf(memCopy, val, mem, scratch, macro (value, dst)
             move value, dst
         end)
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopHalf(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             move value, newValue
         end)
@@ -9934,7 +10974,7 @@ macro doI64AtomicRmwXchg8(mem, val, memCopy, scratch)
         weakCASLoopByte(memCopy, val, mem, scratch, macro (value, dst)
             move value, dst
         end)
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopByte(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             move value, newValue
         end)
@@ -9952,7 +10992,7 @@ macro doI64AtomicRmwXchg16(mem, val, memCopy, scratch)
         weakCASLoopHalf(memCopy, val, mem, scratch, macro (value, dst)
             move value, dst
         end)
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopHalf(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             move value, newValue
         end)
@@ -9970,7 +11010,7 @@ macro doI64AtomicRmwXchg32(mem, val, memCopy, scratch)
         weakCASLoopInt(memCopy, val, mem, scratch, macro (value, dst)
             move value, dst
         end)
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASLoopInt(memCopy, val, mem, scratch, macro(value, oldValue, newValue)
             move value, newValue
         end)
@@ -9986,7 +11026,7 @@ macro doI32AtomicCmpxchg(mem, expected, newVal, memCopy, scratch)
     andq 0xffffffff, mem
     if ARM64E or X86_64
         atomicweakcasi mem, newVal, [memCopy]
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASExchangeInt(memCopy, newVal, mem, scratch, expected)
     else
         error
@@ -9999,7 +11039,7 @@ macro doI64AtomicCmpxchg(mem, expected, newVal, memCopy, scratch)
     move expected, mem
     if ARM64E or X86_64
         atomicweakcasq mem, newVal, [memCopy]
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASExchangeQuad(memCopy, newVal, mem, scratch, expected)
     else
         error
@@ -10013,7 +11053,7 @@ macro doI32AtomicCmpxchg8(mem, expected, newVal, memCopy, scratch)
     andq 0xff, mem
     if ARM64E or X86_64
         atomicweakcasb mem, newVal, [memCopy]
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASExchangeByte(memCopy, newVal, mem, scratch, expected)
     else
         error
@@ -10027,7 +11067,7 @@ macro doI32AtomicCmpxchg16(mem, expected, newVal, memCopy, scratch)
     andq 0xffff, mem
     if ARM64E or X86_64
         atomicweakcash mem, newVal, [memCopy]
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASExchangeHalf(memCopy, newVal, mem, scratch, expected)
     else
         error
@@ -10041,7 +11081,7 @@ macro doI64AtomicCmpxchg8(mem, expected, newVal, memCopy, scratch)
     andq 0xff, mem
     if ARM64E or X86_64
         atomicweakcasb mem, newVal, [memCopy]
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASExchangeByte(memCopy, newVal, mem, scratch, expected)
     else
         error
@@ -10055,7 +11095,7 @@ macro doI64AtomicCmpxchg16(mem, expected, newVal, memCopy, scratch)
     andq 0xffff, mem
     if ARM64E or X86_64
         atomicweakcash mem, newVal, [memCopy]
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASExchangeHalf(memCopy, newVal, mem, scratch, expected)
     else
         error
@@ -10069,7 +11109,7 @@ macro doI64AtomicCmpxchg32(mem, expected, newVal, memCopy, scratch)
     andq 0xffffffff, mem
     if ARM64E or X86_64
         atomicweakcasi mem, newVal, [memCopy]
-    elsif ARM64
+    elsif ARM64 or PPC64
         weakCASExchangeInt(memCopy, newVal, mem, scratch, expected)
     else
         error
@@ -10729,7 +11769,7 @@ ipintAtomicOp(_i64_atomic_rmw32_xchg_u, macro()
 end)
 
 macro weakCASExchangeByte(mem, value, expected, scratch, scratch2)
-    if ARM64
+    if ARM64 or PPC64
     validateOpcodeConfig(scratch2)
     .loop:
         loadlinkacqb [mem], scratch2
@@ -10749,8 +11789,10 @@ macro weakCASExchangeByte(mem, value, expected, scratch, scratch2)
 end
 
 macro weakCASExchangeHalf(mem, value, expected, scratch, scratch2)
-    if ARM64
+    if ARM64 or PPC64
     validateOpcodeConfig(scratch2)
+    wasmSwaph(expected)
+    wasmSwaph(value)
     .loop:
         loadlinkacqh [mem], scratch2
         bqneq expected, scratch2, .fail
@@ -10763,14 +11805,17 @@ macro weakCASExchangeHalf(mem, value, expected, scratch, scratch2)
         jmp .loop
     .done:
         move scratch2, expected
+        wasmSwaph(expected)
     else
         error
     end
 end
 
 macro weakCASExchangeInt(mem, value, expected, scratch, scratch2)
-    if ARM64
+    if ARM64 or PPC64
     validateOpcodeConfig(scratch2)
+    wasmSwapi(expected)
+    wasmSwapi(value)
     .loop:
         loadlinkacqi [mem], scratch2
         bqneq expected, scratch2, .fail
@@ -10783,14 +11828,17 @@ macro weakCASExchangeInt(mem, value, expected, scratch, scratch2)
         jmp .loop
     .done:
         move scratch2, expected
+        wasmSwapi(expected)
     else
         error
     end
 end
 
 macro weakCASExchangeQuad(mem, value, expected, scratch, scratch2)
-    if ARM64
+    if ARM64 or PPC64
     validateOpcodeConfig(scratch2)
+    wasmSwapq(expected)
+    wasmSwapq(value)
     .loop:
         loadlinkacqq [mem], scratch2
         bqneq expected, scratch2, .fail
@@ -10803,6 +11851,7 @@ macro weakCASExchangeQuad(mem, value, expected, scratch, scratch2)
         jmp .loop
     .done:
         move scratch2, expected
+        wasmSwapq(expected)
     else
         error
     end
@@ -10943,7 +11992,7 @@ end)
 .ipint_i32_load_mem_slow_path:
     leap 1[PC], t4
     loadStoreMakePointerSlow(t4, t0, 4, t1, t2, t5, t6)
-    loadi [t0], t1
+    wasmLoadi([t0], t1)
     pushInt32(t1)
     move t4, PC
     nextIPIntInstruction()
@@ -10951,7 +12000,7 @@ end)
 .ipint_i64_load_mem_slow_path:
     leap 1[PC], t4
     loadStoreMakePointerSlow(t4, t0, 8, t1, t2, t5, t6)
-    loadq [t0], t1
+    wasmLoadq([t0], t1)
     pushInt64(t1)
     move t4, PC
     nextIPIntInstruction()
@@ -10959,7 +12008,7 @@ end)
 .ipint_f32_load_mem_slow_path:
     leap 1[PC], t4
     loadStoreMakePointerSlow(t4, t0, 4, t1, t2, t5, t6)
-    loadf [t0], ft0
+    wasmLoadf([t0], ft0)
     pushFloat32(ft0)
     move t4, PC
     nextIPIntInstruction()
@@ -10967,7 +12016,7 @@ end)
 .ipint_f64_load_mem_slow_path:
     leap 1[PC], t4
     loadStoreMakePointerSlow(t4, t0, 8, t1, t2, t5, t6)
-    loadd [t0], ft0
+    wasmLoadd([t0], ft0)
     pushFloat64(ft0)
     move t4, PC
     nextIPIntInstruction()
@@ -10991,7 +12040,7 @@ end)
 .ipint_i32_load16s_mem_slow_path:
     leap 1[PC], t4
     loadStoreMakePointerSlow(t4, t0, 2, t1, t2, t5, t6)
-    loadhsi [t0], t1
+    wasmLoadhsi([t0], t1)
     pushInt32(t1)
     move t4, PC
     nextIPIntInstruction()
@@ -10999,7 +12048,7 @@ end)
 .ipint_i32_load16u_mem_slow_path:
     leap 1[PC], t4
     loadStoreMakePointerSlow(t4, t0, 2, t1, t2, t5, t6)
-    loadh [t0], t1
+    wasmLoadh([t0], t1)
     pushInt32(t1)
     move t4, PC
     nextIPIntInstruction()
@@ -11023,7 +12072,7 @@ end)
 .ipint_i64_load16s_mem_slow_path:
     leap 1[PC], t4
     loadStoreMakePointerSlow(t4, t0, 2, t1, t2, t5, t6)
-    loadhsq [t0], t1
+    wasmLoadhsq([t0], t1)
     pushInt64(t1)
     move t4, PC
     nextIPIntInstruction()
@@ -11031,7 +12080,7 @@ end)
 .ipint_i64_load16u_mem_slow_path:
     leap 1[PC], t4
     loadStoreMakePointerSlow(t4, t0, 2, t1, t2, t5, t6)
-    loadh [t0], t1
+    wasmLoadh([t0], t1)
     pushInt64(t1)
     move t4, PC
     nextIPIntInstruction()
@@ -11039,7 +12088,7 @@ end)
 .ipint_i64_load32s_mem_slow_path:
     leap 1[PC], t4
     loadStoreMakePointerSlow(t4, t0, 4, t1, t2, t5, t6)
-    loadi [t0], t1
+    wasmLoadi([t0], t1)
     sxi2q t1, t1
     pushInt64(t1)
     move t4, PC
@@ -11048,7 +12097,7 @@ end)
 .ipint_i64_load32u_mem_slow_path:
     leap 1[PC], t4
     loadStoreMakePointerSlow(t4, t0, 4, t1, t2, t5, t6)
-    loadi [t0], t1
+    wasmLoadi([t0], t1)
     pushInt64(t1)
     move t4, PC
     nextIPIntInstruction()
@@ -11056,28 +12105,28 @@ end)
 .ipint_i32_store_mem_slow_path:
     leap 1[PC], t4
     loadStoreMakePointerSlow(t4, t0, 4, t1, t2, t5, t6)
-    storei t3, [t0]
+    wasmStorei(t3, [t0])
     move t4, PC
     nextIPIntInstruction()
 
 .ipint_i64_store_mem_slow_path:
     leap 1[PC], t4
     loadStoreMakePointerSlow(t4, t0, 8, t1, t2, t5, t6)
-    storeq t3, [t0]
+    wasmStoreq(t3, [t0])
     move t4, PC
     nextIPIntInstruction()
 
 .ipint_f32_store_mem_slow_path:
     leap 1[PC], t4
     loadStoreMakePointerSlow(t4, t0, 4, t1, t2, t5, t6)
-    storef ft0, [t0]
+    wasmStoref(ft0, [t0])
     move t4, PC
     nextIPIntInstruction()
 
 .ipint_f64_store_mem_slow_path:
     leap 1[PC], t4
     loadStoreMakePointerSlow(t4, t0, 8, t1, t2, t5, t6)
-    stored ft0, [t0]
+    wasmStored(ft0, [t0])
     move t4, PC
     nextIPIntInstruction()
 
@@ -11091,7 +12140,7 @@ end)
 .ipint_i32_store16_mem_slow_path:
     leap 1[PC], t4
     loadStoreMakePointerSlow(t4, t0, 2, t1, t2, t5, t6)
-    storeh t3, [t0]
+    wasmStoreh(t3, [t0])
     move t4, PC
     nextIPIntInstruction()
 
@@ -11105,14 +12154,14 @@ end)
 .ipint_i64_store16_mem_slow_path:
     leap 1[PC], t4
     loadStoreMakePointerSlow(t4, t0, 2, t1, t2, t5, t6)
-    storeh t3, [t0]
+    wasmStoreh(t3, [t0])
     move t4, PC
     nextIPIntInstruction()
 
 .ipint_i64_store32_mem_slow_path:
     leap 1[PC], t4
     loadStoreMakePointerSlow(t4, t0, 4, t1, t2, t5, t6)
-    storei t3, [t0]
+    wasmStorei(t3, [t0])
     move t4, PC
     nextIPIntInstruction()
 
@@ -11781,7 +12830,14 @@ macro mintArgDispatch()
     addq 1, MC
     bigteq sc0, (constexpr IPInt::CallArgumentBytecode::NumOpcodes), _ipint_mint_arg_dispatch_err
     lshiftq (constexpr (WTF::fastLog2(JSC::IPInt::alignMInt))), sc0
-if ARM64 or ARM64E
+if ARM64 or ARM64E or PPC64
+    # During mINT only sc0 is free: sc1 is mintSS, sc2 is targetEntrypoint and
+    # sc3 is the native argument stack, so the table base needs a second temp
+    # drawn from the pinned set.  PPC64 shares ARM64's IPInt register roles
+    # exactly (PC=csr7, MC=csr6, WI=csr0, MB=csr3, BC=csr4), so ARM64's choice
+    # of BC transfers verbatim: BC is dead across argument materialisation
+    # because the memory registers are reloaded from the instance after the
+    # call returns.  X86_64's use of PC is an x86 PC-base idiom, not applicable.
     pcrtoaddr _mint_begin, csr4
     addq sc0, csr4
     jmp csr4
@@ -11789,6 +12845,8 @@ elsif X86_64
     pcrtoaddr _mint_begin, PC
     addq PC, sc0
     jmp sc0
+else
+    error
 end
 end
 
@@ -11797,7 +12855,8 @@ macro mintRetDispatch()
     addq 1, MC
     bigteq sc0, (constexpr IPInt::CallResultBytecode::NumOpcodes), _ipint_mint_ret_dispatch_err
     lshiftq (constexpr (WTF::fastLog2(JSC::IPInt::alignMInt))), sc0
-if ARM64 or ARM64E
+if ARM64 or ARM64E or PPC64
+    # Same temp-register reasoning as mintArgDispatch above.
     pcrtoaddr _mint_begin_return, csr4
     addq sc0, csr4
     jmp csr4
@@ -11805,6 +12864,8 @@ elsif X86_64
     pcrtoaddr _mint_begin_return, PC
     addq PC, sc0
     jmp sc0
+else
+    error
 end
 end
 
@@ -11969,11 +13030,15 @@ if ARM64 or ARM64E
     # t2 is safe here because r1==t1 on ARM64 (t2 is x2, a distinct register).
     loadpairq [t4], t2, t5
     storepairq t2, t5, -RestoreFrameSize[t4]
-elsif X86_64
+elsif X86_64 or PPC64
+    # PPC64 has no load/store-pair; the two-loadp shape uses only t5,
+    # leaving r1 (= t1 = r4, the target instance) alone as on ARM64.
     loadp [t4], t5
     storep t5, -RestoreFrameSize[t4]
     loadp 8[t4], t5
     storep t5, (8 - RestoreFrameSize)[t4]
+else
+    error
 end
     addp 16, t4
     jmp .ipint_restore_frame_copy_loop
@@ -12075,9 +13140,11 @@ end
 
     if ARM64 or ARM64E
         loadpairq -0x10[cfr], t0, t1
-    elsif X86_64 or RISCV64
+    elsif X86_64 or RISCV64 or PPC64
         loadp -0x8[cfr], t1
         loadp -0x10[cfr], t0
+    else
+        error
     end
 
     push t0, t1
@@ -12125,7 +13192,7 @@ mintAlign(_a1)
     mintArgDispatch()
 
 mintAlign(_a2)
-if ARM64 or ARM64E or X86_64
+if ARM64 or ARM64E or X86_64 or PPC64
     mintPop(a2)
     mintArgDispatch()
 else
@@ -12133,7 +13200,7 @@ else
 end
 
 mintAlign(_a3)
-if ARM64 or ARM64E or X86_64
+if ARM64 or ARM64E or X86_64 or PPC64
     mintPop(a3)
     mintArgDispatch()
 else
@@ -12141,7 +13208,7 @@ else
 end
 
 mintAlign(_a4)
-if ARM64 or ARM64E or X86_64
+if ARM64 or ARM64E or X86_64 or PPC64
     mintPop(a4)
     mintArgDispatch()
 else
@@ -12149,15 +13216,18 @@ else
 end
 
 mintAlign(_a5)
-if ARM64 or ARM64E or X86_64
+if ARM64 or ARM64E or X86_64 or PPC64
     mintPop(a5)
     mintArgDispatch()
 else
     break
 end
 
+# PPC64, like ARM64, passes eight integer arguments and results in registers
+# (r3-r10, GPRInfo NUMBER_OF_ARGUMENT_REGISTERS = 8); only X86_64 stops at six.
+# The same holds for every a6/a7/r6/r7 slot of mINT, uINT and argumINT below.
 mintAlign(_a6)
-if ARM64 or ARM64E
+if ARM64 or ARM64E or PPC64
     mintPop(a6)
     mintArgDispatch()
 else
@@ -12165,7 +13235,7 @@ else
 end
 
 mintAlign(_a7)
-if ARM64 or ARM64E
+if ARM64 or ARM64E or PPC64
     mintPop(a7)
     mintArgDispatch()
 else
@@ -12294,6 +13364,59 @@ mintAlign(_tail_call)
 
 # CallArgumentBytecode::Call (0x1b)
 mintAlign(_call)
+if PPC64
+    # _call's body does not fit in its slot, so the PPC64-only slots that
+    # follow it (0x1c-0x23) are jumped over.
+    jmp .ipint_mint_call
+
+    # PPC64 f32 FPR transport (opcodes 0x1c-0x23, emitted by the generator
+    # only for f32 values in FPRs; see ArgumINTBytecode::ArgFPRFloat in
+    # WasmIPIntGenerator.h).  A PPC64 FPR holds an f32 in double format, while
+    # IPInt slots hold the 4-byte IEEE encoding, so these use lfs/stfs where
+    # the plain FPR slots copy all 16 bytes.
+
+mintAlign(_ffa0)
+    loadf PayloadOffset[mintSS], wfa0
+    addq V128ISize, mintSS
+    mintArgDispatch()
+
+mintAlign(_ffa1)
+    loadf PayloadOffset[mintSS], wfa1
+    addq V128ISize, mintSS
+    mintArgDispatch()
+
+mintAlign(_ffa2)
+    loadf PayloadOffset[mintSS], wfa2
+    addq V128ISize, mintSS
+    mintArgDispatch()
+
+mintAlign(_ffa3)
+    loadf PayloadOffset[mintSS], wfa3
+    addq V128ISize, mintSS
+    mintArgDispatch()
+
+mintAlign(_ffa4)
+    loadf PayloadOffset[mintSS], wfa4
+    addq V128ISize, mintSS
+    mintArgDispatch()
+
+mintAlign(_ffa5)
+    loadf PayloadOffset[mintSS], wfa5
+    addq V128ISize, mintSS
+    mintArgDispatch()
+
+mintAlign(_ffa6)
+    loadf PayloadOffset[mintSS], wfa6
+    addq V128ISize, mintSS
+    mintArgDispatch()
+
+mintAlign(_ffa7)
+    loadf PayloadOffset[mintSS], wfa7
+    addq V128ISize, mintSS
+    mintArgDispatch()
+
+.ipint_mint_call:
+end
     pop wasmInstance, ws0
 
     # Save stack pointer, if we tail call someone who changes the frame above's stack argument size.
@@ -12336,10 +13459,16 @@ _wasm_ipint_call_return_location_wide32:
     leap [sp, mintRetSrc], mintRetSrc
 
     # load (first_non_arg_addr - cfr) from the stack and make it absolute
-if ARM64 or ARM64E
+    # The slot depends on offlineasm's two-operand push order.  ARM64 and
+    # PPC64 store `push a, b` as a at [sp], b at [sp+8] (stp / two std), so
+    # after `push t3, PC; push MC, wasmInstance` the frame-relative t3 is at
+    # 2 * SlotSize.  X86_64 pushes one at a time, reversing each pair.
+if ARM64 or ARM64E or PPC64
     loadp (2 * SlotSize)[sc3], mintRetDst
 elsif X86_64
     loadp (3 * SlotSize)[sc3], mintRetDst
+else
+    error
 end
     addp cfr, mintRetDst
 
@@ -12359,7 +13488,7 @@ mintAlign(_r1)
     mintRetDispatch()
 
 mintAlign(_r2)
-if ARM64 or ARM64E or X86_64
+if ARM64 or ARM64E or X86_64 or PPC64
     subp StackValueSize, mintRetDst
     storeq wa2, [mintRetDst]
     mintRetDispatch()
@@ -12368,7 +13497,7 @@ else
 end
 
 mintAlign(_r3)
-if ARM64 or ARM64E or X86_64
+if ARM64 or ARM64E or X86_64 or PPC64
     subp StackValueSize, mintRetDst
     storeq wa3, [mintRetDst]
     mintRetDispatch()
@@ -12377,7 +13506,7 @@ else
 end
 
 mintAlign(_r4)
-if ARM64 or ARM64E or X86_64
+if ARM64 or ARM64E or X86_64 or PPC64
     subp StackValueSize, mintRetDst
     storeq wa4, [mintRetDst]
     mintRetDispatch()
@@ -12386,7 +13515,7 @@ else
 end
 
 mintAlign(_r5)
-if ARM64 or ARM64E or X86_64
+if ARM64 or ARM64E or X86_64 or PPC64
     subp StackValueSize, mintRetDst
     storeq wa5, [mintRetDst]
     mintRetDispatch()
@@ -12395,7 +13524,7 @@ else
 end
 
 mintAlign(_r6)
-if ARM64 or ARM64E
+if ARM64 or ARM64E or PPC64
     subp StackValueSize, mintRetDst
     storeq wa6, [mintRetDst]
     mintRetDispatch()
@@ -12404,7 +13533,7 @@ else
 end
 
 mintAlign(_r7)
-if ARM64 or ARM64E
+if ARM64 or ARM64E or PPC64
     subp StackValueSize, mintRetDst
     storeq wa7, [mintRetDst]
     mintRetDispatch()
@@ -12471,6 +13600,58 @@ mintAlign(_result_stack_vector)
     mintRetDispatch()
 
 mintAlign(_end)
+if PPC64
+    # As for _call: jump over the PPC64-only result slots (0x13-0x1a).
+    jmp .ipint_mint_end
+
+    # PPC64 f32 FPR transport (opcodes 0x13-0x1a, emitted by the generator
+    # only for f32 values in FPRs; see ArgumINTBytecode::ArgFPRFloat in
+    # WasmIPIntGenerator.h).  A PPC64 FPR holds an f32 in double format, while
+    # IPInt slots hold the 4-byte IEEE encoding, so these use lfs/stfs where
+    # the plain FPR slots copy all 16 bytes.
+
+mintAlign(_ffr0)
+    subp StackValueSize, mintRetDst
+    storef wfa0, PayloadOffset[mintRetDst]
+    mintRetDispatch()
+
+mintAlign(_ffr1)
+    subp StackValueSize, mintRetDst
+    storef wfa1, PayloadOffset[mintRetDst]
+    mintRetDispatch()
+
+mintAlign(_ffr2)
+    subp StackValueSize, mintRetDst
+    storef wfa2, PayloadOffset[mintRetDst]
+    mintRetDispatch()
+
+mintAlign(_ffr3)
+    subp StackValueSize, mintRetDst
+    storef wfa3, PayloadOffset[mintRetDst]
+    mintRetDispatch()
+
+mintAlign(_ffr4)
+    subp StackValueSize, mintRetDst
+    storef wfa4, PayloadOffset[mintRetDst]
+    mintRetDispatch()
+
+mintAlign(_ffr5)
+    subp StackValueSize, mintRetDst
+    storef wfa5, PayloadOffset[mintRetDst]
+    mintRetDispatch()
+
+mintAlign(_ffr6)
+    subp StackValueSize, mintRetDst
+    storef wfa6, PayloadOffset[mintRetDst]
+    mintRetDispatch()
+
+mintAlign(_ffr7)
+    subp StackValueSize, mintRetDst
+    storef wfa7, PayloadOffset[mintRetDst]
+    mintRetDispatch()
+
+.ipint_mint_end:
+end
 
     # <first non-arg>   <- first_non_arg_addr
     # return result
@@ -12488,10 +13669,19 @@ mintAlign(_end)
 
 if ARM64 or ARM64E
     loadpairq [sc3], MC, wasmInstance
+elsif PPC64
+    # ARM64's layout (MC at [sc3], wasmInstance at [sc3+8], see the push-order
+    # note at the call site) without a load-pair.  PC needs no reload: as on
+    # ARM64 it is the callee-saved csr7 and mINT dispatch never uses it as a
+    # table base (only X86_64 does).
+    loadq [sc3], MC
+    loadq 8[sc3], wasmInstance
 elsif X86_64
     loadq [sc3], wasmInstance
     loadq 8[sc3], MC
     loadp (2 * SlotSize)[sc3], PC
+else
+    error
 end
     move mintRetDst, sp
 
@@ -12563,8 +13753,13 @@ end
 if X86_64
     pop sc1, sc0
     storep sc0, ReturnPC[sc2]
-elsif ARM64 or ARM64E or ARMv7 or RISCV64
+elsif ARM64 or ARM64E or ARMv7 or RISCV64 or PPC64
+    # Link-register architectures: the return address goes back into LR for
+    # the callee's prologue to save.  On PPC64 LR is an SPR, not a GPR; the
+    # backend's two-operand pop routes it through r0 and mtlr.
     pop sc1, lr
+else
+    error
 end
 
     pop PC, MC
@@ -12703,7 +13898,7 @@ uintAlign(_r5)
     uintDispatch()
 
 uintAlign(_r6)
-if ARM64 or ARM64E
+if ARM64 or ARM64E or PPC64
     popQuad(wa6)
     uintDispatch()
 else
@@ -12711,7 +13906,7 @@ else
 end
 
 uintAlign(_r7)
-if ARM64 or ARM64E
+if ARM64 or ARM64E or PPC64
     popQuad(wa7)
     uintDispatch()
 else
@@ -12770,6 +13965,46 @@ uintAlign(_stack_vector)
 uintAlign(_ret)
     jmp .ipint_exit
 
+if PPC64
+    # PPC64 f32 FPR transport (opcodes 0x13-0x1a, emitted by the generator
+    # only for f32 values in FPRs; see ArgumINTBytecode::ArgFPRFloat in
+    # WasmIPIntGenerator.h).  A PPC64 FPR holds an f32 in double format, while
+    # IPInt slots hold the 4-byte IEEE encoding, so these use lfs/stfs where
+    # the plain FPR slots copy all 16 bytes.
+
+uintAlign(_ffr0)
+    popFloat32(wfa0)
+    uintDispatch()
+
+uintAlign(_ffr1)
+    popFloat32(wfa1)
+    uintDispatch()
+
+uintAlign(_ffr2)
+    popFloat32(wfa2)
+    uintDispatch()
+
+uintAlign(_ffr3)
+    popFloat32(wfa3)
+    uintDispatch()
+
+uintAlign(_ffr4)
+    popFloat32(wfa4)
+    uintDispatch()
+
+uintAlign(_ffr5)
+    popFloat32(wfa5)
+    uintDispatch()
+
+uintAlign(_ffr6)
+    popFloat32(wfa6)
+    uintDispatch()
+
+uintAlign(_ffr7)
+    popFloat32(wfa7)
+    uintDispatch()
+end
+
 # MC = location in argumINT bytecode
 # csr0 = tmp
 # csr1 = dst
@@ -12792,7 +14027,7 @@ argumINTAlign(_a1)
     argumINTDispatch()
 
 argumINTAlign(_a2)
-if ARM64 or ARM64E or X86_64
+if ARM64 or ARM64E or X86_64 or PPC64
     storeq wa2, [argumINTDst]
     subp LocalSize, argumINTDst
     argumINTDispatch()
@@ -12802,7 +14037,7 @@ end
 
 
 argumINTAlign(_a3)
-if ARM64 or ARM64E or X86_64
+if ARM64 or ARM64E or X86_64 or PPC64
     storeq wa3, [argumINTDst]
     subp LocalSize, argumINTDst
     argumINTDispatch()
@@ -12811,7 +14046,7 @@ else
 end
 
 argumINTAlign(_a4)
-if ARM64 or ARM64E or X86_64
+if ARM64 or ARM64E or X86_64 or PPC64
     storeq wa4, [argumINTDst]
     subp LocalSize, argumINTDst
     argumINTDispatch()
@@ -12820,7 +14055,7 @@ else
 end
 
 argumINTAlign(_a5)
-if ARM64 or ARM64E or X86_64
+if ARM64 or ARM64E or X86_64 or PPC64
     storeq wa5, [argumINTDst]
     subp LocalSize, argumINTDst
     argumINTDispatch()
@@ -12829,7 +14064,7 @@ else
 end
 
 argumINTAlign(_a6)
-if ARM64 or ARM64E
+if ARM64 or ARM64E or PPC64
     storeq wa6, [argumINTDst]
     subp LocalSize, argumINTDst
     argumINTDispatch()
@@ -12838,7 +14073,7 @@ else
 end
 
 argumINTAlign(_a7)
-if ARM64 or ARM64E
+if ARM64 or ARM64E or PPC64
     storeq wa7, [argumINTDst]
     subp LocalSize, argumINTDst
     argumINTDispatch()
@@ -12905,6 +14140,54 @@ argumINTAlign(_stack_vector)
 argumINTAlign(_end)
     jmp .ipint_entry_end_local
 
+if PPC64
+    # PPC64 f32 FPR transport (opcodes 0x13-0x1a, emitted by the generator
+    # only for f32 values in FPRs; see ArgumINTBytecode::ArgFPRFloat in
+    # WasmIPIntGenerator.h).  A PPC64 FPR holds an f32 in double format, while
+    # IPInt slots hold the 4-byte IEEE encoding, so these use lfs/stfs where
+    # the plain FPR slots copy all 16 bytes.
+
+argumINTAlign(_ffa0)
+    storef wfa0, PayloadOffset[argumINTDst]
+    subp LocalSize, argumINTDst
+    argumINTDispatch()
+
+argumINTAlign(_ffa1)
+    storef wfa1, PayloadOffset[argumINTDst]
+    subp LocalSize, argumINTDst
+    argumINTDispatch()
+
+argumINTAlign(_ffa2)
+    storef wfa2, PayloadOffset[argumINTDst]
+    subp LocalSize, argumINTDst
+    argumINTDispatch()
+
+argumINTAlign(_ffa3)
+    storef wfa3, PayloadOffset[argumINTDst]
+    subp LocalSize, argumINTDst
+    argumINTDispatch()
+
+argumINTAlign(_ffa4)
+    storef wfa4, PayloadOffset[argumINTDst]
+    subp LocalSize, argumINTDst
+    argumINTDispatch()
+
+argumINTAlign(_ffa5)
+    storef wfa5, PayloadOffset[argumINTDst]
+    subp LocalSize, argumINTDst
+    argumINTDispatch()
+
+argumINTAlign(_ffa6)
+    storef wfa6, PayloadOffset[argumINTDst]
+    subp LocalSize, argumINTDst
+    argumINTDispatch()
+
+argumINTAlign(_ffa7)
+    storef wfa7, PayloadOffset[argumINTDst]
+    subp LocalSize, argumINTDst
+    argumINTDispatch()
+end
+
 if ARM64E
     global _wasmTailCallTrampoline
     _wasmTailCallTrampoline:
@@ -12912,26 +14195,5 @@ if ARM64E
         jmp ws0, WasmEntryPtrTag
 end
 
-# Restore frame return stub: only used when JIT cage is disabled.
-# When JIT cage is enabled, the wasmRestoreFrame gate thunk handles this.
-# At entry: return values in wa/wfa registers and at sp (don't change these)
-global _wasm_restore_frame_return
-_wasm_restore_frame_return:
-    loadp CodeBlock[cfr], wasmInstance
-    ipintReloadMemory(ws0)
-
-if ARM64E
-    loadp ReturnPC[cfr], lr
-    addp CallerFrameAndPCSize, cfr, ws0
-    untagReturnAddress ws0
-    loadp [cfr], cfr
-    tagReturnAddress sp
-    ret
-elsif ARM64
-    loadpairq [cfr], cfr, lr
-    ret
-elsif X86_64
-    loadp ReturnPC[cfr], ws1
-    loadp [cfr], cfr
-    jmp ws1
-end
+# _wasm_restore_frame_return has moved to InPlaceInterpreter.asm: it is used by
+# BBQ/OMG, which exist on architectures that do not include this file.

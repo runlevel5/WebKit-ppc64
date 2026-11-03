@@ -203,6 +203,17 @@ inline void UnwindFunctorBase::copyCalleeSavesToEntryFrameCalleeSavesBuffer(Stac
         int8_t bufferSlot = m_vmCalleeSaveBufferSlotsByRegIndex[currentEntry.reg().index()];
 
         if (bufferSlot < 0) {
+#if CPU(PPC64)
+            // ELFv2 makes r14-r31 callee-saved, but the VM only models r14-r23.
+            // r24-r30 are scratch to the VM and saved at every C-to-VM entry; Air
+            // saves them only because it can be called from C. Like ARMv7 below,
+            // drop them.
+            {
+                Reg reg = currentEntry.reg();
+                RELEASE_ASSERT(reg.isGPR() && reg.gpr() >= PPC64Registers::r24 && reg.gpr() <= PPC64Registers::r30);
+                continue;
+            }
+#endif
             if constexpr (!isARM_THUMB2())
                 RELEASE_ASSERT_NOT_REACHED();
             // This can happen on ARMv7, because there are more callee save

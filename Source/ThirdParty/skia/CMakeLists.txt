@@ -177,6 +177,7 @@ add_library(Skia STATIC
     src/core/SkPath.cpp
     src/core/SkPathBuilder.cpp
     src/core/SkPathData.cpp
+    src/core/SkPathDump.cpp
     src/core/SkPathEffect.cpp
     src/core/SkPathIter.cpp
     src/core/SkPathMeasure.cpp
@@ -238,6 +239,7 @@ add_library(Skia STATIC
     src/core/SkStream.cpp
     src/core/SkStrike.cpp
     src/core/SkStrikeCache.cpp
+    src/core/SkStrikeRef.cpp
     src/core/SkStrikeSpec.cpp
     src/core/SkString.cpp
     src/core/SkStringUtils.cpp
@@ -973,6 +975,12 @@ target_link_libraries(Skia PRIVATE
     PNG::PNG
 )
 
+# Skia is a plain static library, so WEBKIT_LIBRARY/WEBKIT_FRAMEWORK do not add PGO
+# instrumentation to it; without it the raster backend gets no profile.
+if (PGO_COMPILE_OPTIONS)
+    target_compile_options(Skia PRIVATE ${PGO_COMPILE_OPTIONS})
+endif ()
+
 WEBKIT_ADD_TARGET_CXX_FLAGS(Skia
     -ffp-contract=off
     -fstrict-aliasing
@@ -1088,18 +1096,15 @@ else ()
     target_compile_definitions(Skia PRIVATE SK_TYPEFACE_FACTORY_FREETYPE)
 endif ()
 
+# Pixels are B, G, R, A in memory on both byte orders. On big-endian, the scalar
+# blitters and the raster pipeline convert between that layout and the packed
+# SkPMColor value at their loads and stores (BE_CONVERT, swap_8888_bytes).
+target_compile_definitions(Skia PUBLIC
+    SK_R32_SHIFT=16
+)
 if (CMAKE_CXX_BYTE_ORDER STREQUAL "BIG_ENDIAN")
     target_compile_definitions(Skia PUBLIC
         I_ACKNOWLEDGE_SKIA_DOES_NOT_SUPPORT_BIG_ENDIAN
-
-        SK_R32_SHIFT=24
-        SK_G32_SHIFT=16
-        SK_B32_SHIFT=8
-        SK_A32_SHIFT=0
-    )
-else ()
-    target_compile_definitions(Skia PUBLIC
-        SK_R32_SHIFT=16
     )
 endif ()
 

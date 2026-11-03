@@ -55,6 +55,11 @@ public:
         return 48;
 #elif CPU(RISCV64)
         return 44;
+#elif CPU(PPC64)
+        // lwz + (lis, ori) + cmpw + an 8-word patchable branch slot = 48 bytes for the
+        // structure check, then ld (inline offset) or ld + ld (butterfly), so 56 bytes
+        // covers both self access forms with 16-bit offsets.
+        return 56;
 #else
 #error "unsupported platform"
 #endif
@@ -71,6 +76,9 @@ public:
         return 48;
 #elif CPU(RISCV64)
         return 52;
+#elif CPU(PPC64)
+        // The 48-byte structure check, then std (inline) or ld + std (butterfly).
+        return 56;
 #else
 #error "unsupported platform"
 #endif
@@ -86,6 +94,11 @@ public:
 #elif CPU(ARM_THUMB2)
         size_t size = 30;
 #elif CPU(RISCV64)
+        size_t size = 60;
+#elif CPU(PPC64)
+        // Array length: lbz, andi., cmpwi, the 8-word slot, ld, lwz, or = 56 bytes.
+        // String length does not fit (its two internal branches are 8-word slots until
+        // branch compaction, and the size check runs before compaction).
         size_t size = 60;
 #else
 #error "unsupported platform"
