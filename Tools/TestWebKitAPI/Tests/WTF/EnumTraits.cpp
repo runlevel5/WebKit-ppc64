@@ -159,6 +159,8 @@ TEST(WTF_EnumTraits, ZeroBasedContiguousEnum)
 static bool isExpectedEnumString(const ASCIILiteral& expected, const std::span<const char>& result)
 {
     // result won't have a null terminator.
+    if (expected.length() != result.size())
+        return false;
     bool equal = true;
     for (size_t i = 0; i < result.size(); ++i)
         equal &= expected[i] == result[i];
@@ -250,14 +252,16 @@ TEST(WTF_EnumTraits, EnumNameValid)
 
 TEST(WTF_EnumTraits, EnumNameMediumEnumGaps)
 {
-    EXPECT_TRUE(isExpectedEnumString("enum out of range"_s, enumName(static_cast<MediumEnum>(50))));
-    EXPECT_TRUE(isExpectedEnumString("enum out of range"_s, enumName(static_cast<MediumEnum>(200))));
+    // A value inside the name range that is not an enumerator has no name. EnumDumpWithDefault relies on that.
+    EXPECT_TRUE(enumName(static_cast<MediumEnum>(50)).empty());
+    EXPECT_TRUE(enumName(static_cast<MediumEnum>(200)).empty());
 }
 
 TEST(WTF_EnumTraits, EnumNameOutOfRange)
 {
-    EXPECT_TRUE(isExpectedEnumString("enum out of range"_s, enumName(static_cast<EmptyEnum>(0))));
-    EXPECT_TRUE(isExpectedEnumString("enum out of range"_s, enumName(static_cast<SmallEnum>(300))));
+    // These two are inside the name range (300 truncates to 44 in a uint8_t), so they are gaps, not out of range.
+    EXPECT_TRUE(enumName(static_cast<EmptyEnum>(0)).empty());
+    EXPECT_TRUE(enumName(static_cast<SmallEnum>(300)).empty());
     EXPECT_TRUE(isExpectedEnumString("enum out of range"_s, enumName(static_cast<MediumEnum>(600))));
     EXPECT_TRUE(isExpectedEnumString("enum out of range"_s, enumName(static_cast<LargeEnum>(5000))));
     EXPECT_TRUE(isExpectedEnumString("enum out of range"_s, enumName(static_cast<SignedSmallEnum>(-5))));
