@@ -109,6 +109,13 @@ void dumpProcedure(void* ptr)
 
 namespace JSC { namespace Wasm {
 
+// A 32-bit value is the payload of its 8-byte slot.
+static constexpr int32_t narrowSlotOffset(B3::Type type)
+{
+    return (type == B3::Int32 || type == B3::Float) ? PayloadOffset : 0;
+}
+
+
 using namespace B3;
 
 namespace {
@@ -930,8 +937,28 @@ private:
         emitPrepareWasmOperation(block);
         static_assert(FunctionTraits<OperationType>::cCallArity() == sizeof...(Args), "Sanity check");
         Value* operationValue = block->appendNew<ConstPtrValue>(m_proc, origin(), tagCFunction<OperationPtrTag>(operation));
+#if CPU(PPC64)
+        return [&]<size_t... I>(std::index_sequence<I...>) {
+            return block->appendNew<CCallValue>(m_proc, resultType, origin(), operationValue, extendCCallArgumentForELFv2<OperationType, I>(block, std::forward<Args>(args))...);
+        }(std::index_sequence_for<Args...> { });
+#else
         return block->appendNew<CCallValue>(m_proc, resultType, origin(), operationValue, std::forward<Args>(args)...);
+#endif
     }
+
+#if CPU(PPC64)
+    // See cCallArgumentIsUnsigned32: pass an Int32 argument for a uint32_t parameter
+    // zero-extended, so CCallSpecial does not sign-extend it.
+    template<typename OperationType, size_t index>
+    Value* extendCCallArgumentForELFv2(BasicBlock* block, Value* argument)
+    {
+        if constexpr (B3::cCallArgumentIsUnsigned32<OperationType, index>()) {
+            if (argument->type() == Int32)
+                return block->appendNew<Value>(m_proc, ZExt32, origin(), argument);
+        }
+        return argument;
+    }
+#endif
 
     void emitExceptionCheck(CCallHelpers&, Origin, ExceptionType);
 
@@ -941,6 +968,15 @@ private:
     B3::Kind memoryKind(B3::Opcode memoryOp);
     Value* emitLoadOp(LoadOpType, Value* pointer, uint64_t offset);
     void emitStoreOp(StoreOpType, Value* pointer, Value*, uint64_t offset);
+#if CPU(BIG_ENDIAN)
+    // Wasm memory is little-endian. B3 has no byte-reversed memory operations,
+    // so on a big-endian host every access wider than a byte is a patchpoint
+    // around the macro assembler's little-endian accesses.
+    B3::PatchpointValue* littleEndianMemoryPatchpoint(B3::Type, bool writes, bool fence);
+    Value* emitByteSwap(Value*, Width);
+    Value* emitLittleEndianAtomicRMW(B3::Opcode, Width, Value* pointer, Value*);
+    Value* emitLittleEndianAtomicCAS(Width, Value* pointer, Value* expected, Value*);
+#endif
 
     Value* sanitizeAtomicResult(ExtAtomicOpType, Type, Value* result);
     Value* emitAtomicLoadOp(ExtAtomicOpType, Type, Value* pointer, uint64_t offset);
@@ -1658,8 +1694,10 @@ auto OMGIRGenerator::addArguments(const RTT& signature) -> PartialResult
                         dataLog(context.gpr(src.jsr().payloadGPR()), " / ", (int) context.gpr(src.jsr().payloadGPR()));
                     else if (src.isFPR() && width <= Width::Width64)
                         dataLog(context.fpr(src.fpr()));
+#if CPU(X86_64) || CPU(ARM64) || CPU(PPC64) // Context::vector() exists only where SIMD does
                     else if (src.isFPR())
                         dataLog(context.vector(src.fpr()));
+#endif
                     else
                         dataLog(fpl[src.offsetFromFP() / sizeof(uint64_t)], " / ", fpi[src.offsetFromFP() / sizeof(uint32_t)],  " / ", RawHex(fpi[src.offsetFromFP() / sizeof(uint32_t)]), " / ", std::bit_cast<double>(fpl[src.offsetFromFP() / sizeof(uint64_t)]), " at ", RawPointer(&fpi[src.offsetFromFP() / sizeof(uint32_t)]));
                     dataLogLn();
@@ -1689,7 +1727,7 @@ auto OMGIRGenerator::addArguments(const RTT& signature) -> PartialResult
         } else {
             ASSERT(rep.location.isStack());
             B3::Value* address = m_currentBlock->appendNew<B3::Value>(m_proc, B3::Add, Origin(), framePointer(),
-                m_currentBlock->appendNew<B3::ConstPtrValue>(m_proc, Origin(), rep.location.offsetFromFP()));
+                m_currentBlock->appendNew<B3::ConstPtrValue>(m_proc, Origin(), rep.location.offsetFromFP() + narrowSlotOffset(type)));
             argument = m_currentBlock->appendNew<B3::MemoryValue>(m_proc, B3::Load, type, Origin(), address);
         }
 
@@ -1922,12 +1960,12 @@ static void emitWasmCallStackResultsAndSPRestore(CCallHelpers& jit,
         auto wasmType = signature.returnType(i);
         if (rep.isGPR()) {
             if (wasmType.isI32())
-                jit.load32(src, rep.gpr());
+                jit.load32(src.withOffset(PayloadOffset), rep.gpr());
             else
                 jit.load64(src, rep.gpr());
         } else if (rep.isFPR()) {
             if (wasmType.isF32())
-                jit.loadFloat(src, rep.fpr());
+                jit.loadFloat(src.withOffset(PayloadOffset), rep.fpr());
             else if (wasmType.isF64())
                 jit.loadDouble(src, rep.fpr());
             else {
@@ -1936,8 +1974,17 @@ static void emitWasmCallStackResultsAndSPRestore(CCallHelpers& jit,
             }
         } else {
             ASSERT(rep.isStack());
+            // A result pinned to its canonical slot (see createCallPatchpoint) is still copied, since the
+            // callee may have returned with a different SP; for an i32 the pin names the payload half.
+            bool isPinnedPayload = narrowSlotOffset(toB3Type(wasmType))
+                && rep.offsetFromFP() == checkedSum<int32_t>(loc.location.offsetFromSP(), -static_cast<int32_t>(frameSize), PayloadOffset).value();
             if (wasmType.isV128())
                 jit.transferVector(src, CCallHelpers::Address(GPRInfo::callFrameRegister, rep.offsetFromFP()));
+            else if (wasmType.isF32()) {
+                // Air keeps a Float in a 4-byte spill slot; a GP spill slot takes the whole word.
+                jit.transfer32(src.withOffset(PayloadOffset), CCallHelpers::Address(GPRInfo::callFrameRegister, rep.offsetFromFP()));
+            } else if (isPinnedPayload)
+                jit.transfer32(src.withOffset(PayloadOffset), CCallHelpers::Address(GPRInfo::callFrameRegister, rep.offsetFromFP()));
             else
                 jit.transfer64(src, CCallHelpers::Address(GPRInfo::callFrameRegister, rep.offsetFromFP()));
         }
@@ -2374,7 +2421,7 @@ auto OMGIRGenerator::getGlobal(uint32_t index, ExpressionType& result) -> Partia
     const Wasm::GlobalInformation& global = m_info.globals[index];
     switch (global.bindingMode) {
     case Wasm::GlobalInformation::BindingMode::EmbeddedInInstance: {
-        auto* value = m_currentBlock->appendNew<MemoryValue>(m_proc, Load, toB3Type(global.type), origin(), instanceValue(), safeCast<int32_t>(JSWebAssemblyInstance::offsetOfGlobal(m_info, index)));
+        auto* value = m_currentBlock->appendNew<MemoryValue>(m_proc, Load, toB3Type(global.type), origin(), instanceValue(), safeCast<int32_t>(JSWebAssemblyInstance::offsetOfGlobal(m_info, index)) + narrowSlotOffset(toB3Type(global.type)));
         switch (global.type.kind) {
         case TypeKind::I32:
             m_heaps.decorateMemory(&m_heaps.JSWebAssemblyInstance_embeddedGlobals_i32[index], value);
@@ -2409,7 +2456,7 @@ auto OMGIRGenerator::getGlobal(uint32_t index, ExpressionType& result) -> Partia
         pointer->setReadsMutability(B3::Mutability::Immutable);
         pointer->setControlDependent(false);
 
-        auto* load = m_currentBlock->appendNew<MemoryValue>(m_proc, Load, toB3Type(global.type), origin(), pointer, safeCast<int32_t>(Wasm::Global::Value::offsetOfValue()));
+        auto* load = m_currentBlock->appendNew<MemoryValue>(m_proc, Load, toB3Type(global.type), origin(), pointer, safeCast<int32_t>(Wasm::Global::Value::offsetOfValue()) + narrowSlotOffset(toB3Type(global.type)));
         m_heaps.decorateMemory(&m_heaps.WasmGlobalValue_value, load);
 
         result = push(load);
@@ -2429,7 +2476,7 @@ auto OMGIRGenerator::setGlobal(uint32_t index, ExpressionType value) -> PartialR
 
     switch (global.bindingMode) {
     case Wasm::GlobalInformation::BindingMode::EmbeddedInInstance: {
-        auto* store = m_currentBlock->appendNew<MemoryValue>(m_proc, Store, origin(), get(value), instanceValue(), safeCast<int32_t>(JSWebAssemblyInstance::offsetOfGlobal(m_info, index)));
+        auto* store = m_currentBlock->appendNew<MemoryValue>(m_proc, Store, origin(), get(value), instanceValue(), safeCast<int32_t>(JSWebAssemblyInstance::offsetOfGlobal(m_info, index)) + narrowSlotOffset(toB3Type(global.type)));
         switch (global.type.kind) {
         case TypeKind::I32:
             m_heaps.decorateMemory(&m_heaps.JSWebAssemblyInstance_embeddedGlobals_i32[index], store);
@@ -2461,7 +2508,7 @@ auto OMGIRGenerator::setGlobal(uint32_t index, ExpressionType value) -> PartialR
         pointer->setReadsMutability(B3::Mutability::Immutable);
         pointer->setControlDependent(false);
 
-        auto* store = m_currentBlock->appendNew<MemoryValue>(m_proc, Store, origin(), get(value), static_cast<Value*>(pointer), safeCast<int32_t>(Wasm::Global::Value::offsetOfValue()));
+        auto* store = m_currentBlock->appendNew<MemoryValue>(m_proc, Store, origin(), get(value), static_cast<Value*>(pointer), safeCast<int32_t>(Wasm::Global::Value::offsetOfValue()) + narrowSlotOffset(toB3Type(global.type)));
         m_heaps.decorateMemory(&m_heaps.WasmGlobalValue_value, store);
 
         // We emit a write-barrier onto JSWebAssemblyGlobal, not JSWebAssemblyInstance.
@@ -2658,9 +2705,220 @@ inline B3::Kind OMGIRGenerator::memoryKind(B3::Opcode memoryOp)
     return memoryOp;
 }
 
+#if CPU(BIG_ENDIAN)
+static void byteSwapForWasmMemory(CCallHelpers& jit, Width width, GPRReg gpr)
+{
+    switch (width) {
+    case Width8:
+        break;
+    case Width16:
+        jit.byteSwap16(gpr);
+        break;
+    case Width32:
+        jit.byteSwap32(gpr);
+        break;
+    case Width64:
+        jit.byteSwap64(gpr);
+        break;
+    case Width128:
+        RELEASE_ASSERT_NOT_REACHED();
+    }
+}
+
+// Wasm memory is little-endian. Plain loads and stores stay B3 MemoryValues, so
+// that alias analysis, CSE and the signal-based bounds checks treat them as the
+// memory accesses they are; only the register byte-swap is a patchpoint, and a
+// pure one, which B3 may move or drop like any other arithmetic.
+Value* OMGIRGenerator::emitByteSwap(Value* value, Width width)
+{
+    ASSERT(value->type() == Int32 || value->type() == Int64);
+    auto* patchpoint = m_currentBlock->appendNew<B3::PatchpointValue>(m_proc, value->type(), origin());
+    patchpoint->effects = Effects::none();
+    patchpoint->append(value, ValueRep::SomeRegister);
+    patchpoint->resultConstraints = { ValueRep::SomeRegister };
+    patchpoint->setGenerator([=](CCallHelpers& jit, const B3::StackmapGenerationParams& params) {
+        GPRReg result = params[0].gpr();
+        jit.move(params[1].gpr(), result);
+        byteSwapForWasmMemory(jit, width, result);
+    });
+    return patchpoint;
+}
+
+// The atomic accesses are LL/SC loops that swap inside the loop, so they stay
+// patchpoints on the whole memory.
+B3::PatchpointValue* OMGIRGenerator::littleEndianMemoryPatchpoint(B3::Type type, bool writes, bool fence)
+{
+    auto* patchpoint = m_currentBlock->appendNew<B3::PatchpointValue>(m_proc, type, origin());
+    Effects effects = Effects::none();
+    effects.reads = HeapRange::top();
+    if (writes)
+        effects.writes = HeapRange::top();
+    effects.fence = fence;
+    effects.exitsSideways = useSignalingMemory0() || m_info.memory(0).isShared();
+    patchpoint->effects = effects;
+    m_heaps.decoratePatchpointRead(&m_heaps.WebAssemblyMemory, patchpoint);
+    if (writes)
+        m_heaps.decoratePatchpointWrite(&m_heaps.WebAssemblyMemory, patchpoint);
+    if (type != B3::Void)
+        patchpoint->resultConstraints = { ValueRep::SomeEarlyRegister };
+    return patchpoint;
+}
+
+// An LL/SC loop; the old value comes back in host order.
+Value* OMGIRGenerator::emitLittleEndianAtomicRMW(B3::Opcode opcode, Width width, Value* pointer, Value* value)
+{
+    B3::Type type = width == Width64 ? Int64 : Int32;
+    auto* patchpoint = littleEndianMemoryPatchpoint(type, true, true);
+    patchpoint->append(pointer, ValueRep::SomeRegister);
+    patchpoint->append(value, ValueRep::SomeRegister);
+    patchpoint->numGPScratchRegisters = 2;
+    patchpoint->setGenerator([=](CCallHelpers& jit, const B3::StackmapGenerationParams& params) {
+        GPRReg result = params[0].gpr();
+        GPRReg valueGPR = params[2].gpr();
+        GPRReg newValue = params.gpScratch(0);
+        GPRReg status = params.gpScratch(1);
+        CCallHelpers::Address address(params[1].gpr());
+        auto loop = jit.label();
+        switch (width) {
+        case Width8:
+            jit.loadLinkAcq8(address, result);
+            break;
+        case Width16:
+            jit.loadLinkAcq16(address, result);
+            break;
+        case Width32:
+            jit.loadLinkAcq32(address, result);
+            break;
+        default:
+            jit.loadLinkAcq64(address, result);
+            break;
+        }
+        byteSwapForWasmMemory(jit, width, result);
+        jit.move(result, newValue);
+        bool is64 = width == Width64;
+        switch (opcode) {
+        case AtomicXchgAdd:
+            is64 ? jit.add64(valueGPR, newValue) : jit.add32(valueGPR, newValue);
+            break;
+        case AtomicXchgSub:
+            is64 ? jit.sub64(valueGPR, newValue) : jit.sub32(valueGPR, newValue);
+            break;
+        case AtomicXchgAnd:
+            is64 ? jit.and64(valueGPR, newValue) : jit.and32(valueGPR, newValue);
+            break;
+        case AtomicXchgOr:
+            is64 ? jit.or64(valueGPR, newValue) : jit.or32(valueGPR, newValue);
+            break;
+        case AtomicXchgXor:
+            is64 ? jit.xor64(valueGPR, newValue) : jit.xor32(valueGPR, newValue);
+            break;
+        case AtomicXchg:
+            jit.move(valueGPR, newValue);
+            break;
+        default:
+            RELEASE_ASSERT_NOT_REACHED();
+        }
+        byteSwapForWasmMemory(jit, width, newValue);
+        switch (width) {
+        case Width8:
+            jit.storeCondRel8(newValue, address, status);
+            break;
+        case Width16:
+            jit.storeCondRel16(newValue, address, status);
+            break;
+        case Width32:
+            jit.storeCondRel32(newValue, address, status);
+            break;
+        default:
+            jit.storeCondRel64(newValue, address, status);
+            break;
+        }
+        jit.branchTest32(CCallHelpers::NonZero, status).linkTo(loop, &jit);
+    });
+    return patchpoint;
+}
+
+Value* OMGIRGenerator::emitLittleEndianAtomicCAS(Width width, Value* pointer, Value* expected, Value* value)
+{
+    B3::Type type = width == Width64 ? Int64 : Int32;
+    auto* patchpoint = littleEndianMemoryPatchpoint(type, true, true);
+    patchpoint->append(pointer, ValueRep::SomeRegister);
+    patchpoint->append(expected, ValueRep::SomeRegister);
+    patchpoint->append(value, ValueRep::SomeRegister);
+    patchpoint->numGPScratchRegisters = 1;
+    patchpoint->setGenerator([=](CCallHelpers& jit, const B3::StackmapGenerationParams& params) {
+        GPRReg result = params[0].gpr();
+        GPRReg newValue = params.gpScratch(0);
+        CCallHelpers::Address address(params[1].gpr());
+        jit.move(params[2].gpr(), result);
+        jit.move(params[3].gpr(), newValue);
+        byteSwapForWasmMemory(jit, width, result);
+        byteSwapForWasmMemory(jit, width, newValue);
+        switch (width) {
+        case Width8:
+            jit.atomicStrongCAS8(result, newValue, address);
+            break;
+        case Width16:
+            jit.atomicStrongCAS16(result, newValue, address);
+            break;
+        case Width32:
+            jit.atomicStrongCAS32(result, newValue, address);
+            break;
+        default:
+            jit.atomicStrongCAS64(result, newValue, address);
+            break;
+        }
+        byteSwapForWasmMemory(jit, width, result);
+    });
+    return patchpoint;
+}
+#endif
+
 inline Value* OMGIRGenerator::emitLoadOp(LoadOpType op, Value* pointer, uint64_t uoffset)
 {
     int32_t offset = fixupPointerPlusOffset(pointer, uoffset);
+#if CPU(BIG_ENDIAN)
+    // Load the bytes in host order and swap them in a register. A 16-bit load
+    // is zero-extended for the swap and sign-extended afterwards when needed;
+    // floats and doubles are loaded as integers and bit-cast after the swap.
+    auto emitNarrowLoad = [&](B3::Opcode kind) -> Value* {
+        auto* value = m_currentBlock->appendNew<MemoryValue>(m_proc, memoryKind(kind), origin(), pointer, offset);
+        m_heaps.decorateMemory(&m_heaps.WebAssemblyMemory, value);
+        return value;
+    };
+    auto emitLoad = [&](B3::Type type) -> Value* {
+        auto* value = m_currentBlock->appendNew<MemoryValue>(m_proc, memoryKind(Load), type, origin(), pointer, offset);
+        m_heaps.decorateMemory(&m_heaps.WebAssemblyMemory, value);
+        return value;
+    };
+    auto unary = [&](B3::Opcode opcode, Value* value) -> Value* {
+        return m_currentBlock->appendNew<Value>(m_proc, opcode, origin(), value);
+    };
+    switch (op) {
+    case LoadOpType::I32Load16S:
+        return unary(SExt16, emitByteSwap(emitNarrowLoad(Load16Z), Width16));
+    case LoadOpType::I64Load16S:
+        return unary(SExt16To64, emitByteSwap(emitNarrowLoad(Load16Z), Width16));
+    case LoadOpType::I32Load16U:
+        return emitByteSwap(emitNarrowLoad(Load16Z), Width16);
+    case LoadOpType::I64Load16U:
+        return unary(ZExt32, emitByteSwap(emitNarrowLoad(Load16Z), Width16));
+    case LoadOpType::I32Load:
+        return emitByteSwap(emitLoad(Int32), Width32);
+    case LoadOpType::I64Load32U:
+        return unary(ZExt32, emitByteSwap(emitLoad(Int32), Width32));
+    case LoadOpType::I64Load32S:
+        return unary(SExt32, emitByteSwap(emitLoad(Int32), Width32));
+    case LoadOpType::I64Load:
+        return emitByteSwap(emitLoad(Int64), Width64);
+    case LoadOpType::F32Load:
+        return unary(BitwiseCast, emitByteSwap(emitLoad(Int32), Width32));
+    case LoadOpType::F64Load:
+        return unary(BitwiseCast, emitByteSwap(emitLoad(Int64), Width64));
+    default:
+        break;
+    }
+#endif
 
     switch (op) {
     case LoadOpType::I32Load8S: {
@@ -2821,6 +3079,43 @@ inline uint32_t sizeOfStoreOp(StoreOpType op)
 inline void OMGIRGenerator::emitStoreOp(StoreOpType op, Value* pointer, Value* value, uint64_t uoffset)
 {
     int32_t offset = fixupPointerPlusOffset(pointer, uoffset);
+#if CPU(BIG_ENDIAN)
+    // Swap in a register and store the bytes in host order. The 16-bit swap
+    // zero-extends, and Store16 keeps the low half; floats and doubles are
+    // bit-cast to integers before the swap.
+    auto emitStore = [&](B3::Opcode kind, Value* value) {
+        auto* store = m_currentBlock->appendNew<MemoryValue>(m_proc, memoryKind(kind), origin(), value, pointer, offset);
+        m_heaps.decorateMemory(&m_heaps.WebAssemblyMemory, store);
+    };
+    auto unary = [&](B3::Opcode opcode, Value* value) -> Value* {
+        return m_currentBlock->appendNew<Value>(m_proc, opcode, origin(), value);
+    };
+    switch (op) {
+    case StoreOpType::I64Store16:
+        value = unary(Trunc, value);
+        [[fallthrough]];
+    case StoreOpType::I32Store16:
+        emitStore(Store16, emitByteSwap(value, Width16));
+        return;
+    case StoreOpType::I64Store32:
+        value = unary(Trunc, value);
+        [[fallthrough]];
+    case StoreOpType::I32Store:
+        emitStore(Store, emitByteSwap(value, Width32));
+        return;
+    case StoreOpType::F32Store:
+        emitStore(Store, emitByteSwap(unary(BitwiseCast, value), Width32));
+        return;
+    case StoreOpType::I64Store:
+        emitStore(Store, emitByteSwap(value, Width64));
+        return;
+    case StoreOpType::F64Store:
+        emitStore(Store, emitByteSwap(unary(BitwiseCast, value), Width64));
+        return;
+    default:
+        break;
+    }
+#endif
 
     switch (op) {
     case StoreOpType::I64Store8:
@@ -2950,6 +3245,10 @@ inline Value* OMGIRGenerator::emitAtomicLoadOp(ExtAtomicOpType op, Type valueTyp
         break;
     }
 
+#if CPU(BIG_ENDIAN)
+    if (accessWidth(op) != Width8)
+        return sanitizeAtomicResult(op, valueType, emitLittleEndianAtomicRMW(AtomicXchgAdd, accessWidth(op), pointer, value));
+#endif
     auto* atomic = m_currentBlock->appendNew<AtomicValue>(m_proc, memoryKind(AtomicXchgAdd), origin(), accessWidth(op), value, pointer);
     m_heaps.decorateMemory(&m_heaps.WebAssemblyMemory, atomic);
     m_heaps.decorateFencedAccess(&m_heaps.WebAssemblyMemory, atomic);
@@ -2996,6 +3295,12 @@ inline void OMGIRGenerator::emitAtomicStoreOp(ExtAtomicOpType op, Type valueType
 
     if (valueType.isI64() && accessWidth(op) != Width64)
         value = m_currentBlock->appendNew<B3::Value>(m_proc, B3::Trunc, Origin(), value);
+#if CPU(BIG_ENDIAN)
+    if (accessWidth(op) != Width8) {
+        emitLittleEndianAtomicRMW(AtomicXchg, accessWidth(op), pointer, value);
+        return;
+    }
+#endif
     auto* atomic = m_currentBlock->appendNew<AtomicValue>(m_proc, memoryKind(AtomicXchg), origin(), accessWidth(op), value, pointer);
     m_heaps.decorateMemory(&m_heaps.WebAssemblyMemory, atomic);
     m_heaps.decorateFencedAccess(&m_heaps.WebAssemblyMemory, atomic);
@@ -3090,6 +3395,10 @@ inline Value* OMGIRGenerator::emitAtomicBinaryRMWOp(ExtAtomicOpType op, Type val
     if (valueType.isI64() && accessWidth(op) != Width64)
         value = m_currentBlock->appendNew<B3::Value>(m_proc, B3::Trunc, Origin(), value);
 
+#if CPU(BIG_ENDIAN)
+    if (accessWidth(op) != Width8)
+        return sanitizeAtomicResult(op, valueType, emitLittleEndianAtomicRMW(opcode, accessWidth(op), pointer, value));
+#endif
     auto* atomic = m_currentBlock->appendNew<AtomicValue>(m_proc, memoryKind(opcode), origin(), accessWidth(op), value, pointer);
     m_heaps.decorateMemory(&m_heaps.WebAssemblyMemory, atomic);
     m_heaps.decorateFencedAccess(&m_heaps.WebAssemblyMemory, atomic);
@@ -3137,6 +3446,9 @@ Value* OMGIRGenerator::emitAtomicCompareExchange(ExtAtomicOpType op, Type valueT
     Width accessWidth = Wasm::accessWidth(op);
 
     if (widthForType(toB3Type(valueType)) == accessWidth) {
+#if CPU(BIG_ENDIAN)
+        return sanitizeAtomicResult(op, valueType, emitLittleEndianAtomicCAS(accessWidth, pointer, expected, value));
+#endif
         auto* atomic = m_currentBlock->appendNew<AtomicValue>(m_proc, memoryKind(AtomicStrongCAS), origin(), accessWidth, expected, value, pointer);
         m_heaps.decorateMemory(&m_heaps.WebAssemblyMemory, atomic);
         m_heaps.decorateFencedAccess(&m_heaps.WebAssemblyMemory, atomic);
@@ -3190,6 +3502,10 @@ Value* OMGIRGenerator::emitAtomicCompareExchange(ExtAtomicOpType op, Type valueT
         truncatedValue = m_currentBlock->appendNew<B3::Value>(m_proc, B3::Trunc, Origin(), value);
     }
 
+#if CPU(BIG_ENDIAN)
+    if (accessWidth != Width8)
+        return sanitizeAtomicResult(op, valueType, emitLittleEndianAtomicCAS(accessWidth, pointer, truncatedExpected, truncatedValue));
+#endif
     auto* atomic = m_currentBlock->appendNew<AtomicValue>(m_proc, memoryKind(AtomicStrongCAS), origin(), accessWidth, truncatedExpected, truncatedValue, pointer);
     m_heaps.decorateMemory(&m_heaps.WebAssemblyMemory, atomic);
     m_heaps.decorateFencedAccess(&m_heaps.WebAssemblyMemory, atomic);
@@ -3524,7 +3840,7 @@ auto OMGIRGenerator::addI64Add128(ExpressionType lhsLoVar, ExpressionType lhsHiV
         GPRReg aHi = params[3].gpr();
         GPRReg bLo = params[4].gpr();
         GPRReg bHi = params[5].gpr();
-#if CPU(ARM64)
+#if CPU(ARM64) || CPU(PPC64)
         jit.add64AndSetFlags(aLo, bLo, resLo);
         jit.addCarry64(aHi, bHi, resHi);
 #elif CPU(X86_64)
@@ -3532,6 +3848,8 @@ auto OMGIRGenerator::addI64Add128(ExpressionType lhsLoVar, ExpressionType lhsHiV
         jit.add64(bLo, resLo);
         jit.move(aHi, resHi);
         jit.addCarry64(bHi, resHi);
+#else
+#error "Not implemented for this CPU"
 #endif
     });
     patchpoint->effects = Effects::none();
@@ -3562,7 +3880,7 @@ auto OMGIRGenerator::addI64Sub128(ExpressionType lhsLoVar, ExpressionType lhsHiV
         GPRReg aHi = params[3].gpr();
         GPRReg bLo = params[4].gpr();
         GPRReg bHi = params[5].gpr();
-#if CPU(ARM64)
+#if CPU(ARM64) || CPU(PPC64)
         jit.sub64AndSetFlags(aLo, bLo, resLo);
         jit.subBorrow64(aHi, bHi, resHi);
 #elif CPU(X86_64)
@@ -3570,6 +3888,8 @@ auto OMGIRGenerator::addI64Sub128(ExpressionType lhsLoVar, ExpressionType lhsHiV
         jit.sub64(bLo, resLo);
         jit.move(aHi, resHi);
         jit.subBorrow64(bHi, resHi);
+#else
+#error "Not implemented for this CPU"
 #endif
     });
     patchpoint->effects = Effects::none();
@@ -3584,7 +3904,7 @@ auto OMGIRGenerator::addI64MulWideU(ExpressionType lhsVar, ExpressionType rhsVar
     Value* lhs = get(lhsVar);
     Value* rhs = get(rhsVar);
 
-#if CPU(ARM64)
+#if CPU(ARM64) || CPU(PPC64)
     resultLo = push(m_currentBlock->appendNew<Value>(m_proc, Mul, origin(), lhs, rhs));
     resultHi = push(m_currentBlock->appendNew<Value>(m_proc, UMulHigh, origin(), lhs, rhs));
 
@@ -3602,6 +3922,8 @@ auto OMGIRGenerator::addI64MulWideU(ExpressionType lhsVar, ExpressionType rhsVar
 
     resultLo = push(m_currentBlock->appendNew<ExtractValue>(m_proc, origin(), B3::Int64, patchpoint, 0));
     resultHi = push(m_currentBlock->appendNew<ExtractValue>(m_proc, origin(), B3::Int64, patchpoint, 1));
+#else
+#error "I64MulWideU is not implemented for this CPU"
 #endif
 
     return { };
@@ -3612,7 +3934,7 @@ auto OMGIRGenerator::addI64MulWideS(ExpressionType lhsVar, ExpressionType rhsVar
     Value* lhs = get(lhsVar);
     Value* rhs = get(rhsVar);
 
-#if CPU(ARM64)
+#if CPU(ARM64) || CPU(PPC64)
     resultLo = push(m_currentBlock->appendNew<Value>(m_proc, Mul, origin(), lhs, rhs));
     resultHi = push(m_currentBlock->appendNew<Value>(m_proc, MulHigh, origin(), lhs, rhs));
 
@@ -3630,6 +3952,8 @@ auto OMGIRGenerator::addI64MulWideS(ExpressionType lhsVar, ExpressionType rhsVar
 
     resultLo = push(m_currentBlock->appendNew<ExtractValue>(m_proc, origin(), B3::Int64, patchpoint, 0));
     resultHi = push(m_currentBlock->appendNew<ExtractValue>(m_proc, origin(), B3::Int64, patchpoint, 1));
+#else
+#error "I64MulWideS is not implemented for this CPU"
 #endif
 
     return { };
@@ -4323,7 +4647,7 @@ auto OMGIRGenerator::addSIMDShuffle(v128_t imm, ExpressionType a, ExpressionType
         return { };
     }
 
-    if constexpr (!isARM64())
+    if constexpr (!isARM64() && !isPPC64())
         UNREACHABLE_FOR_PLATFORM();
 
     Value* indexes = m_currentBlock->appendNew<Const128Value>(m_proc, origin(), imm);
@@ -4565,7 +4889,7 @@ auto OMGIRGenerator::addSIMDLoadPad(SIMDLaneOperation op, ExpressionType pointer
 
 Value* OMGIRGenerator::loadFromScratchBuffer(unsigned& indexInBuffer, Value* pointer, B3::Type type)
 {
-    int32_t offset = safeCast<int32_t>(sizeof(Wasm::Context::ScratchBufferEntry) * (indexInBuffer++));
+    int32_t offset = safeCast<int32_t>(sizeof(Wasm::Context::ScratchBufferEntry) * (indexInBuffer++)) + narrowSlotOffset(type);
     RELEASE_ASSERT(type.isNumeric());
     return m_currentBlock->appendNew<MemoryValue>(m_proc, Load, type, origin(), pointer, offset);
 }
@@ -4935,7 +5259,7 @@ auto OMGIRGenerator::addCatchToUnreachable(unsigned exceptionIndex, const RTT& s
     unsigned offset = 0;
     for (unsigned i = 0; i < signature.argumentCount(); ++i) {
         Type type = signature.argumentType(i);
-        Value* value = m_currentBlock->appendNew<MemoryValue>(m_proc, Load, toB3Type(type), origin(), payload, safeCast<int32_t>(offset * sizeof(uint64_t)));
+        Value* value = m_currentBlock->appendNew<MemoryValue>(m_proc, Load, toB3Type(type), origin(), payload, safeCast<int32_t>(offset * sizeof(uint64_t)) + narrowSlotOffset(toB3Type(type)));
         results.append(push(value));
         offset += type.kind == TypeKind::V128 ? 2 : 1;
     }
@@ -5025,7 +5349,7 @@ auto OMGIRGenerator::emitCatchTableImpl(ControlData& data, const ControlData::Tr
         unsigned offset = 0;
         for (unsigned i = 0; i < signature->argumentCount(); ++i) {
             Type type = signature->argumentType(i);
-            Value* value = m_currentBlock->appendNew<MemoryValue>(m_proc, Load, toB3Type(type), origin(), buffer, safeCast<int32_t>(offset * sizeof(uint64_t)));
+            Value* value = m_currentBlock->appendNew<MemoryValue>(m_proc, Load, toB3Type(type), origin(), buffer, safeCast<int32_t>(offset * sizeof(uint64_t)) + narrowSlotOffset(toB3Type(type)));
             resultStack.constructAndAppend(type, value);
             offset += type.kind == TypeKind::V128 ? 2 : 1;
         }
@@ -5074,7 +5398,7 @@ auto OMGIRGenerator::addThrow(unsigned exceptionIndex, ArgumentList& args, std::
     patch->append(instanceValue(), ValueRep::reg(GPRInfo::argumentGPR0));
     unsigned offset = 0;
     for (auto arg : args) {
-        patch->append(get(arg), ValueRep::stackArgument(safeCast<int32_t>(offset * sizeof(EncodedJSValue))));
+        patch->append(get(arg), ValueRep::stackArgument(safeCast<int32_t>(offset * sizeof(EncodedJSValue) + narrowSlotOffset(get(arg)->type()))));
         offset += arg.value().type().isVector() ?  2 : 1;
     }
     m_maxNumJSCallArguments = std::max(m_maxNumJSCallArguments, offset);
@@ -5181,7 +5505,7 @@ auto OMGIRGenerator::addReturn(const ControlData&, std::span<const TypedExpressi
     for (unsigned i = 0; i < wasmCallInfo.results.size(); ++i) {
         B3::ValueRep rep = wasmCallInfo.results[i].location;
         if (rep.isStack()) {
-            B3::Value* address = m_currentBlock->appendNew<B3::Value>(m_proc, B3::Add, Origin(), framePointer(), constant(pointerType(), rep.offsetFromFP()));
+            B3::Value* address = m_currentBlock->appendNew<B3::Value>(m_proc, B3::Add, Origin(), framePointer(), constant(pointerType(), rep.offsetFromFP() + narrowSlotOffset(get(returnValues[offset + i])->type())));
             m_currentBlock->appendNew<B3::MemoryValue>(m_proc, B3::Store, Origin(), get(returnValues[offset + i]), address);
         } else {
             ASSERT(rep.isReg());
@@ -5367,8 +5691,11 @@ Vector<ConstrainedValue> OMGIRGenerator::createCallConstrainedArgs(BasicBlock* b
     Vector<ConstrainedValue> constrainedPatchArgs;
     constrainedPatchArgs.reserveCapacity(tmpArgs.size());
     for (unsigned i = 0; i < tmpArgs.size(); ++i) {
-        auto dstLocation = wasmCalleeInfo.params[i];
-        constrainedPatchArgs.append(B3::ConstrainedValue(get(block, tmpArgs[i]), dstLocation));
+        Value* value = get(block, tmpArgs[i]);
+        B3::ValueRep rep = wasmCalleeInfo.params[i].location;
+        if (rep.isStackArgument())
+            rep = B3::ValueRep::stackArgument(safeCast<int32_t>(rep.offsetFromSP() + narrowSlotOffset(value->type())));
+        constrainedPatchArgs.append(B3::ConstrainedValue(value, rep));
     }
 
     return constrainedPatchArgs;
@@ -5395,13 +5722,16 @@ auto OMGIRGenerator::createCallPatchpoint(BasicBlock* block, const RTT& signatur
     const Vector<ArgumentLocation, 1>& constrainedResultLocations = wasmCalleeInfo.results;
     if (returnType != B3::Void) {
         Vector<B3::ValueRep, 1> resultConstraints;
-        for (auto valueLocation : constrainedResultLocations) {
+        for (unsigned i = 0; i < constrainedResultLocations.size(); ++i) {
+            auto valueLocation = constrainedResultLocations[i];
             // FIXME: Graph Coloring has an issue where it runs out of "colors" (aka registers) when passing as an Any so instead place results where they would canonically go.
             // Even though the expected location is SP relative it still works with emitWasmCallStackResultsAndSPRestore because "SP" means FP - frameSize not the semi-random SP we got back from our callee.
             if (valueLocation.location.isStackArgument() && Options::airUseGreedyRegAlloc()) {
                 // FIXME: Should these results be ColdAny? The argument in favor of Warm is that we have to move the values anyway so we might as well put in a register if that's what B3 wants
                 resultConstraints.append(B3::ValueRep::WarmAny);
-            } else
+            } else if (valueLocation.location.isStackArgument())
+                resultConstraints.append(B3::ValueRep::stackArgument(safeCast<int32_t>(valueLocation.location.offsetFromSP() + narrowSlotOffset(toB3Type(signature.returnType(i))))));
+            else
                 resultConstraints.append(B3::ValueRep(valueLocation.location));
         }
         patchpoint->resultConstraints = WTF::move(resultConstraints);
@@ -5489,8 +5819,10 @@ static inline void prepareForTailCallImpl(unsigned functionIndex, CCallHelpers& 
                     dataLog(context.gpr(src.gpr()), " / ", (int) context.gpr(src.gpr()));
                 else if (src.isFPR() && width <= Width64)
                     dataLog(context.fpr(src.fpr()));
+#if CPU(X86_64) || CPU(ARM64) || CPU(PPC64) // Context::vector() exists only where SIMD does
                 else if (src.isFPR())
                     dataLog(context.vector(src.fpr()));
+#endif
                 else if (src.isConstant())
                     dataLog(src.value(), " / ", src.doubleValue());
                 else
@@ -5556,6 +5888,12 @@ static inline void prepareForTailCallImpl(unsigned functionIndex, CCallHelpers& 
         ShuffleLocation dst;
         std::optional<int64_t> constant;
         Width width { Width64 };
+        bool isFloat { false };
+        // A 32-bit value is the payload of its 8-byte slot: every stack destination is a
+        // calling-convention slot, and an Int32 stack source is an 8-byte spill slot. A
+        // Float spill slot is 4 bytes, so it has no payload half.
+        int32_t srcPayloadOffset() const { return width == Width32 && !isFloat ? PayloadOffset : 0; }
+        int32_t dstPayloadOffset() const { return width == Width32 ? PayloadOffset : 0; }
     };
 
     Vector<ShuffleEntry> entries;
@@ -5656,6 +5994,7 @@ static inline void prepareForTailCallImpl(unsigned functionIndex, CCallHelpers& 
         } else {
             ShuffleEntry entry;
             entry.width = dstType.width();
+            entry.isFloat = dstType.isF32() || dstType.isF64();
             ASSERT(dstType.width() <= Width64);
             entry.src = src;
             entry.dst = dst;
@@ -5674,6 +6013,9 @@ static inline void prepareForTailCallImpl(unsigned functionIndex, CCallHelpers& 
         ASSERT(!calleeSaves.find(MacroAssembler::linkRegister));
         entry.dst = ShuffleLocation::fromGPR(MacroAssembler::linkRegister);
 #else
+        // On PPC64 LR is a special-purpose register that the shuffle cannot target, so the
+        // return PC goes to the new frame's return PC slot as on x86_64, and is loaded into
+        // LR from there once the shuffle is done (see below).
         entry.dst = ShuffleLocation::fromStack(newReturnPCOffset);
 #endif
         entries.append(entry);
@@ -5727,8 +6069,8 @@ static inline void prepareForTailCallImpl(unsigned functionIndex, CCallHelpers& 
         }
         if (conflicts) {
             int scratchOffset = allocateSpill(Width64);
-            auto scratchAddr = CCallHelpers::Address(MacroAssembler::stackPointerRegister, scratchOffset);
-            auto srcAddr = CCallHelpers::Address(MacroAssembler::stackPointerRegister, entry.src.stackOffset);
+            auto scratchAddr = CCallHelpers::Address(MacroAssembler::stackPointerRegister, scratchOffset + entry.srcPayloadOffset());
+            auto srcAddr = CCallHelpers::Address(MacroAssembler::stackPointerRegister, entry.src.stackOffset + entry.srcPayloadOffset());
             jit.transfer32(srcAddr, scratchAddr);
             entry.src = ShuffleLocation::fromStack(scratchOffset);
         }
@@ -5752,7 +6094,7 @@ static inline void prepareForTailCallImpl(unsigned functionIndex, CCallHelpers& 
                     jit.move64ToDouble(MacroAssembler::TrustedImm64(*e.constant), dst.fpr);
             } else {
                 ASSERT(dst.kind == ShuffleLocation::Stack);
-                auto dstAddr = CCallHelpers::Address(MacroAssembler::stackPointerRegister, dst.stackOffset);
+                auto dstAddr = CCallHelpers::Address(MacroAssembler::stackPointerRegister, dst.stackOffset + e.dstPayloadOffset());
                 if (e.width == Width32) {
                     jit.move(MacroAssembler::TrustedImm32(static_cast<int32_t>(*e.constant)), tmp);
                     jit.store32(tmp, dstAddr);
@@ -5768,7 +6110,7 @@ static inline void prepareForTailCallImpl(unsigned functionIndex, CCallHelpers& 
                 jit.move(src.gpr, dst.gpr);
             else {
                 ASSERT(dst.kind == ShuffleLocation::Stack);
-                jit.storeWidth(e.width, src.gpr, CCallHelpers::Address(MacroAssembler::stackPointerRegister, dst.stackOffset));
+                jit.storeWidth(e.width, src.gpr, CCallHelpers::Address(MacroAssembler::stackPointerRegister, dst.stackOffset + e.dstPayloadOffset()));
             }
             return;
         }
@@ -5778,13 +6120,13 @@ static inline void prepareForTailCallImpl(unsigned functionIndex, CCallHelpers& 
                 jit.moveDouble(src.fpr, dst.fpr);
             } else {
                 ASSERT(dst.kind == ShuffleLocation::Stack);
-                jit.storeWidth(e.width, src.fpr, CCallHelpers::Address(MacroAssembler::stackPointerRegister, dst.stackOffset));
+                jit.storeWidth(e.width, src.fpr, CCallHelpers::Address(MacroAssembler::stackPointerRegister, dst.stackOffset + e.dstPayloadOffset()));
             }
             return;
         }
         case ShuffleLocation::Stack: {
             ASSERT(src.kind == ShuffleLocation::Stack);
-            auto srcAddr = CCallHelpers::Address(MacroAssembler::stackPointerRegister, src.stackOffset);
+            auto srcAddr = CCallHelpers::Address(MacroAssembler::stackPointerRegister, src.stackOffset + e.srcPayloadOffset());
             ASSERT_WITH_MESSAGE(e.width != Width128, "V128 values should have been split during setup.");
             if (dst.kind == ShuffleLocation::GPR)
                 jit.loadWidth(e.width, srcAddr, dst.gpr);
@@ -5792,7 +6134,7 @@ static inline void prepareForTailCallImpl(unsigned functionIndex, CCallHelpers& 
                 jit.loadWidth(e.width, srcAddr, dst.fpr);
             else {
                 ASSERT(dst.kind == ShuffleLocation::Stack);
-                auto dstAddr = CCallHelpers::Address(MacroAssembler::stackPointerRegister, dst.stackOffset);
+                auto dstAddr = CCallHelpers::Address(MacroAssembler::stackPointerRegister, dst.stackOffset + e.dstPayloadOffset());
                 jit.transferWidth(e.width, srcAddr, dstAddr);
             }
             return;
@@ -5811,15 +6153,19 @@ static inline void prepareForTailCallImpl(unsigned functionIndex, CCallHelpers& 
         int scratchOffset = allocateSpill(Width64);
         auto scratchAddr = CCallHelpers::Address(MacroAssembler::stackPointerRegister, scratchOffset);
 
+        // The scratch slot is read back like the source it replaces (see srcPayloadOffset).
         switch (e.src.kind) {
         case ShuffleLocation::GPR:
             jit.storePtr(e.src.gpr, scratchAddr);
             break;
         case ShuffleLocation::FPR:
-            jit.storeDouble(e.src.fpr, scratchAddr);
+            if (e.width == Width32)
+                jit.storeFloat(e.src.fpr, scratchAddr);
+            else
+                jit.storeDouble(e.src.fpr, scratchAddr);
             break;
         case ShuffleLocation::Stack: {
-            jit.transferWidth(e.width, CCallHelpers::Address(MacroAssembler::stackPointerRegister, e.src.stackOffset), scratchAddr);
+            jit.transferWidth(e.width, CCallHelpers::Address(MacroAssembler::stackPointerRegister, e.src.stackOffset + e.srcPayloadOffset()), scratchAddr.withOffset(e.srcPayloadOffset()));
             break;
         }
         default:
@@ -5876,6 +6222,13 @@ static inline void prepareForTailCallImpl(unsigned functionIndex, CCallHelpers& 
 
     auto newSPAtPrologueOffsetFromSP = newFPOffsetFromSP + prologueStackPointerDelta();
 
+#if CPU(PPC64)
+    // The callee's prologue spills LR, not a stack slot, as its return PC (the frame header
+    // is [fp] = caller fp, [fp+8] = return PC, as on ARM64). Commit the shuffled return PC
+    // to LR with mtlr; nothing from here to the jump makes a call, and only calls write LR.
+    jit.restoreReturnAddressBeforeReturn(CCallHelpers::Address(MacroAssembler::stackPointerRegister, newReturnPCOffset));
+#endif
+
 #if CPU(ARM) || CPU(ARM64) || CPU(RISCV64)
     // the return PC should already be in the linkRegister from the shuffle above.
     if (WasmOMGIRGeneratorInternal::verboseTailCalls) {
@@ -5924,8 +6277,10 @@ static inline void prepareForTailCallImpl(unsigned functionIndex, CCallHelpers& 
                         dataLog(context.gpr(arg.location.jsr().payloadGPR()), " / ", (int) context.gpr(arg.location.jsr().payloadGPR()));
                     else if (arg.location.isFPR() && arg.width <= Width::Width64)
                         dataLog(context.fpr(arg.location.fpr()));
+#if CPU(X86_64) || CPU(ARM64) || CPU(PPC64) // Context::vector() exists only where SIMD does
                     else if (arg.location.isFPR())
                         dataLog(context.vector(arg.location.fpr()));
+#endif
                     else
                         dataLog(fpl[src.offsetFromFP() / sizeof(*fpl)], " / ", fpi[src.offsetFromFP() / sizeof(*fpi)],  " / ", RawHex(fpi[src.offsetFromFP() / sizeof(*fpi)]), " / ", std::bit_cast<double>(fpl[src.offsetFromFP() / sizeof(*fpl)]), " at ", RawPointer(&fpi[src.offsetFromFP() / sizeof(*fpi)]));
                     dataLogLn();

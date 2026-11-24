@@ -150,6 +150,10 @@ enum SkColorType : int {
 #elif SK_PMCOLOR_BYTE_ORDER(R,G,B,A)
     kN32_SkColorType          = kRGBA_8888_SkColorType,//!< native 32-bit RGBA encoding
 
+#elif defined(SK_CPU_BENDIAN) && SK_R32_SHIFT == 16
+    // Big-endian keeps the little-endian BGRA memory layout; see BE_CONVERT in SkColorData.h.
+    kN32_SkColorType          = kBGRA_8888_SkColorType,
+
 #else
     #error "SK_*32_SHIFT values must correspond to BGRA or RGBA byte order"
 #endif

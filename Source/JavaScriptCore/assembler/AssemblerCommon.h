@@ -719,7 +719,9 @@ ALWAYS_INLINE void* memcpyTearing(void* dst, const void* src, size_t n)
 
 static ALWAYS_INLINE void* memcpyAtomicIfPossible(void* dst, const void* src, size_t n)
 {
-    if (isPowerOfTwo(n) && n <= sizeof(CPURegister))
+    // An atomic access must be naturally aligned. Instructions are only 4-byte aligned, so an 8-byte
+    // copy (e.g. two PPC64 instructions) may not be.
+    if (isPowerOfTwo(n) && n <= sizeof(CPURegister) && WTF::isAligned(dst, n))
         return memcpyAtomic(dst, src, n);
     return memcpyTearing(dst, src, n);
 }

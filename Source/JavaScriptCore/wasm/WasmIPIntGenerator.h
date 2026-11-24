@@ -49,8 +49,21 @@ namespace IPInt {
 constexpr static unsigned STACK_ENTRY_SIZE = 16; // bytes
 struct IPIntStackEntry {
     union {
+#if CPU(BIG_ENDIAN)
+        // A 32-bit value lives at PayloadOffset of its 8-byte slot, as in
+        // every wasm frame slot.
+        struct {
+            int32_t i32UpperHalf;
+            int32_t i32;
+        };
+        struct {
+            float f32UpperHalf;
+            float f32;
+        };
+#else
         int32_t i32;
         float f32;
+#endif
         int64_t i64;
         double f64;
         v128_t v128;
@@ -61,8 +74,21 @@ struct IPIntStackEntry {
 constexpr static unsigned LOCAL_SIZE = 16; // bytes
 struct IPIntLocal {
     union {
+#if CPU(BIG_ENDIAN)
+        // A 32-bit value lives at PayloadOffset of its 8-byte slot, as in
+        // every wasm frame slot.
+        struct {
+            int32_t i32UpperHalf;
+            int32_t i32;
+        };
+        struct {
+            float f32UpperHalf;
+            float f32;
+        };
+#else
         int32_t i32;
         float f32;
+#endif
         int64_t i64;
         double f64;
         v128_t v128;
@@ -241,7 +267,14 @@ enum class CallArgumentBytecode : uint8_t { // (mINT)
     TailCall = 0x1a,
     Call = 0x1b,
 
+#if CPU(PPC64)
+    // PPC64 holds an f32 in an FPR in double format while IPInt slots hold its
+    // 4-byte encoding, so f32 needs its own variants (lfs/stfs).
+    ArgumentFPRFloat = 0x1c, // 0x1c - 0x23: pop an f32 into fa0, fa1, ...
+    NumOpcodes = 0x24 // this must be the last element of the enum!
+#else
     NumOpcodes // this must be the last element of the enum!
+#endif
 };
 
 struct CallMetadata {
@@ -296,7 +329,13 @@ enum class CallResultBytecode : uint8_t { // (mINT)
     ResultStackVector = 0x11,
     End = 0x12,
 
+#if CPU(PPC64)
+    // f32 variants for PPC64; see above.
+    ResultFPRFloat = 0x13, // 0x13 - 0x1a: f32 in fr0 - fr7
+    NumOpcodes = 0x1b // this must be the last element of the enum!
+#else
     NumOpcodes // this must be the last element of the enum!
+#endif
 };
 
 struct CallReturnMetadata {
@@ -313,7 +352,13 @@ enum class ArgumINTBytecode: uint8_t {
     StackVector = 0x11,
     End = 0x12,
 
+#if CPU(PPC64)
+    // f32 variants for PPC64; see above.
+    ArgFPRFloat = 0x13, // 0x13 - 0x1a: f32 in fr0 - fr7
+    NumOpcodes = 0x1b // this must be the last element of the enum!
+#else
     NumOpcodes // this must be the last element of the enum!
+#endif
 };
 
 enum class UINTBytecode: uint8_t {
@@ -323,7 +368,13 @@ enum class UINTBytecode: uint8_t {
     StackVector = 0x11,
     End = 0x12,
 
+#if CPU(PPC64)
+    // f32 variants for PPC64; see above.
+    RetFPRFloat = 0x13, // 0x13 - 0x1a: f32 in fr0 - fr7
+    NumOpcodes = 0x1b // this must be the last element of the enum!
+#else
     NumOpcodes // this must be the last element of the enum!
+#endif
 };
 
 // GC Metadata

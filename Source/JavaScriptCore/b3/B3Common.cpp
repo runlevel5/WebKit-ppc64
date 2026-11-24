@@ -78,6 +78,11 @@ GPRReg extendedOffsetAddrRegister()
     return MacroAssembler::dataTempRegister;
 #elif CPU(X86_64)
     return GPRReg::InvalidGPRReg;
+#elif CPU(PPC64)
+    // Unreachable: Arg::isValidAddrForm() accepts any offset on PPC64 (the
+    // MacroAssembler folds large displacements through its scratch registers),
+    // so Air never needs an extended-offset address register.
+    return GPRReg::InvalidGPRReg;
 #else
 #error Unhandled architecture.
 #endif

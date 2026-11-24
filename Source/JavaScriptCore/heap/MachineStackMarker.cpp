@@ -69,6 +69,10 @@ static inline int NODELETE osRedZoneAdjustment()
     // There is no red zone.
     // https://stackoverflow.com/questions/77908878/aarch64-is-there-a-red-zone-on-linux-if-so-16-or-128-bytes
 #endif
+#elif CPU(PPC64)
+    // ELFv2's protected zone: code may use the 288 bytes below the stack pointer without
+    // allocating a frame. The rest of the 512-byte zone is reserved for the system.
+    redZoneAdjustment = -288;
 #endif
     return redZoneAdjustment;
 }

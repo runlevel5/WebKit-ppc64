@@ -63,7 +63,9 @@ inline bool NODELETE Bitmap::concurrentTestAndSet(size_t n)
     uint8_t* wordPtr = &bits[index];
     uint8_t oldValue;
     do {
-        oldValue = *wordPtr;
+        // An atomic load: other threads CAS this byte concurrently, and a plain load
+        // lets the compiler reuse a stale value across a failed relaxed CAS.
+        oldValue = WTF::atomicLoad(wordPtr, std::memory_order_relaxed);
         if (oldValue & mask)
             return true;
     } while (!WTF::atomicCompareExchangeWeakRelaxed(wordPtr, oldValue, static_cast<uint8_t>(oldValue | mask)));

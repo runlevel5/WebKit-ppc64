@@ -32,6 +32,7 @@
 #include "LLIntEntrypoint.h"
 #include "LLIntSlowPaths.h"
 #include "LLIntThunks.h"
+#include "MacroAssembler.h"
 #include "Opcode.h"
 
 #if PLATFORM(COCOA)
@@ -102,8 +103,19 @@ static constexpr bool scriptingIsForbidden() { return false; }
 #endif
 
 
+#if CPU(PPC64) && !ENABLE(C_LOOP)
+// Read by the interpreters' entry code (ppc64setcpufeatures in ppc64.rb): non-zero when the CPU is
+// older than POWER8, so that LLInt and IPInt take their ISA 2.01 instruction sequences.
+extern "C" {
+uint8_t g_jscPPC64Pre207 __attribute__((visibility("hidden"))) = 0;
+}
+#endif
+
 void initialize()
 {
+#if CPU(PPC64) && !ENABLE(C_LOOP)
+    g_jscPPC64Pre207 = !MacroAssemblerPPC64::supportsISA2_07();
+#endif
 #if HAVE(OS_SCRIPT_CONFIG_SPI)
     // This check is provided only as a convenience best effort at helping identify when there
     // is a potential SDK vs OS mismatch. The check is intentionally designed to be cheap.
@@ -166,6 +178,10 @@ void initialize()
     llint_entry(opcodeMap, opcodeMapWide16, opcodeMapWide32);
 
 #if ENABLE(WEBASSEMBLY)
+    // Every wasm function is entered through IPInt (ipint_entry), even with
+    // useWasmIPInt off, which only makes IPInt tier up at the first prologue
+    // check; so IPInt's dispatch bases are installed and validated whenever
+    // wasm is on, as verifyInitialization() below expects.
     if (Options::useWasm())
         IPInt::initialize();
 #endif

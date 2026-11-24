@@ -159,6 +159,65 @@ public:
 
     static constexpr GPRReg returnRegister = RISCV64Registers::x10;
     static constexpr GPRReg returnRegister2 = RISCV64Registers::x11;
+#elif CPU(PPC64)
+    // ELFv2 argument GPRs r3-r7 carry the incoming Yarr arguments.
+    static constexpr GPRReg input = PPC64Registers::r3;
+    static constexpr GPRReg index = PPC64Registers::r4;
+    static constexpr GPRReg length = PPC64Registers::r5;
+    static constexpr GPRReg output = PPC64Registers::r6;
+    static constexpr GPRReg matchingContext = PPC64Registers::r7;
+    static constexpr GPRReg freelistRegister = InvalidGPRReg;
+
+    // Scratch registers. Only r3-r10 are free volatile GPRs and five carry
+    // arguments, so the rest are the ELFv2 callee-saved r24-r28, which the
+    // generated code saves itself, like x86_64's rbx/r12-r15.
+    static constexpr GPRReg regT0 = PPC64Registers::r8;
+    static constexpr GPRReg regT1 = PPC64Registers::r9;
+    static constexpr GPRReg regT2 = PPC64Registers::r10;
+    // No volatile GPR is left for regT3, so it is the callee-saved r19.
+    static constexpr GPRReg regT3 = PPC64Registers::r19;
+    static constexpr GPRReg initialStart = PPC64Registers::r24;
+    static constexpr GPRReg remainingMatchCount = PPC64Registers::r25;
+    static constexpr GPRReg regUnicodeInputAndTrail = PPC64Registers::r26;
+    static constexpr GPRReg unicodeAndSubpatternIdTemp = PPC64Registers::r27;
+    static constexpr GPRReg endOfStringAddress = PPC64Registers::r28;
+
+    // ELFv2 returns a two-word aggregate (UGPRPair) in r3/r4.
+    static constexpr GPRReg returnRegister = PPC64Registers::r3;
+    static constexpr GPRReg returnRegister2 = PPC64Registers::r4;
+
+    // SIMD searches. VSR0-13 are volatile in ELFv2, and the searches are only
+    // used when the generated code makes no calls. Their lane handling assumes
+    // little-endian, so big-endian leaves them off.
+#if CPU(BIG_ENDIAN)
+    static constexpr FPRReg vectorTemp0 = InvalidFPRReg;
+    static constexpr FPRReg vectorTemp1 = InvalidFPRReg;
+    static constexpr FPRReg vectorTemp2 = InvalidFPRReg;
+    static constexpr FPRReg vectorTemp3 = InvalidFPRReg;
+    static constexpr FPRReg vectorTemp4 = InvalidFPRReg;
+    static constexpr FPRReg vectorInput0 = InvalidFPRReg;
+    static constexpr FPRReg vectorInput1 = InvalidFPRReg;
+    static constexpr FPRReg vectorInput2 = InvalidFPRReg;
+    static constexpr FPRReg vectorInput3 = InvalidFPRReg;
+    static constexpr FPRReg vectorScratch0 = InvalidFPRReg;
+    static constexpr FPRReg vectorScratch1 = InvalidFPRReg;
+    static constexpr FPRReg vectorScratch2 = InvalidFPRReg;
+    static constexpr FPRReg vectorScratch3 = InvalidFPRReg;
+#else
+    static constexpr FPRReg vectorTemp0 = PPC64Registers::f0;
+    static constexpr FPRReg vectorTemp1 = PPC64Registers::f1;
+    static constexpr FPRReg vectorTemp2 = PPC64Registers::f2;
+    static constexpr FPRReg vectorTemp3 = PPC64Registers::f3;
+    static constexpr FPRReg vectorTemp4 = PPC64Registers::f4;
+    static constexpr FPRReg vectorInput0 = PPC64Registers::f5;
+    static constexpr FPRReg vectorInput1 = PPC64Registers::f6;
+    static constexpr FPRReg vectorInput2 = PPC64Registers::f7;
+    static constexpr FPRReg vectorInput3 = PPC64Registers::f8;
+    static constexpr FPRReg vectorScratch0 = PPC64Registers::f9;
+    static constexpr FPRReg vectorScratch1 = PPC64Registers::f10;
+    static constexpr FPRReg vectorScratch2 = PPC64Registers::f11;
+    static constexpr FPRReg vectorScratch3 = PPC64Registers::f12;
+#endif
 #endif
 };
 

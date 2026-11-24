@@ -499,6 +499,41 @@ void BBQJIT::emitModOrDiv(Value& lhs, Location lhsLocation, Value& rhs, Location
         recordJumpToThrowException(ExceptionType::IntegerOverflow, isNegativeOne);
     }
 
+    // INT_MIN % -1 must give 0. ARM64's sdiv yields INT_MIN for INT_MIN / -1, so the
+    // multiplySub below cancels out, but PPC64's divw/divd leave the quotient undefined.
+    // Answer x % -1 = 0 directly. A constant -1 divisor was folded above.
+    Jump remainderByNegativeOneDone;
+    if constexpr (isPPC64() && isSigned && IsMod) {
+        if (!rhs.isConst()) {
+            Jump notNegativeOne = is32
+                ? m_jit.branch32(RelationalCondition::NotEqual, rhsLocation.asGPR(), TrustedImm32(-1))
+                : m_jit.branch64(RelationalCondition::NotEqual, rhsLocation.asGPR(), TrustedImm64(-1));
+            if constexpr (is32)
+                m_jit.xor32(resultLocation.asGPR(), resultLocation.asGPR());
+            else
+                m_jit.xor64(resultLocation.asGPR(), resultLocation.asGPR());
+            remainderByNegativeOneDone = m_jit.jump();
+            notNegativeOne.link(&m_jit);
+        }
+    }
+
+#if CPU(PPC64)
+    // POWER9 computes the remainder directly; x % 0 and x % -1 are already handled.
+    if (IsMod && MacroAssembler::supportsISA3_00()) {
+        if (is32 && isSigned)
+            m_jit.mod32(lhsLocation.asGPR(), rhsLocation.asGPR(), resultLocation.asGPR());
+        else if (is32)
+            m_jit.uMod32(lhsLocation.asGPR(), rhsLocation.asGPR(), resultLocation.asGPR());
+        else if (isSigned)
+            m_jit.mod64(lhsLocation.asGPR(), rhsLocation.asGPR(), resultLocation.asGPR());
+        else
+            m_jit.uMod64(lhsLocation.asGPR(), rhsLocation.asGPR(), resultLocation.asGPR());
+        if (remainderByNegativeOneDone.isSet())
+            remainderByNegativeOneDone.link(&m_jit);
+        return;
+    }
+#endif
+
     GPRReg divResult = IsMod ? scratches.gpr(0) : resultLocation.asGPR();
     if (is32 && isSigned)
         m_jit.div32(lhsLocation.asGPR(), rhsLocation.asGPR(), divResult);
@@ -515,6 +550,9 @@ void BBQJIT::emitModOrDiv(Value& lhs, Location lhsLocation, Value& rhs, Location
         else
             m_jit.multiplySub64(divResult, rhsLocation.asGPR(), lhsLocation.asGPR(), resultLocation.asGPR());
     }
+
+    if (remainderByNegativeOneDone.isSet())
+        remainderByNegativeOneDone.link(&m_jit);
 }
 #endif
 
@@ -561,6 +599,37 @@ void BBQJIT::emitShuffleMove(Vector<Value, N, OverflowHandler>& srcVector, Vecto
     statusVector[index] = ShuffleStatus::Moved;
 }
 
+#if CPU(PPC64)
+// ELFv2 has the caller sign- or zero-extend a narrow argument by its C type. BBQ
+// keeps i32 values zero-extended, which is wrong for a negative int32_t, so
+// re-extend each narrow integer argument by the operation's parameter type.
+template<typename Func>
+static void extendNarrowCCallArgumentsForELFv2(CCallHelpers& jit, const CallInformation& callInfo, size_t argumentCount)
+{
+    using Traits = FunctionTraits<Func>;
+    [&]<size_t... I>(std::index_sequence<I...>) {
+        ([&] {
+            using RawArg = std::remove_cvref_t<typename Traits::template ArgumentType<I>>;
+            using Arg = typename std::conditional_t<std::is_enum_v<RawArg>, std::underlying_type<RawArg>, std::type_identity<RawArg>>::type;
+            if constexpr (std::is_integral_v<Arg> && sizeof(Arg) < sizeof(uint64_t)) {
+                if (I >= argumentCount || I >= callInfo.params.size())
+                    return;
+                auto location = callInfo.params[I].location;
+                if (!location.isGPR())
+                    return;
+                GPRReg reg = location.jsr().payloadGPR();
+                if constexpr (std::is_same_v<Arg, bool> || sizeof(Arg) == 1)
+                    std::is_signed_v<Arg> ? jit.signExtend8To64(reg, reg) : jit.zeroExtend8To32(reg, reg);
+                else if constexpr (sizeof(Arg) == 2)
+                    std::is_signed_v<Arg> ? jit.signExtend16To64(reg, reg) : jit.zeroExtend16To32(reg, reg);
+                else
+                    std::is_signed_v<Arg> ? jit.signExtend32ToPtr(reg, reg) : jit.zeroExtend32ToWord(reg, reg);
+            }
+        }(), ...);
+    }(std::make_index_sequence<Traits::arity>());
+}
+#endif
+
 template<typename Func>
 void BBQJIT::emitCCall(Func function, std::span<const Value> arguments)
 {
@@ -581,6 +650,9 @@ void BBQJIT::emitCCall(Func function, std::span<const Value> arguments)
     // Preserve caller-saved registers and other info
     prepareForExceptions();
     saveValuesAcrossCallAndPassArguments(arguments, callInfo, functionRTT.get());
+#if CPU(PPC64)
+    extendNarrowCCallArgumentsForELFv2<Func>(m_jit, callInfo, arguments.size());
+#endif
 
     // Materialize address of native function and call register
     void* taggedFunctionPtr = tagCFunctionPtr<void*, OperationPtrTag>(function);
@@ -611,6 +683,9 @@ void BBQJIT::emitCCall(Func function, std::span<const Value> arguments, Value& r
     // Preserve caller-saved registers and other info
     prepareForExceptions();
     saveValuesAcrossCallAndPassArguments(arguments, callInfo, functionRTT.get());
+#if CPU(PPC64)
+    extendNarrowCCallArgumentsForELFv2<Func>(m_jit, callInfo, arguments.size());
+#endif
 
     // Materialize address of native function and call register
     void* taggedFunctionPtr = tagCFunctionPtr<void*, OperationPtrTag>(function);

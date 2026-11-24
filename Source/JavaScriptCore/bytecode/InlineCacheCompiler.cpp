@@ -1399,6 +1399,17 @@ void InlineCacheCompiler::emitDataICPrepareForCall(CCallHelpers& jit)
 #elif CPU(RISCV64)
     static_assert(!maxFrameExtentForSlowPathCall);
     jit.pushPair(CCallHelpers::framePointerRegister, CCallHelpers::linkRegister);
+#elif CPU(PPC64)
+    static_assert(!!maxFrameExtentForSlowPathCall);
+    // The DataIC handler is entered as a leaf with its return address in LR and
+    // the caller's fp. The nested C call clobbers LR, so spill fp and LR as a frame
+    // header for emitDataICRestoreAfterCall, without setting fp = sp. Then reserve
+    // the ELFv2 linkage area for the call.
+    jit.sub64(CCallHelpers::TrustedImm32(16), CCallHelpers::stackPointerRegister);
+    jit.store64(CCallHelpers::framePointerRegister, CCallHelpers::Address(CCallHelpers::stackPointerRegister));
+    jit.moveFromLR(CCallHelpers::dataTempRegister);
+    jit.store64(CCallHelpers::dataTempRegister, CCallHelpers::Address(CCallHelpers::stackPointerRegister, 8));
+    jit.subPtr(CCallHelpers::TrustedImm32(maxFrameExtentForSlowPathCall), CCallHelpers::stackPointerRegister);
 #endif
 }
 
@@ -3759,6 +3770,10 @@ void InlineCacheCompiler::generateAccessCase(unsigned index, AccessCase& accessC
 
             auto spillState = preserveLiveRegistersToStackForCallWithoutExceptions();
 
+            // The live registers were just saved at sp; keep the C call's
+            // linkage area (ELFv2: CR/LR/TOC at sp+8..sp+31) below them, as the
+            // other slow-path calls in this file do.
+            jit.makeSpaceOnStackForCCall();
             if (m_propertyCache.isHandlerIC())
                 InlineCacheCompiler::emitDataICPrepareForCall(jit);
             jit.setupArguments<decltype(operationWriteBarrierSlowPath)>(CCallHelpers::TrustedImmPtr(&vm), scratchGPR);
@@ -3766,6 +3781,7 @@ void InlineCacheCompiler::generateAccessCase(unsigned index, AccessCase& accessC
             jit.callOperation<OperationPtrTag>(operationWriteBarrierSlowPath);
             if (m_propertyCache.isHandlerIC())
                 InlineCacheCompiler::emitDataICRestoreAfterCall(jit);
+            jit.reclaimSpaceOnStackForCCall();
             restoreLiveRegistersFromStackForCall(spillState);
 
             skipBarrier.link(&jit);
@@ -4705,7 +4721,7 @@ void InlineCacheCompiler::emitIntrinsicGetter(IntrinsicGetterAccessCase& accessC
         jit.move(CCallHelpers::TrustedImm32(0), valueGPR);
         auto nullCase = jit.branchTestPtr(CCallHelpers::Zero, scratchGPR);
         // offsetOfAliveEntryCount() is the same for both JSSet::Helper and JSMap::Helper.
-        jit.load32(CCallHelpers::Address(scratchGPR, JSSet::Helper::offsetOfAliveEntryCount()), valueGPR);
+        jit.load32(CCallHelpers::Address(scratchGPR, JSSet::Helper::offsetOfAliveEntryCount() + PayloadOffset), valueGPR);
         nullCase.link(&jit);
         jit.boxInt32(valueGPR, valueRegs);
         succeed();

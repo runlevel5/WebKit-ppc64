@@ -29,6 +29,8 @@
 
 #include <wtf/Assertions.h>
 #include <wtf/PrintStream.h>
+#include <wtf/StackBounds.h>
+#include <wtf/Threading.h>
 #include <wtf/StringPrintStream.h>
 
 #if HAVE(DLADDR)
@@ -40,9 +42,39 @@
 #include <wtf/NeverDestroyed.h>
 #endif
 
+#if CPU(PPC64) && OS(LINUX)
+// The walk below reads other functions' stack frames, which ASan considers out of bounds.
+SUPPRESS_ASAN
+#endif
 void WTFGetBacktrace(void** stack, int* size)
 {
-#if HAVE(BACKTRACE)
+#if CPU(PPC64) && OS(LINUX)
+    // glibc's backtrace() on PPC64 walks the ELFv2 back chain, which JIT and
+    // LLInt frames do not maintain, and can fault. Walk it ourselves and stop
+    // at the first frame that is not a strictly higher, 16-byte-aligned slot
+    // inside this thread's stack, truncating the trace at JIT frames.
+    int maxFrames = *size;
+    int captured = 0;
+    // Use the bounds WTF caches per thread: pthread_getattr_np parses /proc/self/maps for the main
+    // thread, and exception scope verification captures a trace on every throw.
+    const auto& stackBounds = WTF::Thread::currentSingleton().stack();
+    void** frame = reinterpret_cast<void**>(__builtin_frame_address(0));
+    while (captured < maxFrames && frame) {
+        void** next = reinterpret_cast<void**>(*frame); // back chain
+        if (next <= frame)
+            break; // the back-chain must ascend (the stack grows down)
+        if (reinterpret_cast<uintptr_t>(next) & 0xf)
+            break; // frames are 16-byte aligned in ELFv2
+        if (reinterpret_cast<uintptr_t>(next) - reinterpret_cast<uintptr_t>(frame) > (16u << 20))
+            break; // an implausibly large gap means a bogus back-chain
+        if (stackBounds.isEmpty() || reinterpret_cast<char*>(next + 3) > static_cast<char*>(stackBounds.origin()))
+            break; // next[0..2] must lie within the stack
+        // ELFv2 saves the return address (LR) at caller_sp + 16, i.e. next[2].
+        stack[captured++] = next[2];
+        frame = next;
+    }
+    *size = captured;
+#elif HAVE(BACKTRACE)
     *size = backtrace(stack, *size);
 #elif OS(WINDOWS)
     *size = RtlCaptureStackBackTrace(0, *size, stack, nullptr);

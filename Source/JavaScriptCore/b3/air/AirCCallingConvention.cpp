@@ -81,6 +81,44 @@ void marshallCCallArgumentImpl(Vector<Arg>& result, unsigned& argumentCount, Val
 }
 
 
+#if CPU(PPC64)
+// ELFv2 assigns every argument one doubleword of the parameter save area by its
+// position in the argument list, starting after the 32-byte linkage area at
+// sp + 32. Positions 0-7 are also r3-r10: an integer argument takes the GPR of its
+// position (FP arguments skip theirs) or, from position 8 on, its doubleword. FP
+// arguments take f1-f13 in order, then their doubleword (a float in its low word).
+static constexpr unsigned elfV2ArgumentGPRs = 8;
+static constexpr unsigned elfV2ArgumentFPRs = 13;
+static constexpr Value::OffsetType elfV2ParameterSaveAreaOffset = 32;
+
+void marshallCCallArgumentELFv2(Vector<Arg>& result, unsigned& gpArgumentCount, unsigned& fpArgumentCount, bool& usesParameterSaveArea, Type childType)
+{
+    ASSERT(cCallArgumentRegisterCount(childType) == 1);
+    unsigned position = gpArgumentCount + fpArgumentCount;
+    Value::OffsetType slot = elfV2ParameterSaveAreaOffset + 8 * position;
+    switch (bankForType(childType)) {
+    case GP:
+        if (position < elfV2ArgumentGPRs)
+            result.append(Tmp(GPRInfo::toArgumentRegister(position)));
+        else {
+            result.append(Arg::callArg(slot));
+            usesParameterSaveArea = true;
+        }
+        gpArgumentCount++;
+        return;
+    case FP:
+        if (fpArgumentCount < elfV2ArgumentFPRs)
+            result.append(Tmp(static_cast<FPRReg>(PPC64Registers::f1 + fpArgumentCount)));
+        else {
+            result.append(Arg::callArg(slot));
+            usesParameterSaveArea = true;
+        }
+        fpArgumentCount++;
+        return;
+    }
+    RELEASE_ASSERT_NOT_REACHED();
+}
+#else
 void marshallCCallArgument(Vector<Arg> &result, unsigned& gpArgumentCount, unsigned& fpArgumentCount, Value::OffsetType& stackOffset, Type childType)
 {
     switch (bankForType(childType)) {
@@ -93,6 +131,7 @@ void marshallCCallArgument(Vector<Arg> &result, unsigned& gpArgumentCount, unsig
     }
     RELEASE_ASSERT_NOT_REACHED();
 }
+#endif
 
 } // anonymous namespace
 
@@ -102,9 +141,21 @@ Vector<Arg> computeCCallingConvention(Code& code, CCallValue* value)
     result.append(Tmp(CCallSpecial::scratchRegister)); // For callee
     unsigned gpArgumentCount = 0;
     unsigned fpArgumentCount = 0;
+#if CPU(PPC64)
+    // The callee may store CR, LR and the TOC into the 32-byte linkage area at our
+    // sp, so it is always reserved. A caller that passes anything in memory must
+    // reserve the whole parameter save area, one doubleword per argument.
+    bool usesParameterSaveArea = false;
+    for (unsigned i = 1; i < value->numChildren(); ++i)
+        marshallCCallArgumentELFv2(result, gpArgumentCount, fpArgumentCount, usesParameterSaveArea, value->child(i)->type());
+    Value::OffsetType stackOffset = elfV2ParameterSaveAreaOffset;
+    if (usesParameterSaveArea)
+        stackOffset += 8 * (gpArgumentCount + fpArgumentCount);
+#else
     Value::OffsetType stackOffset = 0;
     for (unsigned i = 1; i < value->numChildren(); ++i)
         marshallCCallArgument(result, gpArgumentCount, fpArgumentCount, stackOffset, value->child(i)->type());
+#endif
     code.requestCallArgAreaSizeInBytes(WTF::roundUpToMultipleOf<stackAlignmentBytes()>(stackOffset));
     return result;
 }
@@ -293,10 +344,17 @@ ArgumentValueList computeCCallArguments(Procedure& procedure, B3::BasicBlock* bl
     Vector<unsigned> argUnderlyingCounts;
     unsigned gpArgumentCount = 0;
     unsigned fpArgumentCount = 0;
+#if CPU(PPC64)
+    bool usesParameterSaveArea = false;
+#else
     Value::OffsetType stackOffset = 0;
+#endif
 
     for (auto type : types) {
         argUnderlyingCounts.append(underlyingArgs.size());
+#if CPU(PPC64)
+        marshallCCallArgumentELFv2(underlyingArgs, gpArgumentCount, fpArgumentCount, usesParameterSaveArea, type);
+#else
 #if CPU(ARM_THUMB2)
         if (type == Int64) {
             // Int64 arguments are passed in even-based register pairs on ARMv7.
@@ -308,6 +366,7 @@ ArgumentValueList computeCCallArguments(Procedure& procedure, B3::BasicBlock* bl
         }
 #endif
         marshallCCallArgument(underlyingArgs, gpArgumentCount, fpArgumentCount, stackOffset, type);
+#endif
     }
 
     return ArgumentValueList { procedure, block, types, WTF::move(underlyingArgs), WTF::move(argUnderlyingCounts) };
