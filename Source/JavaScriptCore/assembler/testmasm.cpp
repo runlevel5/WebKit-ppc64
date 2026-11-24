@@ -6206,6 +6206,262 @@ void testMove64BitImmediates()
     }
 }
 
+#if CPU(PPC64)
+// Integer to floating-point conversions round once, to nearest even, whatever
+// instructions the CPU offers: the PowerPC paths older than ISA 2.06 build the
+// unsigned and single-precision forms from the signed doubleword conversion.
+void testIntegerToFloatingPointConversions()
+{
+    Vector<uint64_t> values = {
+        0, 1, 2, 3, 0x7fffffffull, 0x80000000ull, 0xffffffffull, 0x100000000ull,
+        (1ull << 24) - 1, 1ull << 24, (1ull << 24) + 1, (1ull << 24) + 2, (1ull << 24) + 3,
+        (1ull << 53) - 1, 1ull << 53, (1ull << 53) + 1, (1ull << 53) + 2, (1ull << 53) + 3,
+        (1ull << 54) + 1, (1ull << 54) + 2, (1ull << 54) + 3, (1ull << 54) + 5,
+        0x4000008000000000ull, 0x4000008000000001ull, 0x400000bfffffffffull, 0x4000007fffffffffull,
+        0x7fffffffffffffffull, 0x7fffffffffffff00ull, 0x7ffffffffffffc00ull, 0x7ffffffffffffbffull,
+        0x8000000000000000ull, 0x8000000000000001ull, 0x8000000000000400ull, 0x8000000000000401ull, 0x80000000000007ffull, 0x8000000000000800ull, 0x8000000000000c00ull,
+        0x8000008000000000ull, 0x8000008000000001ull, 0x8000018000000000ull, 0x80000100000007ffull,
+        0xfffffffffffff7ffull, 0xfffffffffffff800ull, 0xfffffffffffffbffull, 0xfffffffffffffc00ull, 0xffffffffffffffffull,
+        0xffffff7fffffffffull, 0xffffff8000000000ull, 0xffffff8000000001ull, 0x123456789abcdef0ull, 0xfedcba9876543210ull,
+    };
+    for (uint64_t extra : { 0x7ffull, 0x400ull, 0x401ull, 0x3ffull, 0xc00ull, 0xbffull }) {
+        for (unsigned shift = 0; shift < 12; ++shift) {
+            values.append((0x20000000000000ull | extra) << shift);
+            values.append(0ull - ((0x20000000000000ull | extra) << shift));
+        }
+    }
+    auto compileToDouble = [](auto&& convert) {
+        return compile([&] (CCallHelpers& jit) {
+            emitFunctionPrologue(jit);
+            convert(jit);
+            emitFunctionEpilogue(jit);
+            jit.ret();
+        });
+    };
+    auto i32ToDouble = compileToDouble([] (CCallHelpers& jit) { jit.convertInt32ToDouble(GPRInfo::argumentGPR0, FPRInfo::returnValueFPR); });
+    auto u32ToDouble = compileToDouble([] (CCallHelpers& jit) { jit.convertUInt32ToDouble(GPRInfo::argumentGPR0, FPRInfo::returnValueFPR); });
+    auto i64ToDouble = compileToDouble([] (CCallHelpers& jit) { jit.convertInt64ToDouble(GPRInfo::argumentGPR0, FPRInfo::returnValueFPR); });
+    auto u64ToDouble = compileToDouble([] (CCallHelpers& jit) { jit.convertUInt64ToDouble(GPRInfo::argumentGPR0, FPRInfo::returnValueFPR); });
+    auto i32ToFloat = compileToDouble([] (CCallHelpers& jit) { jit.convertInt32ToFloat(GPRInfo::argumentGPR0, FPRInfo::returnValueFPR); });
+    auto u32ToFloat = compileToDouble([] (CCallHelpers& jit) { jit.convertUInt32ToFloat(GPRInfo::argumentGPR0, FPRInfo::returnValueFPR); });
+    auto i64ToFloat = compileToDouble([] (CCallHelpers& jit) { jit.convertInt64ToFloat(GPRInfo::argumentGPR0, FPRInfo::returnValueFPR); });
+    auto u64ToFloat = compileToDouble([] (CCallHelpers& jit) { jit.convertUInt64ToFloat(GPRInfo::argumentGPR0, FPRInfo::returnValueFPR); });
+    for (uint64_t value : values) {
+        // The 32-bit forms read only the low word, whatever the upper word holds.
+        uint64_t dirty = value | 0xdeadbeef00000000ull;
+        CHECK_EQ(invoke<double>(i32ToDouble, dirty), static_cast<double>(static_cast<int32_t>(value)));
+        CHECK_EQ(invoke<double>(u32ToDouble, dirty), static_cast<double>(static_cast<uint32_t>(value)));
+        CHECK_EQ(invoke<double>(i64ToDouble, value), static_cast<double>(static_cast<int64_t>(value)));
+        CHECK_EQ(invoke<double>(u64ToDouble, value), static_cast<double>(value));
+        CHECK_EQ(invoke<float>(i32ToFloat, dirty), static_cast<float>(static_cast<int32_t>(value)));
+        CHECK_EQ(invoke<float>(u32ToFloat, dirty), static_cast<float>(static_cast<uint32_t>(value)));
+        CHECK_EQ(invoke<float>(i64ToFloat, value), static_cast<float>(static_cast<int64_t>(value)));
+        CHECK_EQ(invoke<float>(u64ToFloat, value), static_cast<float>(value));
+    }
+}
+
+// Truncating conversions to unsigned integers over their defined domain.
+void testTruncateDoubleToUnsigned()
+{
+    auto toUint32 = compile([] (CCallHelpers& jit) {
+        emitFunctionPrologue(jit);
+        jit.truncateDoubleToUint32(FPRInfo::argumentFPR0, GPRInfo::returnValueGPR);
+        emitFunctionEpilogue(jit);
+        jit.ret();
+    });
+    auto toUint64 = compile([] (CCallHelpers& jit) {
+        emitFunctionPrologue(jit);
+        jit.truncateDoubleToUint64(FPRInfo::argumentFPR0, GPRInfo::returnValueGPR);
+        emitFunctionEpilogue(jit);
+        jit.ret();
+    });
+    for (double value : { 0.0, 0.5, 0.999, 1.0, 1.5, 2147483647.0, 2147483648.0, 2147483648.5, 4294967295.0, 4294967295.9 })
+        CHECK_EQ(invoke<uint64_t>(toUint32, value), static_cast<uint64_t>(static_cast<uint32_t>(value)));
+    for (double value : { 0.0, 0.5, 1.0, 4294967296.0, 9007199254740993.0, 9223372036854774784.0, 9223372036854775808.0, 9223372036854777856.0, 13835058055282163712.0, 18446744073709549568.0 })
+        CHECK_EQ(invoke<uint64_t>(toUint64, value), static_cast<uint64_t>(value));
+}
+
+// Rounding to an integral double, into the operand's register and into another
+// one, bit for bit against the C library: the sign of zero results and the
+// quieting of NaNs are part of the contract. Below ISA 2.07 these are
+// instruction sequences, not single instructions.
+void testRoundDoubleToIntegral()
+{
+    struct Case {
+        void (*emit)(CCallHelpers&, FPRReg, FPRReg);
+        double (*expected)(double);
+    };
+    const Case cases[] = {
+        { [] (CCallHelpers& jit, FPRReg src, FPRReg dest) { jit.floorDouble(src, dest); }, [] (double value) { return std::floor(value); } },
+        { [] (CCallHelpers& jit, FPRReg src, FPRReg dest) { jit.ceilDouble(src, dest); }, [] (double value) { return std::ceil(value); } },
+        { [] (CCallHelpers& jit, FPRReg src, FPRReg dest) { jit.truncDouble(src, dest); }, [] (double value) { return std::trunc(value); } },
+        { [] (CCallHelpers& jit, FPRReg src, FPRReg dest) { jit.roundTowardZeroDouble(src, dest); }, [] (double value) { return std::trunc(value); } },
+        { [] (CCallHelpers& jit, FPRReg src, FPRReg dest) { jit.roundTowardNearestIntDouble(src, dest); }, [] (double value) { return std::nearbyint(value); } },
+    };
+    Vector<double> operands = doubleOperands();
+    for (double magnitude : { 0.25, 0.5, 0.75, 1.5, 2.5, 3.5, 1e-310, 0.49999999999999994, 1073741824.5, 2147483647.5, 4294967295.5,
+        2251799813685247.5, 2251799813685248.5, 4503599627370495.5, 4503599627370496.0, 4503599627370497.0, 9007199254740992.0,
+        9223372036854775808.0, 1e300 }) {
+        operands.append(magnitude);
+        operands.append(-magnitude);
+    }
+    operands.append(std::bit_cast<double>(0x7ff0000000000001ull)); // signalling NaN
+    for (auto& testCase : cases) {
+        for (bool inPlace : { false, true }) {
+            auto round = compile([&] (CCallHelpers& jit) {
+                emitFunctionPrologue(jit);
+                if (inPlace) {
+                    jit.moveDouble(FPRInfo::argumentFPR0, FPRInfo::returnValueFPR);
+                    testCase.emit(jit, FPRInfo::returnValueFPR, FPRInfo::returnValueFPR);
+                } else {
+                    jit.moveDouble(FPRInfo::argumentFPR0, FPRInfo::fpRegT2);
+                    testCase.emit(jit, FPRInfo::fpRegT2, FPRInfo::returnValueFPR);
+                }
+                emitFunctionEpilogue(jit);
+                jit.ret();
+            });
+            for (double value : operands) {
+                double expected = testCase.expected(value);
+                double actual = invoke<double>(round, value);
+                if (std::isnan(expected)) {
+                    // Any quiet NaN will do.
+                    CHECK_EQ(std::bit_cast<uint64_t>(actual) & 0x7ff8000000000000ull, 0x7ff8000000000000ull);
+                } else
+                    CHECK_EQ(std::bit_cast<uint64_t>(actual), std::bit_cast<uint64_t>(expected));
+            }
+        }
+    }
+}
+
+// 8-, 16- and 32-bit atomics at every aligned position in a word, checking the
+// result, the stored value and that the neighbouring bytes are untouched. The
+// narrow forms are emulated on the containing word before ISA 2.06.
+void testNarrowAtomics()
+{
+    for (unsigned width : { 8u, 16u, 32u }) {
+        unsigned bytes = width / 8;
+        uint64_t mask = width == 32 ? 0xffffffffull : (1ull << width) - 1;
+        auto xchg = compile([=] (CCallHelpers& jit) {
+            emitFunctionPrologue(jit);
+            jit.move(GPRInfo::argumentGPR1, GPRInfo::regT2);
+            switch (width) {
+            case 8: jit.atomicXchg8(GPRInfo::regT2, CCallHelpers::Address(GPRInfo::argumentGPR0)); break;
+            case 16: jit.atomicXchg16(GPRInfo::regT2, CCallHelpers::Address(GPRInfo::argumentGPR0)); break;
+            default: jit.atomicXchg32(GPRInfo::regT2, CCallHelpers::Address(GPRInfo::argumentGPR0)); break;
+            }
+            jit.move(GPRInfo::regT2, GPRInfo::returnValueGPR);
+            emitFunctionEpilogue(jit);
+            jit.ret();
+        });
+        auto xchgAdd = compile([=] (CCallHelpers& jit) {
+            emitFunctionPrologue(jit);
+            jit.move(GPRInfo::argumentGPR1, GPRInfo::regT2);
+            switch (width) {
+            case 8: jit.atomicXchgAdd8(GPRInfo::regT2, CCallHelpers::Address(GPRInfo::argumentGPR0, 0)); break;
+            case 16: jit.atomicXchgAdd16(GPRInfo::regT2, CCallHelpers::Address(GPRInfo::argumentGPR0, 0)); break;
+            default: jit.atomicXchgAdd32(GPRInfo::regT2, CCallHelpers::Address(GPRInfo::argumentGPR0, 0)); break;
+            }
+            jit.move(GPRInfo::regT2, GPRInfo::returnValueGPR);
+            emitFunctionEpilogue(jit);
+            jit.ret();
+        });
+        // Returns the value seen; the flag the fourth argument points to says whether it stored.
+        auto strongCAS = compile([=] (CCallHelpers& jit) {
+            emitFunctionPrologue(jit);
+            jit.move(GPRInfo::argumentGPR1, GPRInfo::regT4);
+            switch (width) {
+            case 8: jit.atomicStrongCAS8(CCallHelpers::Success, GPRInfo::regT4, GPRInfo::argumentGPR2, CCallHelpers::Address(GPRInfo::argumentGPR0), GPRInfo::regT5); break;
+            case 16: jit.atomicStrongCAS16(CCallHelpers::Success, GPRInfo::regT4, GPRInfo::argumentGPR2, CCallHelpers::Address(GPRInfo::argumentGPR0), GPRInfo::regT5); break;
+            default: jit.atomicStrongCAS32(CCallHelpers::Success, GPRInfo::regT4, GPRInfo::argumentGPR2, CCallHelpers::Address(GPRInfo::argumentGPR0), GPRInfo::regT5); break;
+            }
+            jit.store32(GPRInfo::regT5, CCallHelpers::Address(GPRInfo::argumentGPR3));
+            jit.move(GPRInfo::regT4, GPRInfo::returnValueGPR);
+            emitFunctionEpilogue(jit);
+            jit.ret();
+        });
+        // Retries a weak CAS until it stores or sees another value; returns 1 if it stored.
+        auto weakCAS = compile([=] (CCallHelpers& jit) {
+            emitFunctionPrologue(jit);
+            auto retry = jit.label();
+            jit.move(GPRInfo::argumentGPR1, GPRInfo::regT4);
+            CCallHelpers::Jump stored;
+            switch (width) {
+            case 8: stored = jit.branchAtomicWeakCAS8(CCallHelpers::Success, GPRInfo::regT4, GPRInfo::argumentGPR2, CCallHelpers::Address(GPRInfo::argumentGPR0)); break;
+            case 16: stored = jit.branchAtomicWeakCAS16(CCallHelpers::Success, GPRInfo::regT4, GPRInfo::argumentGPR2, CCallHelpers::Address(GPRInfo::argumentGPR0)); break;
+            default: stored = jit.branchAtomicWeakCAS32(CCallHelpers::Success, GPRInfo::regT4, GPRInfo::argumentGPR2, CCallHelpers::Address(GPRInfo::argumentGPR0)); break;
+            }
+            // Not stored: a mismatch ends the loop, a lost reservation retries.
+            switch (width) {
+            case 8: jit.load8(CCallHelpers::Address(GPRInfo::argumentGPR0), GPRInfo::regT5); break;
+            case 16: jit.load16(CCallHelpers::Address(GPRInfo::argumentGPR0), GPRInfo::regT5); break;
+            default: jit.load32(CCallHelpers::Address(GPRInfo::argumentGPR0), GPRInfo::regT5); break;
+            }
+            jit.branch64(CCallHelpers::Equal, GPRInfo::regT5, GPRInfo::regT4).linkTo(retry, &jit);
+            jit.move(CCallHelpers::TrustedImm32(0), GPRInfo::returnValueGPR);
+            auto done = jit.jump();
+            stored.link(&jit);
+            jit.move(CCallHelpers::TrustedImm32(1), GPRInfo::returnValueGPR);
+            done.link(&jit);
+            emitFunctionEpilogue(jit);
+            jit.ret();
+        });
+
+        for (unsigned offset = 0; offset + bytes <= 8; offset += bytes) {
+            alignas(8) uint8_t buffer[16];
+            auto reset = [&] { for (unsigned i = 0; i < 16; ++i) buffer[i] = 0xa0 + i; };
+            auto field = [&] () -> uint64_t {
+                uint64_t value = 0;
+                memcpy(&value, buffer + 4 + offset, bytes);
+#if CPU(BIG_ENDIAN)
+                value >>= 64 - width;
+#endif
+                return value;
+            };
+            auto checkNeighbours = [&] {
+                for (unsigned i = 0; i < 16; ++i) {
+                    if (i < 4 + offset || i >= 4 + offset + bytes)
+                        CHECK_EQ(buffer[i], 0xa0 + i);
+                }
+            };
+            uint8_t* address = buffer + 4 + offset;
+            for (uint64_t operand : { 0ull, 1ull, 0x7full, 0x80ull, 0xffull, 0x1234ull, 0xffffull, 0x12345678ull, 0xffffffffull, 0xdeadbeefcafef00dull }) {
+                reset();
+                uint64_t before = field();
+                CHECK_EQ(invoke<uint64_t>(xchg, address, operand) & mask, before);
+                CHECK_EQ(field(), operand & mask);
+                checkNeighbours();
+
+                reset();
+                CHECK_EQ(invoke<uint64_t>(xchgAdd, address, operand) & mask, before);
+                CHECK_EQ(field(), (before + operand) & mask);
+                checkNeighbours();
+
+                reset();
+                uint32_t stored = 2;
+                CHECK_EQ(invoke<uint64_t>(strongCAS, address, before | ~mask, operand, &stored), before);
+                CHECK_EQ(stored, 1u);
+                CHECK_EQ(field(), operand & mask);
+                checkNeighbours();
+                uint64_t now = field();
+                CHECK_EQ(invoke<uint64_t>(strongCAS, address, (now + 1) & mask, 0x55ull, &stored), now);
+                CHECK_EQ(stored, 0u);
+                CHECK_EQ(field(), now);
+                checkNeighbours();
+
+                reset();
+                CHECK_EQ(invoke<uint64_t>(weakCAS, address, before, operand), 1ull);
+                CHECK_EQ(field(), operand & mask);
+                checkNeighbours();
+                now = field();
+                CHECK_EQ(invoke<uint64_t>(weakCAS, address, (now + 1) & mask, 0x55ull), 0ull);
+                CHECK_EQ(field(), now);
+                checkNeighbours();
+            }
+        }
+    }
+}
+#endif // CPU(PPC64)
+
 #if CPU(PPC64) && CPU(BIG_ENDIAN)
 // The little-endian float and double stores resolve the address before moving
 // the data, since a BaseIndex with a displacement outside 16 bits resolves
@@ -10071,6 +10327,12 @@ void run(const char* filter) WTF_IGNORES_THREAD_SAFETY_ANALYSIS
     RUN(testTest32AllOnesMask());
     RUN(testOr32ImmediateWithDistinctDestination());
     RUN(testMove64BitImmediates());
+#if CPU(PPC64)
+    RUN(testIntegerToFloatingPointConversions());
+    RUN(testTruncateDoubleToUnsigned());
+    RUN(testRoundDoubleToIntegral());
+    RUN(testNarrowAtomics());
+#endif
 #if CPU(PPC64) && CPU(BIG_ENDIAN)
     RUN(testFloatingPointLittleEndianBaseIndexLargeOffset());
 #endif
@@ -10086,10 +10348,12 @@ void run(const char* filter) WTF_IGNORES_THREAD_SAFETY_ANALYSIS
     RUN(testMove32ToFloatMovi());
     RUN(testMove64ToDoubleMovi());
     RUN(testMove64ToDoubleRepeated32BitPatternBug());
-    RUN(testMove128ToVectorMovi());
+    if (Options::useWasmSIMD())
+        RUN(testMove128ToVectorMovi());
     RUN(testMove32ToFloatComprehensive());
     RUN(testMove64ToDoubleComprehensive());
-    RUN(testMove128ToVectorComprehensive());
+    if (Options::useWasmSIMD())
+        RUN(testMove128ToVectorComprehensive());
 
     RUN(testMove32ToFloatX64());
     RUN(testMove64ToDoubleX64());

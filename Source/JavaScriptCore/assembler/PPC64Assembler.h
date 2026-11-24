@@ -512,6 +512,11 @@ public:
         insn(xFormFp(63, frt, PPC64Registers::f0, frb, /*XO*/ 264, /*Rc*/ 0));
     }
 
+    void fnabs(FPRegisterID frt, FPRegisterID frb)
+    {
+        insn(xFormFp(63, frt, PPC64Registers::f0, frb, /*XO*/ 136, /*Rc*/ 0));
+    }
+
     void fmr(FPRegisterID frt, FPRegisterID frb)
     {
         insn(xFormFp(63, frt, PPC64Registers::f0, frb, /*XO*/ 72, /*Rc*/ 0));
@@ -1713,9 +1718,77 @@ public:
         insn(xForm(31, rs, ra, rb, /*XO*/ 726, /*Rc*/ 1));
     }
 
+    // True for every instruction that is not in the 64-bit base set of ISA
+    // 2.01, which is all that the oldest supported CPUs (PowerPC 970, POWER5)
+    // share: AltiVec, VSX, prefixed instructions, and the fixed-point and
+    // floating-point additions of ISA 2.02 and later.
+    static constexpr bool isNewerThanISA2_01(uint32_t instruction)
+    {
+        unsigned opcode = instruction >> 26;
+        unsigned xo = (instruction >> 1) & 0x3ff;
+        switch (opcode) {
+        case 1: // Prefixed instructions.
+        case 4: // AltiVec.
+        case 6: // lxvp, stxvp.
+        case 56: // lq.
+        case 57: // lfdp, lxsd, lxssp.
+        case 60: // VSX.
+        case 61: // stfdp, stxsd, stxssp, lxv, stxv.
+            return true;
+        case 31:
+            if ((xo & 0x1f) == 15) // isel.
+                return true;
+            switch (xo) {
+            case 6: case 38: // lvsl, lvsr.
+            case 7: case 39: case 71: case 103: case 359: // lvebx, lvehx, lvewx, lvx, lvxl.
+            case 135: case 167: case 199: case 231: case 487: // stvebx, stvehx, stvewx, stvx, stvxl.
+            case 12: case 140: case 332: case 588: case 716: // lxsiwzx, stxsiwx, lxvdsx, lxsdx, stxsdx.
+            case 780: case 844: case 908: case 972: // lxvw4x, lxvd2x, stxvw4x, stxvd2x.
+            case 51: case 115: case 179: case 211: case 243: // mfvsrd, mfvsrwz, mtvsrd, mtvsrwa, mtvsrwz.
+            case 52: case 116: case 694: case 726: // lbarx, lharx, stbcx., sthcx.
+            case 122: case 378: case 506: // popcntb, popcntw, popcntd.
+            case 154: case 186: case 508: // prtyw, prtyd, cmpb.
+            case 532: case 660: // ldbrx, stdbrx.
+            case 538: case 570: // cnttzw, cnttzd.
+            case 265: case 267: case 777: case 779: // modud, moduw, modsd, modsw.
+            case 155: case 187: case 219: // brw, brd, brh.
+            case 224: case 576: // cmpeqb, mcrxrx.
+            case 384: case 416: case 448: case 480: // setbc, setbcr, setnbc, setnbcr.
+                return true;
+            default:
+                return false;
+            }
+        case 59:
+        case 63:
+            if (xo & 0x10) // A-form arithmetic: the upper bits are a register.
+                return false;
+            switch (xo) {
+            case 8: // fcpsgn.
+            case 142: case 143: case 942: case 943: // fctiwu, fctiwuz, fctidu, fctiduz.
+            case 392: case 424: case 456: case 488: // frin, friz, frip, frim.
+            case 974: // fcfidu, fcfidus.
+                return true;
+            case 846: // fcfids; fcfid under opcode 63 is in the base set.
+                return opcode == 59;
+            default:
+                return false;
+            }
+        default:
+            return false;
+        }
+    }
+
+    // Set by Options::validatePPC64ISALevel() on a CPU, or under a
+    // maximumPPC64ISALevel, older than POWER8: emitting an instruction that
+    // such a CPU does not have then crashes here instead of at run time,
+    // and does so even where the hardware could have executed it.
+    JS_EXPORT_PRIVATE static bool s_rejectNewerThanISA2_01;
+
 protected:
     void insn(uint32_t instruction)
     {
+        if (s_rejectNewerThanISA2_01) [[unlikely]]
+            RELEASE_ASSERT(!isNewerThanISA2_01(instruction));
         m_buffer.putInt(instruction);
     }
 

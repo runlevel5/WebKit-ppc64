@@ -93,15 +93,17 @@ PPC64_EXTRA_GPRS = [
 # makes callee-saved and which nothing saves on the way into JS (vmEntry's
 # pushCalleeSaves covers r24-r30, and JSC's FP callee saves are f14-f21), so
 # every FP temporary -- e.g. the one ppc64_truncd2i needs -- clobbered a
-# C caller's f24.  f9-f12 are volatile and, with ft0-ft7 on f1-f8, named by
-# nothing else.  They are ELFv2 argument registers 9-12, but a Tmp lives only
+# C caller's f24.  f9-f11 are volatile and, with ft0-ft7 on f1-f8, named by
+# nothing else.  They are ELFv2 argument registers 9-11, but a Tmp lives only
 # inside the expansion of one offlineasm instruction, never across a call.
+# f12 and f13 stand in for v1 and v0 where there is no VSX.
 PPC64_EXTRA_FPRS = [
     SpecialRegister.new("f9"),
     SpecialRegister.new("f10"),
     SpecialRegister.new("f11"),
-    SpecialRegister.new("f12"),
 ]
+# f12 and f13 are left out: on CPUs without VSX they stand in for v1 and v0
+# (see ppc64VectorStandIn).
 
 # -------------------------------------------------------------------------
 # PtrTag-based call classification.
@@ -938,6 +940,7 @@ class Sequence
         # Generic RISC pass: lower Address operands in arith/test/branch/compare ops by
         # loading them into Tmps.  Covers cases not handled by the PPC-specific pass.
         result = riscLowerMisplacedAddresses(result)
+        result = ppc64AddPre207Temporaries(result)
         result = assignRegistersToTemporaries(result, :gpr, PPC64_EXTRA_GPRS)
         result = assignRegistersToTemporaries(result, :fpr, PPC64_EXTRA_FPRS)
         # Last, so that no later pass rebuilds the marked load-reserve nodes.
@@ -1008,10 +1011,37 @@ end
 # -------------------------------------------------------------------------
 PPC64_NEAR_BRANCH_BYTES = 24 * 1024
 PPC64_MAX_BYTES_PER_INSTRUCTION = 64
+PPC64_MAX_BYTES_PER_LONG_INSTRUCTION = 256
+
+# The instructions whose sequence for CPUs older than POWER8 needs more
+# registers than r0 and f0 get temporaries appended to their operands.
+PPC64_PRE207_GPR_TEMPORARIES = { "cq2d" => 1, "cq2f" => 1, "cq2fs" => 1, "loadqle" => 1, "loaddle" => 1, "storeqle" => 1, "storedle" => 1,
+    "loadlinkacqb" => 2, "loadlinkacqh" => 2, "storecondrelb" => 2, "storecondrelh" => 2,
+    "andf" => 1, "andd" => 1, "orf" => 1, "ord" => 1 }
+PPC64_PRE207_FPR_TEMPORARIES = {
+    "ceilf" => 2, "ceild" => 2, "floorf" => 2, "floord" => 2,
+    "truncatef" => 2, "truncated" => 2, "roundf" => 2, "roundd" => 2,
+}
+# These carry both instruction sequences and one of them is long.
+PPC64_LONG_INSTRUCTIONS = PPC64_PRE207_GPR_TEMPORARIES.keys + PPC64_PRE207_FPR_TEMPORARIES.keys + ["truncatef2q", "truncated2q"]
+
+def ppc64AddPre207Temporaries(list)
+    list.map {
+        | node |
+        if node.is_a?(Instruction) && (PPC64_PRE207_GPR_TEMPORARIES[node.opcode] || PPC64_PRE207_FPR_TEMPORARIES[node.opcode])
+            extra = []
+            (PPC64_PRE207_GPR_TEMPORARIES[node.opcode] || 0).times { extra << Tmp.new(node.codeOrigin, :gpr) }
+            (PPC64_PRE207_FPR_TEMPORARIES[node.opcode] || 0).times { extra << Tmp.new(node.codeOrigin, :fpr) }
+            Instruction.new(node.codeOrigin, node.opcode, node.operands + extra, node.annotation)
+        else
+            node
+        end
+    }
+end
 
 def ppc64NodeByteBound(node)
     if node.is_a?(Instruction)
-        PPC64_MAX_BYTES_PER_INSTRUCTION
+        PPC64_LONG_INSTRUCTIONS.include?(node.opcode) ? PPC64_MAX_BYTES_PER_LONG_INSTRUCTION : PPC64_MAX_BYTES_PER_INSTRUCTION
     elsif node.is_a?(Label)
         align = node.instance_variable_get(:@alignTo)
         (align && align.respond_to?(:value)) ? [align.value.to_i, 16].max : 16
@@ -1231,6 +1261,198 @@ def ppc64EmitFPBranch(cond, ops)
 end
 
 # -------------------------------------------------------------------------
+# Run-time instruction selection.
+#
+# The interpreters are assembled once but run on anything from a PowerPC 970
+# up. Where the POWER8 (ISA 2.07) form of an instruction is worth having, both
+# forms are emitted and one conditional branch picks between them on CR2[EQ],
+# which is set when the CPU has ISA 2.07. CR2 is a nonvolatile field that
+# nothing else in JSC's generated code touches (the JITs and these backends
+# use CR0, and CR6 for vector compares); pushCalleeSaves establishes it at
+# every entry from C with ppc64setcpufeatures and popCalleeSaves restores the
+# caller's.
+#
+# The older forms move bits between the register files through the doubleword
+# at -8(sp), in the ELFv2 protected zone, as some lowerings already did.
+# -------------------------------------------------------------------------
+$ppc64SelectCounter = 0
+
+def ppc64SelectPOWER8(fast, slow)
+    $ppc64SelectCounter += 1
+    n = $ppc64SelectCounter
+    $asm.puts "bne 2, .Lppc64pre207_#{n}"
+    fast.call
+    $asm.puts "b .Lppc64selected_#{n}"
+    $asm.puts ".Lppc64pre207_#{n}:"
+    slow.call
+    $asm.puts ".Lppc64selected_#{n}:"
+end
+
+def ppc64UniqueLabel(stem)
+    $ppc64SelectCounter += 1
+    ".Lppc64#{stem}_#{$ppc64SelectCounter}"
+end
+
+# Offsets of the halves of the doubleword at -8(sp).
+def ppc64SlotLowWord
+    $currentSettings["BIG_ENDIAN"] ? "-4(1)" : "-8(1)"
+end
+
+def ppc64SlotHighWord
+    $currentSettings["BIG_ENDIAN"] ? "-8(1)" : "-4(1)"
+end
+
+# The register holding a reversed access's address for the two-word forms,
+# which index it with r0: the base itself, or the temporary when the address
+# has a displacement.
+def ppc64Pre207ReversedBase(addr, tmp, codeOriginString)
+    raise "ppc64: reversed access needs an Address operand at #{codeOriginString}" unless addr.is_a?(Address)
+    base = addr.base.ppc64Operand
+    off = addr.offset.value
+    return base if off == 0
+    ppc64ValidateDOffset(off, codeOriginString)
+    $asm.puts "addi #{tmp}, #{base}, #{off}"
+    tmp
+end
+
+# r0 = the bit offset of a byte or aligned halfword within its word: the byte
+# offset times eight on little-endian, counted from the other end on
+# big-endian.
+def ppc64EmitNarrowFieldShift(addr, width)
+    $asm.puts "rlwinm 0, #{addr}, 3, 27, 28"
+    $asm.puts "xori 0, 0, #{32 - width}" if $currentSettings["BIG_ENDIAN"]
+end
+
+# The 16-byte moves (pushv, popv, loadv, storev) use VSX. A CPU without it
+# runs no wasm SIMD, so every value they carry is a scalar in the eight bytes
+# at the lower address, which is the doubleword an FPR reads and writes. An
+# FPR operand therefore moves just that doubleword, and v0 and v1, which
+# IPInt also uses to carry scalars (locals, globals, select), are stood in
+# for by f13 and f12, which nothing else names. The other vector registers
+# only appear in SIMD opcodes, which such a CPU never reaches.
+def ppc64EmitVectorStandIn(insn, operand, memory)
+    fpr = if operand.is_a?(VecRegisterID)
+        { "32" => "13", "33" => "12" }[operand.ppc64Operand]
+    else
+        operand.ppc64Operand
+    end
+    if fpr
+        $asm.puts "#{insn} #{fpr}, #{memory}"
+    else
+        $asm.puts "trap"
+    end
+end
+
+# FPR <- GPR and GPR <- FPR bit moves (mtvsrd / mfvsrd).
+def ppc64EmitMoveToFPR(fpr, gpr)
+    ppc64SelectPOWER8(
+        lambda { $asm.puts "mtvsrd #{fpr}, #{gpr}" },
+        lambda {
+            $asm.puts "std #{gpr}, -8(1)"
+            $asm.puts "lfd #{fpr}, -8(1)"
+        })
+end
+
+def ppc64EmitMoveToGPR(gpr, fpr)
+    ppc64SelectPOWER8(
+        lambda { $asm.puts "mfvsrd #{gpr}, #{fpr}" },
+        lambda {
+            $asm.puts "stfd #{fpr}, -8(1)"
+            $asm.puts "ld #{gpr}, -8(1)"
+        })
+end
+
+# The low word of the FPR's doubleword, zero-extended (mfvsrwz).
+def ppc64EmitMoveLowWordToGPR(gpr, fpr)
+    ppc64SelectPOWER8(
+        lambda { $asm.puts "mfvsrwz #{gpr}, #{fpr}" },
+        lambda {
+            $asm.puts "stfd #{fpr}, -8(1)"
+            $asm.puts "lwz #{gpr}, #{ppc64SlotLowWord}"
+        })
+end
+
+# Rounding to an integral value without frim/frip/friz (ISA 2.02) or xsrdpic
+# (VSX). A value of magnitude 2^52 or more is already integral and a NaN is
+# only quieted. Below that, fctidz/fcfid truncate exactly, floor and ceil
+# step by one when the truncation went the wrong way, and round-to-even adds
+# and subtracts 2^52 in the default rounding mode. The sign, including that
+# of a zero result, is the operand's. Clobbers r0, f0, CR0 and the two FPR
+# temporaries.
+def ppc64EmitRoundPre207(kind, src, dst, fa, fb)
+    done = ppc64UniqueLabel("rounded")
+    small = ppc64UniqueLabel("roundsmall")
+    negative = ppc64UniqueLabel("roundneg")
+    $asm.puts "li 0, 0x433"
+    $asm.puts "sldi 0, 0, 52"
+    $asm.puts "std 0, -8(1)"
+    $asm.puts "lfd #{fa}, -8(1)"                 # 2^52
+    $asm.puts "fabs 0, #{src}"
+    $asm.puts "fcmpu 0, 0, #{fa}"
+    $asm.puts "blt #{small}"
+    $asm.puts "fadd 0, #{src}, #{src}"           # a NaN, quieted (unused otherwise)
+    $asm.puts "fcmpu 0, #{src}, #{src}"
+    $asm.puts "bnu $+12"
+    $asm.puts "fmr #{dst}, 0"
+    $asm.puts "b #{done}"
+    $asm.puts "fmr #{dst}, #{src}"
+    $asm.puts "b #{done}"
+    $asm.puts "#{small}:"
+    $asm.puts "stfd #{src}, -8(1)"               # the operand's sign, as an integer
+    if kind == :nearest
+        $asm.puts "ld 0, -8(1)"
+        $asm.puts "cmpdi 0, 0"
+        $asm.puts "blt #{negative}"
+        $asm.puts "fadd 0, #{src}, #{fa}"
+        $asm.puts "fsub 0, 0, #{fa}"
+        $asm.puts "fabs #{dst}, 0"
+        $asm.puts "b #{done}"
+        $asm.puts "#{negative}:"
+        $asm.puts "fsub 0, #{src}, #{fa}"
+        $asm.puts "fadd 0, 0, #{fa}"
+        $asm.puts "fnabs #{dst}, 0"
+    else
+        $asm.puts "fctidz 0, #{src}"
+        $asm.puts "fcfid 0, 0"
+        unless kind == :trunc
+            $asm.puts "li 0, 1"
+            $asm.puts "std 0, -16(1)"
+            $asm.puts "lfd #{fb}, -16(1)"
+            $asm.puts "fcfid #{fb}, #{fb}"       # 1.0
+            $asm.puts "fcmpu 0, 0, #{src}"
+            if kind == :floor
+                $asm.puts "ble $+8"
+                $asm.puts "fsub 0, 0, #{fb}"
+            else
+                $asm.puts "bge $+8"
+                $asm.puts "fadd 0, 0, #{fb}"
+            end
+        end
+        $asm.puts "ld 0, -8(1)"
+        $asm.puts "cmpdi 0, 0"
+        $asm.puts "fabs #{dst}, 0"
+        $asm.puts "bge $+8"
+        $asm.puts "fnabs #{dst}, 0"
+    end
+    $asm.puts "#{done}:"
+end
+
+# r0 = value, with its low 11 bits folded into bit 11 when it needs more than
+# 53 significant bits, so that fcfid is exact and frsp rounds once (as GCC does
+# for -mcpu=970). value may be r0. Clobbers tmp and CR0.
+def ppc64EmitStickyFold(value, tmp)
+    $asm.puts "sradi #{tmp}, #{value}, 53"
+    $asm.puts "addi #{tmp}, #{tmp}, 1"
+    $asm.puts "cmpldi #{tmp}, 1"
+    $asm.puts "mr 0, #{value}" unless value == "0"
+    $asm.puts "ble $+20"
+    $asm.puts "rldicl #{tmp}, 0, 0, 53"
+    $asm.puts "addi #{tmp}, #{tmp}, 2047"
+    $asm.puts "or 0, 0, #{tmp}"
+    $asm.puts "rldicr 0, 0, 0, 52"
+end
+
+# -------------------------------------------------------------------------
 # Helpers: materialise a CR0 bit as 0/1 in dst with isel (ISA 2.03, in the
 # POWER8 baseline), which reads the bit directly; mfcr is microcoded. isel's
 # RA field of 0 is a literal zero, so "bit ? 0 : 1" needs no zero register,
@@ -1239,14 +1461,30 @@ end
 # EQ=2, SO/FU=3.
 # -------------------------------------------------------------------------
 def ppc64EmitSetIfCR0Bit(dst, bit)
-    $asm.puts "li 0, 0"
-    $asm.puts "li #{dst}, 1"
-    $asm.puts "isel #{dst}, #{dst}, 0, #{bit}"
+    ppc64SelectPOWER8(
+        lambda {
+            $asm.puts "li 0, 0"
+            $asm.puts "li #{dst}, 1"
+            $asm.puts "isel #{dst}, #{dst}, 0, #{bit}"
+        },
+        lambda {
+            $asm.puts "li #{dst}, 1"
+            $asm.puts "bc 12, #{bit}, $+8"
+            $asm.puts "li #{dst}, 0"
+        })
 end
 
 def ppc64EmitSetUnlessCR0Bit(dst, bit)
-    $asm.puts "li #{dst}, 1"
-    $asm.puts "isel #{dst}, 0, #{dst}, #{bit}"
+    ppc64SelectPOWER8(
+        lambda {
+            $asm.puts "li #{dst}, 1"
+            $asm.puts "isel #{dst}, 0, #{dst}, #{bit}"
+        },
+        lambda {
+            $asm.puts "li #{dst}, 0"
+            $asm.puts "bc 12, #{bit}, $+8"
+            $asm.puts "li #{dst}, 1"
+        })
 end
 
 # -------------------------------------------------------------------------
@@ -1837,29 +2075,27 @@ class Instruction
             src = operands[0].ppc64Operand
             $asm.puts "cntlzw #{dst}, #{src}"
 
-        # cnttzd/cnttzw are POWER9 (ISA 3.0), outside the POWER8 baseline.
-        # Use the isolate-lowest-bit identity instead:
-        # cnttz(x) = popcnt((x & -x) - 1); for x == 0 the mask becomes all
-        # ones and popcnt yields the type width.
-        # r0 is a pure data scratch here (never a load/store base).
-        # The decrement must be addic, NOT addi: addi reads RA = r0 as a
-        # literal zero (the (RA|0) rule); addic reads the register.
+        # cnttzd/cnttzw are POWER9 (ISA 3.0) and popcnt is ISA 2.06, so count
+        # the leading zeros of the mask of bits below the lowest set one:
+        # cnttz(x) = width - cntlz(~x & (x - 1)); for x == 0 the mask is all
+        # ones and the result is the type width. cntlzw looks at the low word
+        # only. r0 is a pure data scratch here; src is never r0, so addi
+        # reads it as a register.
         when "countTrailingZerosp", "countTrailingZerosq", "tzcntq"
             dst = operands[1].ppc64Operand
             src = operands[0].ppc64Operand
-            $asm.puts "neg 0, #{src}"
-            $asm.puts "and 0, 0, #{src}"
-            $asm.puts "addic 0, 0, -1"
-            $asm.puts "popcntd #{dst}, 0"
+            $asm.puts "addi 0, #{src}, -1"
+            $asm.puts "andc 0, 0, #{src}"
+            $asm.puts "cntlzd #{dst}, 0"
+            $asm.puts "subfic #{dst}, #{dst}, 64"
 
         when "countTrailingZerosi", "tzcnti"
             dst = operands[1].ppc64Operand
             src = operands[0].ppc64Operand
-            $asm.puts "neg 0, #{src}"
-            $asm.puts "and 0, 0, #{src}"
-            $asm.puts "addic 0, 0, -1"
-            $asm.puts "rldicl 0, 0, 0, 32"
-            $asm.puts "popcntw #{dst}, 0"
+            $asm.puts "addi 0, #{src}, -1"
+            $asm.puts "andc 0, 0, #{src}"
+            $asm.puts "cntlzw #{dst}, 0"
+            $asm.puts "subfic #{dst}, #{dst}, 32"
 
         # ------------------------------------------------------------------
         # Zero/Sign extension
@@ -1982,7 +2218,7 @@ class Instruction
         when "loadhle", "loadhsile", "loadhsqle", "loadile", "loadisle", "loadqle"
             addr = operands[0]
             dst  = operands[1].ppc64Operand
-            unless $currentSettings["BIG_ENDIAN"]
+            if !$currentSettings["BIG_ENDIAN"]
                 plain = { "loadhle" => "lhz", "loadhsile" => "lha", "loadhsqle" => "lha", "loadile" => "lwz", "loadisle" => "lwa", "loadqle" => "ld" }[opcode]
                 if plain == "lwa" or plain == "ld"
                     ppc64ValidateDSOffset(addr.offset.value, codeOriginString)
@@ -1991,6 +2227,19 @@ class Instruction
                 end
                 $asm.puts "#{plain} #{dst}, #{addr.ppc64Operand}"
                 ppc64ZeroExtend32(dst) if opcode == "loadhsile"
+            elsif opcode == "loadqle"
+                # ldbrx is ISA 2.06; before it, two reversed words (r0 is the
+                # index and then the value of the high one).
+                tmp = operands[2].ppc64Operand
+                ppc64SelectPOWER8(
+                    lambda { $asm.puts "ldbrx #{dst}, #{ppc64XFormAddress(addr, codeOriginString)}" },
+                    lambda {
+                        base = ppc64Pre207ReversedBase(addr, tmp, codeOriginString)
+                        $asm.puts "li 0, 4"
+                        $asm.puts "lwbrx 0, #{base}, 0"
+                        $asm.puts "lwbrx #{dst}, 0, #{base}"
+                        $asm.puts "rldimi #{dst}, 0, 32, 0"
+                    })
             else
                 ea = ppc64XFormAddress(addr, codeOriginString)
                 case opcode
@@ -2008,17 +2257,31 @@ class Instruction
                 when "loadisle"
                     $asm.puts "lwbrx #{dst}, #{ea}"
                     $asm.puts "extsw #{dst}, #{dst}"
-                when "loadqle"
-                    $asm.puts "ldbrx #{dst}, #{ea}"
                 end
             end
 
         when "loadfle", "loaddle"
             addr = operands[0]
             dst  = operands[1].ppc64Operand
-            unless $currentSettings["BIG_ENDIAN"]
+            if !$currentSettings["BIG_ENDIAN"]
                 ppc64ValidateDOffset(addr.offset.value, codeOriginString)
                 $asm.puts "#{opcode == "loadfle" ? "lfs" : "lfd"} #{dst}, #{addr.ppc64Operand}"
+            elsif opcode == "loaddle"
+                tmp = operands[2].ppc64Operand
+                ppc64SelectPOWER8(
+                    lambda {
+                        $asm.puts "ldbrx 0, #{ppc64XFormAddress(addr, codeOriginString)}"
+                        $asm.puts "mtvsrd #{dst}, 0"
+                    },
+                    lambda {
+                        base = ppc64Pre207ReversedBase(addr, tmp, codeOriginString)
+                        $asm.puts "li 0, 4"
+                        $asm.puts "lwbrx 0, #{base}, 0"
+                        $asm.puts "stw 0, #{ppc64SlotHighWord}"
+                        $asm.puts "lwbrx 0, 0, #{base}"
+                        $asm.puts "stw 0, #{ppc64SlotLowWord}"
+                        $asm.puts "lfd #{dst}, -8(1)"
+                    })
             else
                 ea = ppc64XFormAddress(addr, codeOriginString)
                 if opcode == "loadfle"
@@ -2026,15 +2289,14 @@ class Instruction
                     $asm.puts "stw 0, -8(1)"
                     $asm.puts "lfs #{dst}, -8(1)"
                 else
-                    $asm.puts "ldbrx 0, #{ea}"
-                    $asm.puts "mtvsrd #{dst}, 0"
+                    raise "unreachable"
                 end
             end
 
         when "storehle", "storeile", "storeqle"
             src  = operands[0].ppc64Operand
             addr = operands[1]
-            unless $currentSettings["BIG_ENDIAN"]
+            if !$currentSettings["BIG_ENDIAN"]
                 plain = { "storehle" => "sth", "storeile" => "stw", "storeqle" => "std" }[opcode]
                 if plain == "std"
                     ppc64ValidateDSOffset(addr.offset.value, codeOriginString)
@@ -2042,9 +2304,24 @@ class Instruction
                     ppc64ValidateDOffset(addr.offset.value, codeOriginString)
                 end
                 $asm.puts "#{plain} #{src}, #{addr.ppc64Operand}"
+            elsif opcode == "storeqle"
+                tmp = operands[2].ppc64Operand
+                ppc64SelectPOWER8(
+                    lambda { $asm.puts "stdbrx #{src}, #{ppc64XFormAddress(addr, codeOriginString)}" },
+                    lambda {
+                        # The word at the higher address goes first, so that
+                        # a store running off the end of a memory faults
+                        # before it has written anything.
+                        base = ppc64Pre207ReversedBase(addr, tmp, codeOriginString)
+                        $asm.puts "srdi 0, #{src}, 32"
+                        $asm.puts "addi #{tmp}, #{base}, 4"
+                        $asm.puts "stwbrx 0, 0, #{tmp}"
+                        $asm.puts "addi #{tmp}, #{tmp}, -4" if base == tmp
+                        $asm.puts "stwbrx #{src}, 0, #{base}"
+                    })
             else
                 ea = ppc64XFormAddress(addr, codeOriginString)
-                $asm.puts "#{ { "storehle" => "sthbrx", "storeile" => "stwbrx", "storeqle" => "stdbrx" }[opcode] } #{src}, #{ea}"
+                $asm.puts "#{ { "storehle" => "sthbrx", "storeile" => "stwbrx" }[opcode] } #{src}, #{ea}"
             end
 
         when "storefle", "storedle"
@@ -2062,8 +2339,20 @@ class Instruction
                     $asm.puts "lwz 0, -8(1)"
                     $asm.puts "stwbrx 0, 0, #{base}"
                 else
-                    $asm.puts "mfvsrd 0, #{src}"
-                    $asm.puts "stdbrx 0, 0, #{base}"
+                    tmp = operands[2].ppc64Operand
+                    ppc64SelectPOWER8(
+                        lambda {
+                            $asm.puts "mfvsrd 0, #{src}"
+                            $asm.puts "stdbrx 0, 0, #{base}"
+                        },
+                        lambda {
+                            $asm.puts "stfd #{src}, -8(1)"
+                            $asm.puts "lwz 0, #{ppc64SlotHighWord}"
+                            $asm.puts "addi #{tmp}, #{base}, 4"
+                            $asm.puts "stwbrx 0, 0, #{tmp}"
+                            $asm.puts "lwz 0, #{ppc64SlotLowWord}"
+                            $asm.puts "stwbrx 0, 0, #{base}"
+                        })
                 end
             end
 
@@ -2071,9 +2360,26 @@ class Instruction
         when "bswaph", "bswapi", "bswapq"
             reg = operands[0].ppc64Operand
             store, load = { "bswaph" => ["sthbrx", "lhz"], "bswapi" => ["stwbrx", "lwz"], "bswapq" => ["stdbrx", "ld"] }[opcode]
-            $asm.puts "addi 0, 1, -8"
-            $asm.puts "#{store} #{reg}, 0, 0"
-            $asm.puts "#{load} #{reg}, -8(1)"
+            if opcode == "bswapq"
+                ppc64SelectPOWER8(
+                    lambda {
+                        $asm.puts "addi 0, 1, -8"
+                        $asm.puts "stdbrx #{reg}, 0, 0"
+                    },
+                    lambda {
+                        # The reversed low word becomes the high one.
+                        $asm.puts "addi 0, 1, #{$currentSettings["BIG_ENDIAN"] ? -8 : -4}"
+                        $asm.puts "stwbrx #{reg}, 0, 0"
+                        $asm.puts "srdi #{reg}, #{reg}, 32"
+                        $asm.puts "addi 0, 1, #{$currentSettings["BIG_ENDIAN"] ? -4 : -8}"
+                        $asm.puts "stwbrx #{reg}, 0, 0"
+                    })
+                $asm.puts "ld #{reg}, -8(1)"
+            else
+                $asm.puts "addi 0, 1, -8"
+                $asm.puts "#{store} #{reg}, 0, 0"
+                $asm.puts "#{load} #{reg}, -8(1)"
+            end
 
         # ------------------------------------------------------------------
         # Stores
@@ -2153,7 +2459,27 @@ class Instruction
             # ARM64's ldaxr{b,h} Wt writes — the callers compare the result
             # against a 64-bit `expected` with bqneq, so this matters.
             $asm.puts "sync" unless instance_variable_get(:@ppc64LeadingSyncHoisted) # order prior stores (RCsc)
-            $asm.puts "#{larx} #{dst}, 0, #{addr}"
+            if opcode == "loadlinkacqb" || opcode == "loadlinkacqh"
+                # lbarx/lharx are ISA 2.06. Before it, reserve the aligned word
+                # that holds the field and extract the field; the word waits
+                # at -24(sp) for the store-conditional (an ordinary store does
+                # not give up a reservation). The halfword must be aligned.
+                width = opcode == "loadlinkacqb" ? 8 : 16
+                word = operands[2].ppc64Operand
+                aligned = operands[3].ppc64Operand
+                ppc64SelectPOWER8(
+                    lambda { $asm.puts "#{larx} #{dst}, 0, #{addr}" },
+                    lambda {
+                        $asm.puts "rldicr #{aligned}, #{addr}, 0, 61"
+                        $asm.puts "lwarx #{word}, 0, #{aligned}"
+                        $asm.puts "std #{word}, -24(1)"
+                        ppc64EmitNarrowFieldShift(addr, width)
+                        $asm.puts "srw #{dst}, #{word}, 0"
+                        $asm.puts "rlwinm #{dst}, #{dst}, 0, #{32 - width}, 31"
+                    })
+            else
+                $asm.puts "#{larx} #{dst}, 0, #{addr}"
+            end
             $asm.puts "lwsync"                            # acquire
 
         when "storecondrelb", "storecondrelh", "storecondreli", "storecondrelq"
@@ -2167,7 +2493,32 @@ class Instruction
                    else                      "stdcx."
                    end
             $asm.puts "lwsync"                            # release
-            $asm.puts "#{stcx} #{src}, 0, #{addr}"
+            if opcode == "storecondrelb" || opcode == "storecondrelh"
+                # The counterpart of the narrow load-reserve above: put the
+                # field into the reserved word and store that. dst holds the
+                # field's mask until it receives the status.
+                width = opcode == "storecondrelb" ? 8 : 16
+                word = operands[3].ppc64Operand
+                shifted = operands[4].ppc64Operand
+                raise "ppc64: #{opcode} needs distinct status and value registers at #{codeOriginString}" if dst == src
+                ppc64SelectPOWER8(
+                    lambda { $asm.puts "#{stcx} #{src}, 0, #{addr}" },
+                    lambda {
+                        ppc64EmitNarrowFieldShift(addr, width)
+                        $asm.puts "li #{dst}, -1"
+                        $asm.puts "rldicl #{dst}, #{dst}, 0, #{64 - width}"
+                        $asm.puts "slw #{dst}, #{dst}, 0"
+                        $asm.puts "ld #{word}, -24(1)"
+                        $asm.puts "andc #{word}, #{word}, #{dst}"
+                        $asm.puts "slw #{shifted}, #{src}, 0"
+                        $asm.puts "and #{shifted}, #{shifted}, #{dst}"
+                        $asm.puts "or #{word}, #{word}, #{shifted}"
+                        $asm.puts "rldicr #{shifted}, #{addr}, 0, 61"
+                        $asm.puts "stwcx. #{word}, 0, #{shifted}"
+                    })
+            else
+                $asm.puts "#{stcx} #{src}, 0, #{addr}"
+            end
             # st*cx. sets CR0[EQ] on success; the offlineasm contract is 0 on
             # success. li does not touch CR0, and isel reads the bit directly
             # (mfcr is microcoded).
@@ -2343,13 +2694,17 @@ class Instruction
             operands.each { | op |
                 raise "ppc64: pushv expects an FPR/vector register, got #{op.class} #{op.respond_to?(:name) ? op.name : op.inspect} at #{codeOriginString}" unless op.is_a?(FPRegisterID) or op.is_a?(VecRegisterID) or op.is_a?(SpecialRegister)
                 $asm.puts "addi 1, 1, -16"
-                $asm.puts "stxvd2x #{op.ppc64Operand}, 0, 1"
+                ppc64SelectPOWER8(
+                    lambda { $asm.puts "stxvd2x #{op.ppc64Operand}, 0, 1" },
+                    lambda { ppc64EmitVectorStandIn("stfd", op, "0(1)") })
             }
 
         when "popv"
             operands.each { | op |
                 raise "ppc64: popv expects an FPR/vector register, got #{op.class} #{op.respond_to?(:name) ? op.name : op.inspect} at #{codeOriginString}" unless op.is_a?(FPRegisterID) or op.is_a?(VecRegisterID) or op.is_a?(SpecialRegister)
-                $asm.puts "lxvd2x #{op.ppc64Operand}, 0, 1"
+                ppc64SelectPOWER8(
+                    lambda { $asm.puts "lxvd2x #{op.ppc64Operand}, 0, 1" },
+                    lambda { ppc64EmitVectorStandIn("lfd", op, "0(1)") })
                 $asm.puts "addi 1, 1, 16"
             }
 
@@ -2374,7 +2729,9 @@ class Instruction
             unless addr.is_a?(Address) && addr.offset.value == 0
                 raise "ppc64: #{opcode} address must be lowered to [reg] first, got #{addr.class} at #{codeOriginString}"
             end
-            $asm.puts "#{isLoad ? 'lxvd2x' : 'stxvd2x'} #{reg.ppc64Operand}, 0, #{addr.base.ppc64Operand}"
+            ppc64SelectPOWER8(
+                lambda { $asm.puts "#{isLoad ? 'lxvd2x' : 'stxvd2x'} #{reg.ppc64Operand}, 0, #{addr.base.ppc64Operand}" },
+                lambda { ppc64EmitVectorStandIn(isLoad ? "lfd" : "stfd", reg, "0(#{addr.base.ppc64Operand})") })
 
         # ------------------------------------------------------------------
         # Control flow
@@ -2482,6 +2839,22 @@ class Instruction
         # leaves the return-address stack alone. (addpcis would do it in one
         # instruction, but needs ISA 3.0 and offlineasm is built for POWER8.)
         # ------------------------------------------------------------------
+        # ppc64setcpufeatures flag: keep the caller's CR at 8(sp) and set
+        # CR2[EQ] when the CPU has ISA 2.07, from the byte LLInt::initialize
+        # filled in (non-zero on older CPUs). r11 and r12 are free at entry.
+        when "ppc64setcpufeatures"
+            lbl = operands[0].asmLabel
+            $asm.puts "mfcr 11"
+            $asm.puts "std 11, 8(1)"
+            $asm.puts "mflr 11"
+            $asm.puts "bcl 20, 31, 1f"
+            $asm.puts "1:"
+            $asm.puts "mflr 12"
+            $asm.puts "mtlr 11"
+            $asm.puts "addis 12, 12, (#{lbl} - 1b)@ha"
+            $asm.puts "lbz 12, (#{lbl} - 1b)@l(12)"
+            $asm.puts "cmpwi 2, 12, 0"
+
         when "pcrtoaddr"
             lbl  = operands[0].asmLabel
             dest = operands[1].ppc64Operand
@@ -2764,7 +3137,7 @@ class Instruction
         # what MacroAssemblerPPC64::addFloat & co. emit too.
         #
         # f0 is reserved as the backend's FP scratch: no offlineasm FPR
-        # maps to it (ft0-ft7 are f1-f8, csfr0-7 f14-f21, Tmps f9-f12) and
+        # maps to it (ft0-ft7 are f1-f8, csfr0-7 f14-f21, Tmps f9-f11) and
         # it is volatile in ELFv2.
         # ------------------------------------------------------------------
         when "addf", "addd"
@@ -2842,8 +3215,21 @@ class Instruction
         when "andf", "andd", "orf", "ord"
             dst = operands[1].ppc64Operand
             src = operands[0].ppc64Operand
-            ins = opcode.start_with?("and") ? "xxland" : "xxlor"
-            $asm.puts "#{ins} #{dst}, #{dst}, #{src}"
+            tmp = operands[2].ppc64Operand
+            ins = opcode.start_with?("and") ? "and" : "or"
+            ppc64SelectPOWER8(
+                lambda { $asm.puts "xxl#{ins} #{dst}, #{dst}, #{src}" },
+                lambda {
+                    # Without VSX the two images meet in GPRs, by way of the
+                    # protected zone.
+                    $asm.puts "stfd #{src}, -8(1)"
+                    $asm.puts "stfd #{dst}, -16(1)"
+                    $asm.puts "ld 0, -8(1)"
+                    $asm.puts "ld #{tmp}, -16(1)"
+                    $asm.puts "#{ins} 0, 0, #{tmp}"
+                    $asm.puts "std 0, -8(1)"
+                    $asm.puts "lfd #{dst}, -8(1)"
+                })
 
         # double <-> float.  frsp rounds to single precision (the FPR keeps
         # the double-format image).  A float in an FPR already IS a double, so
@@ -2863,14 +3249,21 @@ class Instruction
         # per FPSCR[RN] -- round-to-nearest-even, which JSC never changes.
         # All four are exact for float inputs (an integer nearest a float is
         # itself a float).
-        when "ceilf", "ceild"
-            $asm.puts "frip #{operands[1].ppc64Operand}, #{operands[0].ppc64Operand}"
-        when "floorf", "floord"
-            $asm.puts "frim #{operands[1].ppc64Operand}, #{operands[0].ppc64Operand}"
-        when "truncatef", "truncated"
-            $asm.puts "friz #{operands[1].ppc64Operand}, #{operands[0].ppc64Operand}"
-        when "roundf", "roundd"
-            $asm.puts "xsrdpic #{operands[1].ppc64Operand}, #{operands[0].ppc64Operand}"
+        #
+        # ppc64AddPre207Temporaries appended two FPR temporaries for the
+        # sequence older CPUs use.
+        when "ceilf", "ceild", "floorf", "floord", "truncatef", "truncated", "roundf", "roundd"
+            src = operands[0].ppc64Operand
+            dst = operands[1].ppc64Operand
+            insn, kind = case opcode
+                         when "ceilf", "ceild" then ["frip", :ceil]
+                         when "floorf", "floord" then ["frim", :floor]
+                         when "truncatef", "truncated" then ["friz", :trunc]
+                         else ["xsrdpic", :nearest]
+                         end
+            ppc64SelectPOWER8(
+                lambda { $asm.puts "#{insn} #{dst}, #{src}" },
+                lambda { ppc64EmitRoundPre207(kind, src, dst, operands[2].ppc64Operand, operands[3].ppc64Operand) })
 
         # Raw bit moves between a GPR and a float (arm64 fmov Sd, Wn / Wd, Sn).
         # The FPR holds the double-format image, so these are conversions,
@@ -2884,14 +3277,29 @@ class Instruction
         when "fi2f"
             src = operands[0].ppc64Operand
             dst = operands[1].ppc64Operand
-            $asm.puts "sldi 0, #{src}, 32"
-            $asm.puts "mtvsrd #{dst}, 0"
-            $asm.puts "xscvspdpn #{dst}, #{dst}"
+            ppc64SelectPOWER8(
+                lambda {
+                    $asm.puts "sldi 0, #{src}, 32"
+                    $asm.puts "mtvsrd #{dst}, 0"
+                    $asm.puts "xscvspdpn #{dst}, #{dst}"
+                },
+                lambda {
+                    # lfs widens the single bit pattern, as xscvspdpn does.
+                    $asm.puts "stw #{src}, -8(1)"
+                    $asm.puts "lfs #{dst}, -8(1)"
+                })
         when "ff2i"
             src = operands[0].ppc64Operand
             dst = operands[1].ppc64Operand
-            $asm.puts "xscvdpspn 0, #{src}"
-            $asm.puts "mfvsrwz #{dst}, 0"
+            ppc64SelectPOWER8(
+                lambda {
+                    $asm.puts "xscvdpspn 0, #{src}"
+                    $asm.puts "mfvsrwz #{dst}, 0"
+                },
+                lambda {
+                    $asm.puts "stfs #{src}, -8(1)"
+                    $asm.puts "lwz #{dst}, -8(1)"
+                })
 
         # FP -> integer, truncating toward zero (arm64 fcvtz{u,s}).  Callers
         # range-check first (wasm trunc traps, trunc_sat saturates
@@ -2901,18 +3309,55 @@ class Instruction
         # mfvsrwz (zero-extending, 32-bit results) or mfvsrd (64-bit).
         # Float sources need nothing extra: the FPR already holds the double
         # image.
+        #
+        # Before ISA 2.06 there are only the signed conversions. An in-range
+        # uint32 converts exactly with the signed doubleword form; a uint64 of
+        # 2^63 or more is converted 2^63 lower and gets its top bit back.
         when "truncatef2i", "truncated2i"
-            $asm.puts "fctiwuz 0, #{operands[0].ppc64Operand}"
-            $asm.puts "mfvsrwz #{operands[1].ppc64Operand}, 0"
+            src = operands[0].ppc64Operand
+            dst = operands[1].ppc64Operand
+            ppc64SelectPOWER8(
+                lambda {
+                    $asm.puts "fctiwuz 0, #{src}"
+                    $asm.puts "mfvsrwz #{dst}, 0"
+                },
+                lambda {
+                    $asm.puts "fctidz 0, #{src}"
+                    $asm.puts "stfd 0, -8(1)"
+                    $asm.puts "lwz #{dst}, #{ppc64SlotLowWord}"
+                })
         when "truncatef2is"
             $asm.puts "fctiwz 0, #{operands[0].ppc64Operand}"
-            $asm.puts "mfvsrwz #{operands[1].ppc64Operand}, 0"
+            ppc64EmitMoveLowWordToGPR(operands[1].ppc64Operand, "0")
         when "truncatef2q", "truncated2q"
-            $asm.puts "fctiduz 0, #{operands[0].ppc64Operand}"
-            $asm.puts "mfvsrd #{operands[1].ppc64Operand}, 0"
+            src = operands[0].ppc64Operand
+            dst = operands[1].ppc64Operand
+            ppc64SelectPOWER8(
+                lambda {
+                    $asm.puts "fctiduz 0, #{src}"
+                    $asm.puts "mfvsrd #{dst}, 0"
+                },
+                lambda {
+                    $asm.puts "li 0, 0x43E"
+                    $asm.puts "sldi 0, 0, 52"
+                    $asm.puts "std 0, -8(1)"
+                    $asm.puts "lfd 0, -8(1)"            # 2^63
+                    $asm.puts "fcmpu 0, #{src}, 0"
+                    $asm.puts "li #{dst}, 0"
+                    $asm.puts "blt $+16"
+                    $asm.puts "fsub 0, #{src}, 0"
+                    $asm.puts "li #{dst}, 1"
+                    $asm.puts "b $+8"
+                    $asm.puts "fmr 0, #{src}"
+                    $asm.puts "fctidz 0, 0"
+                    $asm.puts "stfd 0, -8(1)"
+                    $asm.puts "sldi #{dst}, #{dst}, 63"
+                    $asm.puts "ld 0, -8(1)"
+                    $asm.puts "xor #{dst}, #{dst}, 0"
+                })
         when "truncatef2qs", "truncated2qs"
             $asm.puts "fctidz 0, #{operands[0].ppc64Operand}"
-            $asm.puts "mfvsrd #{operands[1].ppc64Operand}, 0"
+            ppc64EmitMoveToGPR(operands[1].ppc64Operand, "0")
 
         # Integer-to-float conversions.
         # Semantics per the ARM64 reference backend: the "s" suffix means
@@ -2925,46 +3370,99 @@ class Instruction
         # mtvsrwa (sign-extend word), mtvsrwz (zero-extend word) and mtvsrd
         # move GPR→VSR directly; FPR f_n aliases VSR n, so fcfid* can consume
         # the result in place.
-        when "ci2ds"
+        #
+        # Before ISA 2.06 the only conversion is fcfid (signed doubleword to
+        # double), with frsp to round to single: the word forms extend in r0
+        # first, an unsigned doubleword with its top bit set is halved (keeping
+        # a sticky bit) and the result doubled, and a doubleword headed for a
+        # float has its low bits folded so that only frsp rounds.
+        # ppc64AddPre207Temporaries appended a GPR temporary to cq2d, cq2f
+        # and cq2fs for that.
+        when "ci2ds", "ci2d", "ci2fs", "ci2f"
             src = operands[0].ppc64Operand
             dst = operands[1].ppc64Operand
-            $asm.puts "mtvsrwa #{dst}, #{src}"
-            $asm.puts "fcfid #{dst}, #{dst}"
-        when "ci2d"
-            src = operands[0].ppc64Operand
-            dst = operands[1].ppc64Operand
-            $asm.puts "mtvsrwz #{dst}, #{src}"
-            $asm.puts "fcfid #{dst}, #{dst}"
-        when "ci2fs"
-            src = operands[0].ppc64Operand
-            dst = operands[1].ppc64Operand
-            $asm.puts "mtvsrwa #{dst}, #{src}"
-            $asm.puts "fcfids #{dst}, #{dst}"
-        when "ci2f"
-            src = operands[0].ppc64Operand
-            dst = operands[1].ppc64Operand
-            $asm.puts "mtvsrwz #{dst}, #{src}"
-            $asm.puts "fcfids #{dst}, #{dst}"
+            signed = opcode.end_with?("s")
+            toFloat = opcode.start_with?("ci2f")
+            ppc64SelectPOWER8(
+                lambda {
+                    $asm.puts "#{signed ? "mtvsrwa" : "mtvsrwz"} #{dst}, #{src}"
+                    $asm.puts "#{toFloat ? "fcfids" : "fcfid"} #{dst}, #{dst}"
+                },
+                lambda {
+                    $asm.puts signed ? "extsw 0, #{src}" : "rldicl 0, #{src}, 0, 32"
+                    $asm.puts "std 0, -8(1)"
+                    $asm.puts "lfd #{dst}, -8(1)"
+                    $asm.puts "fcfid #{dst}, #{dst}"
+                    $asm.puts "frsp #{dst}, #{dst}" if toFloat
+                })
         when "cq2ds"
             src = operands[0].ppc64Operand
             dst = operands[1].ppc64Operand
-            $asm.puts "mtvsrd #{dst}, #{src}"
+            ppc64EmitMoveToFPR(dst, src)
             $asm.puts "fcfid #{dst}, #{dst}"
         when "cq2d"
             src = operands[0].ppc64Operand
             dst = operands[1].ppc64Operand
-            $asm.puts "mtvsrd #{dst}, #{src}"
-            $asm.puts "fcfidu #{dst}, #{dst}"
+            tmp = operands[2].ppc64Operand
+            ppc64SelectPOWER8(
+                lambda {
+                    $asm.puts "mtvsrd #{dst}, #{src}"
+                    $asm.puts "fcfidu #{dst}, #{dst}"
+                },
+                lambda {
+                    $asm.puts "rldicl 0, #{src}, 0, 63"
+                    $asm.puts "srdi #{tmp}, #{src}, 1"
+                    $asm.puts "or 0, 0, #{tmp}"
+                    $asm.puts "cmpdi #{src}, 0"
+                    $asm.puts "blt $+8"
+                    $asm.puts "mr 0, #{src}"
+                    $asm.puts "std 0, -8(1)"
+                    $asm.puts "lfd #{dst}, -8(1)"
+                    $asm.puts "fcfid #{dst}, #{dst}"
+                    $asm.puts "bge $+8"
+                    $asm.puts "fadd #{dst}, #{dst}, #{dst}"
+                })
         when "cq2fs"
             src = operands[0].ppc64Operand
             dst = operands[1].ppc64Operand
-            $asm.puts "mtvsrd #{dst}, #{src}"
-            $asm.puts "fcfids #{dst}, #{dst}"
+            tmp = operands[2].ppc64Operand
+            ppc64SelectPOWER8(
+                lambda {
+                    $asm.puts "mtvsrd #{dst}, #{src}"
+                    $asm.puts "fcfids #{dst}, #{dst}"
+                },
+                lambda {
+                    ppc64EmitStickyFold(src, tmp)
+                    $asm.puts "std 0, -8(1)"
+                    $asm.puts "lfd #{dst}, -8(1)"
+                    $asm.puts "fcfid #{dst}, #{dst}"
+                    $asm.puts "frsp #{dst}, #{dst}"
+                })
         when "cq2f"
             src = operands[0].ppc64Operand
             dst = operands[1].ppc64Operand
-            $asm.puts "mtvsrd #{dst}, #{src}"
-            $asm.puts "fcfidus #{dst}, #{dst}"
+            tmp = operands[2].ppc64Operand
+            ppc64SelectPOWER8(
+                lambda {
+                    $asm.puts "mtvsrd #{dst}, #{src}"
+                    $asm.puts "fcfidus #{dst}, #{dst}"
+                },
+                lambda {
+                    $asm.puts "rldicl 0, #{src}, 0, 63"
+                    $asm.puts "srdi #{tmp}, #{src}, 1"
+                    $asm.puts "or 0, 0, #{tmp}"
+                    $asm.puts "cmpdi #{src}, 0"
+                    $asm.puts "blt $+8"
+                    $asm.puts "mr 0, #{src}"
+                    ppc64EmitStickyFold("0", tmp)
+                    $asm.puts "std 0, -8(1)"
+                    $asm.puts "lfd #{dst}, -8(1)"
+                    $asm.puts "fcfid #{dst}, #{dst}"
+                    $asm.puts "frsp #{dst}, #{dst}"
+                    $asm.puts "cmpdi #{src}, 0"
+                    $asm.puts "bge $+8"
+                    $asm.puts "fadds #{dst}, #{dst}, #{dst}"
+                })
 
         when "cd2i", "truncated2is"
             # Rewritten to ppc64_truncd2i (with an FPR Tmp) by
@@ -2981,17 +3479,17 @@ class Instruction
             dst  = operands[1].ppc64Operand
             ftmp = operands[2].ppc64Operand
             $asm.puts "fctiwz #{ftmp}, #{src}"
-            $asm.puts "mfvsrwz #{dst}, #{ftmp}"
+            ppc64EmitMoveLowWordToGPR(dst, ftmp)
 
         # Double-to-float truncation and double-to-double
         # Raw bit moves between a GPR and a double: the FPR holds the double
-        # image as is, so these are plain VSX moves (POWER8 baseline), no
-        # stack round trip.
+        # image as is, so these are plain VSX moves on POWER8 and a stack
+        # round trip before it.
         when "fd2q"
-            $asm.puts "mfvsrd #{operands[1].ppc64Operand}, #{operands[0].ppc64Operand}"
+            ppc64EmitMoveToGPR(operands[1].ppc64Operand, operands[0].ppc64Operand)
 
         when "fq2d"
-            $asm.puts "mtvsrd #{operands[1].ppc64Operand}, #{operands[0].ppc64Operand}"
+            ppc64EmitMoveToFPR(operands[1].ppc64Operand, operands[0].ppc64Operand)
 
         # ------------------------------------------------------------------
         # FP compare and branch  (fcmpu cr0: LT=bit31, GT=bit30, EQ=bit29, FU=SO=bit28)

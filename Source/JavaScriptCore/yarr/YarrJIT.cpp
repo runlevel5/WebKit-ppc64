@@ -6231,6 +6231,11 @@ class YarrGenerator final : public YarrJITInfo {
 
     std::optional<MultiPatternSIMDResult> generateMultiPatternSIMDSearch(const MaskedAlternativeInfo& info, unsigned checkedOffset, MacroAssembler::JumpList& matched)
     {
+#if CPU(PPC64)
+        // The vector code needs VSX and the ISA 2.07 vector instructions.
+        if (!MacroAssembler::supportsISA2_07())
+            return std::nullopt;
+#endif
         // Only for Latin1 (8-bit characters)
         if (m_charSize != CharSize::Char8)
             return std::nullopt;
@@ -6496,6 +6501,11 @@ class YarrGenerator final : public YarrJITInfo {
 
     std::optional<SkipBitInTableSIMDResult> generateBitInTableSIMDSearch(const BoyerMooreBitmap::Map& bitmap, const BoyerMooreFastCandidates& charactersFastPath, unsigned strideLength, unsigned endIndex, unsigned checkedOffset, MacroAssembler::JumpList& matched)
     {
+#if CPU(PPC64)
+        // The vector code needs VSX and the ISA 2.07 vector instructions.
+        if (!MacroAssembler::supportsISA2_07())
+            return std::nullopt;
+#endif
         // Only for Latin1 (8-bit characters)
         if (m_charSize != CharSize::Char8)
             return std::nullopt;

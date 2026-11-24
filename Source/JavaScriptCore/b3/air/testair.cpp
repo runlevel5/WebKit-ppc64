@@ -3493,7 +3493,8 @@ void run(const char* filter)
     RUN(testMoveFloatZeroConstant());
     RUN(testMoveDoubleConstant());
     RUN(testMoveFloatConstant());
-    RUN(testMoveVectorZeroConstant());
+    if (Options::useWasmSIMD())
+        RUN(testMoveVectorZeroConstant());
     RUN(testMoveFloatConstantSpill());
     RUN(testAddDoubleZeroWithOther());
     RUN(testMulDoubleZeroWithOther());

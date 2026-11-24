@@ -610,7 +610,8 @@ bool hasCapacityToUseLargeGigacage();
     v(Bool, forceOSRExitToLLInt, false, Normal, "If true, we always exit to the LLInt. If false, we exit to whatever is most convenient."_s) \
     v(Unsigned, getByValICMaxNumberOfIdentifiers, 4, Normal, "Number of identifiers we see in the LLInt that could cause us to bail on generating an IC for get_by_val."_s) \
     v(Bool, useRandomizingExecutableIslandAllocation, false, Normal, "For the arm64 and ppc64 ExecutableAllocator, if true, select which region to use randomly. This is useful for testing that jump islands work."_s) \
-    v(Unsigned, maximumPPC64ISALevel, 310, Normal, "On ppc64, the newest Power ISA level the JITs may emit instructions from even when the CPU has a newer one: 207 (POWER8), 300 (POWER9) or 310 (POWER10). Lets newer hardware test the older code paths."_s) \
+    v(Unsigned, maximumPPC64ISALevel, 310, Normal, "On ppc64, the newest Power ISA level the JITs may emit instructions from even when the CPU has a newer one: 201 (PowerPC 970 and anything else older than POWER8), 207 (POWER8), 300 (POWER9) or 310 (POWER10). Lets newer hardware test the older code paths."_s) \
+    v(Bool, validatePPC64ISALevel, false, Normal, "On ppc64, crash when a JIT emits an instruction that a CPU older than POWER8 does not have while running on, or limited by maximumPPC64ISALevel to, such a CPU. For testing the pre-POWER8 code paths on newer hardware, which would otherwise execute the instruction."_s) \
     v(Bool, exposeProfilersOnGlobalObject, false, Normal, "If true, we will expose functions to enable/disable both the sampling profiler and the super sampler"_s) \
     v(Bool, allowUnsupportedTiers, false, Normal, "If true, we will not disable DFG or FTL when an experimental feature is enabled."_s) \
     v(Bool, returnEarlyFromInfiniteLoopsForFuzzing, false, Normal, nullptr) \

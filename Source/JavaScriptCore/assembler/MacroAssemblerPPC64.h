@@ -119,12 +119,18 @@ public:
     // code that needs LR uses mflr/mtlr.
     static constexpr RegisterID linkRegister = PPC64Registers::r0;
 
-    static bool supportsFloatingPointRounding() { return true; } // frip/frim/friz + xsrdpic
+    // frip/frim/friz are ISA 2.02 and xsrdpic is VSX: below POWER8 the
+    // rounding functions emit emitRoundToIntegralPre207() instead.
+    static bool supportsFloatingPointRounding() { return true; }
     // Power ISA level beyond the POWER8 (2.07) baseline, from AT_HWCAP2 and
     // capped by Options::maximumPPC64ISALevel() so POWER9/POWER10 machines can
     // also exercise the older sequences. Every instruction newer than 2.07 is
     // emitted only behind one of these checks.
     JS_EXPORT_PRIVATE static unsigned isaLevel();
+    // The floor is 201: a PowerPC 970, or any other 64-bit CPU older than
+    // POWER8. Every instruction newer than ISA 2.01 that the scalar paths use
+    // has a fallback behind this check; the vector (wasm SIMD) paths require it.
+    static bool supportsISA2_07() { return isaLevel() >= 207; }
     static bool supportsISA3_00() { return isaLevel() >= 300; }
     static bool supportsISA3_1() { return isaLevel() >= 310; }
 
@@ -697,6 +703,13 @@ public:
                 m_assembler.setbcr(dest, bi);
             return;
         }
+        if (!supportsISA2_07()) {
+            // No isel before ISA 2.06: load one value and branch over the other.
+            m_assembler.addi(dest, PPC64Registers::r0, whenSet ? 1 : 0);
+            emitSkipOneInstruction(12, bi);                 // bit set: keep it
+            m_assembler.addi(dest, PPC64Registers::r0, whenSet ? 0 : 1);
+            return;
+        }
         if (whenSet) {
             RegisterID one = dest == memoryTempRegister ? dataTempRegister : memoryTempRegister;
             m_assembler.addi(one, PPC64Registers::r0, 1);   // li one, 1
@@ -732,6 +745,66 @@ public:
             bi = 2; bo = 12; break;
         }
         setFromCR0Bit(bi, bo != 4, dest);
+    }
+
+    // --- GPR <-> FPR bit moves -----------------------------------------
+    // POWER8 moves bits between the register files directly (mtvsrd, mfvsrd and
+    // their word forms). Before that the only route is memory: a doubleword in
+    // the ELFv2 protected zone below the stack pointer, which signal handlers
+    // leave alone. The word forms extend in r0, an ordinary register as a data
+    // operand.
+    static constexpr int bitMoveSlot = -8;
+    static constexpr int bitMoveSlotLowWord = bitMoveSlot + (std::endian::native == std::endian::big ? 4 : 0);
+    static constexpr int bitMoveSlotHighWord = bitMoveSlot + (std::endian::native == std::endian::big ? 0 : 4);
+    void moveBitsToFPR(FPRegisterID dest, RegisterID src)
+    {
+        if (supportsISA2_07()) {
+            m_assembler.mtvsrd(dest, src);
+            return;
+        }
+        m_assembler.std(src, bitMoveSlot, stackPointerRegister);
+        m_assembler.lfd(dest, bitMoveSlot, stackPointerRegister);
+    }
+    void moveBitsToGPR(RegisterID dest, FPRegisterID src)
+    {
+        if (supportsISA2_07()) {
+            m_assembler.mfvsrd(dest, src);
+            return;
+        }
+        m_assembler.stfd(src, bitMoveSlot, stackPointerRegister);
+        m_assembler.ld(dest, bitMoveSlot, stackPointerRegister);
+    }
+    void moveZeroExtendedWordToFPR(FPRegisterID dest, RegisterID src)
+    {
+        if (supportsISA2_07()) {
+            m_assembler.mtvsrwz(dest, src);
+            return;
+        }
+        m_assembler.rldicl(PPC64Registers::r0, src, 0, 32);
+        moveBitsToFPR(dest, PPC64Registers::r0);
+    }
+    void moveSignExtendedWordToFPR(FPRegisterID dest, RegisterID src)
+    {
+        if (supportsISA2_07()) {
+            m_assembler.mtvsrwa(dest, src);
+            return;
+        }
+        m_assembler.extsw(PPC64Registers::r0, src);
+        moveBitsToFPR(dest, PPC64Registers::r0);
+    }
+    // The vector paths address VSRs by number; they exist only from ISA 2.07.
+    void moveBitsToFPR(uint32_t destVSR, RegisterID src) { m_assembler.mtvsrd(destVSR, src); }
+    void moveBitsToGPR(RegisterID dest, uint32_t srcVSR) { m_assembler.mfvsrd(dest, srcVSR); }
+    void moveLowWordToGPR(RegisterID dest, uint32_t srcVSR) { m_assembler.mfvsrwz(dest, srcVSR); }
+    // The low word of the FPR's doubleword, zero-extended.
+    void moveLowWordToGPR(RegisterID dest, FPRegisterID src)
+    {
+        if (supportsISA2_07()) {
+            m_assembler.mfvsrwz(dest, src);
+            return;
+        }
+        m_assembler.stfd(src, bitMoveSlot, stackPointerRegister);
+        m_assembler.lwz(dest, bitMoveSlotLowWord, stackPointerRegister);
     }
 
     // --- 32-bit arithmetic ---------------------------------------------
@@ -1711,20 +1784,20 @@ public:
     void moveZeroToDouble(FPRegisterID dest)
     {
         m_assembler.addi(dataTempRegister, PPC64Registers::r0, 0);
-        m_assembler.mtvsrd(dest, dataTempRegister);
+        moveBitsToFPR(dest, dataTempRegister);
     }
     void move64ToDouble(RegisterID src, FPRegisterID dest)
     {
-        m_assembler.mtvsrd(dest, src);
+        moveBitsToFPR(dest, src);
     }
     void move64ToDouble(TrustedImm64 imm, FPRegisterID dest)
     {
         moveImmToScratch(imm.m_value, dataTempRegister);
-        m_assembler.mtvsrd(dest, dataTempRegister);
+        moveBitsToFPR(dest, dataTempRegister);
     }
     void moveDoubleTo64(FPRegisterID src, RegisterID dest)
     {
-        m_assembler.mfvsrd(dest, src);
+        moveBitsToGPR(dest, src);
     }
     // Bitcast int32 <-> float32. An FPR holds a float in double format, so these
     // are format conversions, not copies: xscvspdpn / xscvdpspn convert between
@@ -1734,7 +1807,13 @@ public:
     // -mcpu=power8). No memory round trip, unlike the former stw/lfs pair.
     void move32ToFloat(RegisterID src, FPRegisterID dest)
     {
-        m_assembler.mtvsrwz(dest, src);                     // the bits in word 1 of doubleword 0
+        if (!supportsISA2_07()) {
+            // lfs widens the single bit pattern into the FPR's double format.
+            m_assembler.stw(src, bitMoveSlot, stackPointerRegister);
+            m_assembler.lfs(dest, bitMoveSlot, stackPointerRegister);
+            return;
+        }
+        moveZeroExtendedWordToFPR(dest, src);                     // the bits in word 1 of doubleword 0
         m_assembler.xxspltw(vsr(dest), vsr(dest), 1);       // ... and so in word 0
         m_assembler.xscvspdpn(vsr(dest), vsr(dest));
     }
@@ -1745,16 +1824,21 @@ public:
     }
     void moveFloatTo32(FPRegisterID src, RegisterID dest)
     {
+        if (!supportsISA2_07()) {
+            m_assembler.stfs(src, bitMoveSlot, stackPointerRegister);
+            m_assembler.lwz(dest, bitMoveSlot, stackPointerRegister);
+            return;
+        }
         // xscvdpspn leaves the single in word 0. Only ISA 3.0 also copies it to
         // word 1, so on the POWER8 baseline it must not be read with mfvsrwz.
         m_assembler.xscvdpspn(vsr(fpTempRegister), vsr(src));
-        m_assembler.mfvsrd(dest, fpTempRegister);
+        moveBitsToGPR(dest, fpTempRegister);
         m_assembler.srdi(dest, dest, 32);                   // word 0, zero-extended
     }
 
     void convertInt32ToDouble(RegisterID src, FPRegisterID dest)
     {
-        m_assembler.mtvsrwa(dest, src);
+        moveSignExtendedWordToFPR(dest, src);
         m_assembler.fcfid(dest, dest);
     }
     void convertInt32ToDouble(TrustedImm32 imm, FPRegisterID dest)
@@ -1769,12 +1853,12 @@ public:
     }
     void convertInt64ToDouble(RegisterID src, FPRegisterID dest)
     {
-        m_assembler.mtvsrd(dest, src);
+        moveBitsToFPR(dest, src);
         m_assembler.fcfid(dest, dest);
     }
     void convertUInt32ToDouble(RegisterID src, FPRegisterID dest)
     {
-        m_assembler.mtvsrwz(dest, src);
+        moveZeroExtendedWordToFPR(dest, src);
         m_assembler.fcfid(dest, dest);
     }
     void convertUInt32ToDouble(RegisterID src, FPRegisterID dest, FPRegisterID)
@@ -1783,7 +1867,24 @@ public:
     }
     void convertUInt64ToDouble(RegisterID src, FPRegisterID dest)
     {
-        m_assembler.mtvsrd(dest, src);
+        if (!supportsISA2_07()) {
+            // No fcfidu before ISA 2.06. A value with the top bit set is halved
+            // with its low bit kept as a sticky bit, so that the one rounding
+            // fcfid does is the correct one, and the result is doubled.
+            m_assembler.rldicl(PPC64Registers::r0, src, 0, 63);     // src & 1
+            m_assembler.cmpdi(0, src, 0);
+            m_assembler.rldicl(memoryTempRegister, src, 63, 1);     // src >> 1 (reads src before r12 is written)
+            m_assembler.or_(PPC64Registers::r0, PPC64Registers::r0, memoryTempRegister);
+            emitSkipOneInstruction(12, 0);                          // negative as signed: keep the halved value
+            m_assembler.mr(PPC64Registers::r0, src);
+            m_assembler.std(PPC64Registers::r0, bitMoveSlot, stackPointerRegister);
+            m_assembler.lfd(dest, bitMoveSlot, stackPointerRegister);
+            m_assembler.fcfid(dest, dest);
+            emitSkipOneInstruction(4, 0);                           // non-negative: done
+            m_assembler.fadd(dest, dest, dest);
+            return;
+        }
+        moveBitsToFPR(dest, src);
         m_assembler.fcfidu(dest, dest);
     }
     void convertFloatToDouble(FPRegisterID src, FPRegisterID dest)
@@ -1853,63 +1954,158 @@ public:
     // FP bitwise ops treat the doubles as bit patterns (used for sign-bit
     // masking, NaN canonicalization, SIMD-lane logic). FPR f_n aliases
     // VSR n, so the VSX logical ops apply directly.
-    void andDouble(FPRegisterID a, FPRegisterID b, FPRegisterID dest)
-    {
-        m_assembler.xxland(dest, a, b);
-    }
-    void andDouble(FPRegisterID src, FPRegisterID dest)
-    {
-        m_assembler.xxland(dest, dest, src);
-    }
-    void orDouble(FPRegisterID a, FPRegisterID b, FPRegisterID dest)
-    {
-        m_assembler.xxlor(dest, a, b);
-    }
-    void orDouble(FPRegisterID src, FPRegisterID dest)
-    {
-        m_assembler.xxlor(dest, dest, src);
-    }
-    void xorDouble(FPRegisterID a, FPRegisterID b, FPRegisterID dest)
-    {
-        m_assembler.xxlxor(dest, a, b);
-    }
-    void xorDouble(FPRegisterID src, FPRegisterID dest)
-    {
-        m_assembler.xxlxor(dest, dest, src);
-    }
+    void andDouble(FPRegisterID a, FPRegisterID b, FPRegisterID dest) { doubleBitwise(&PPC64Assembler::xxland, a, b, dest); }
+    void andDouble(FPRegisterID src, FPRegisterID dest) { andDouble(dest, src, dest); }
+    void orDouble(FPRegisterID a, FPRegisterID b, FPRegisterID dest) { doubleBitwise(&PPC64Assembler::xxlor, a, b, dest); }
+    void orDouble(FPRegisterID src, FPRegisterID dest) { orDouble(dest, src, dest); }
+    void xorDouble(FPRegisterID a, FPRegisterID b, FPRegisterID dest) { doubleBitwise(&PPC64Assembler::xxlxor, a, b, dest); }
+    void xorDouble(FPRegisterID src, FPRegisterID dest) { xorDouble(dest, src, dest); }
     void negateDouble(FPRegisterID src, FPRegisterID dest)            { m_assembler.fneg(dest, src); }
     void negateFloat(FPRegisterID src, FPRegisterID dest)             { m_assembler.fneg(dest, src); }
-    void floorDouble(FPRegisterID src, FPRegisterID dest)             { m_assembler.frim(dest, src); }
-    void ceilDouble(FPRegisterID src, FPRegisterID dest)              { m_assembler.frip(dest, src); }
-    void truncDouble(FPRegisterID src, FPRegisterID dest)             { m_assembler.friz(dest, src); }
-    void roundTowardZeroDouble(FPRegisterID src, FPRegisterID dest)   { m_assembler.friz(dest, src); }
+    // Rounding to an integral value without frim/frip/friz (ISA 2.02) or
+    // xsrdpic (VSX). A double of magnitude 2^52 or more is already integral,
+    // and a smaller one fits an int64: fctidz and fcfid truncate it, a
+    // comparison with the operand corrects that by one for floor and ceil, and
+    // adding and subtracting 2^52 rounds to nearest even. The result takes the
+    // operand's sign, which is what keeps -0 and the negative results that
+    // round to zero. dest may be src. Uses both scratch GPRs and two
+    // doublewords of the protected zone.
+    enum class RoundingKind : uint8_t { Floor, Ceil, Trunc, NearestEven };
+    void emitRoundToIntegralPre207(RoundingKind kind, FPRegisterID src, FPRegisterID dest)
+    {
+        ASSERT(src != fpTempRegister && dest != fpTempRegister);
+        constexpr int integerSlot = bitMoveSlot - 8;
+        m_assembler.stfd(src, bitMoveSlot, stackPointerRegister);
+        m_assembler.ld(dataTempRegister, bitMoveSlot, stackPointerRegister);
+        m_assembler.rldicl(memoryTempRegister, dataTempRegister, 12, 53); // biased exponent
+        Jump small = branch32(Below, memoryTempRegister, TrustedImm32(0x433));
+        // Integral already, infinite or NaN. Adding a NaN to itself quiets it,
+        // as the rounding instructions do.
+        Jump finite = branch32(NotEqual, memoryTempRegister, TrustedImm32(0x7ff));
+        m_assembler.fadd(dest, src, src);
+        Jump doneSpecial = jump();
+        finite.link(this);
+        m_assembler.fmr(dest, src);
+        Jump doneLarge = jump();
+
+        small.link(this);
+        if (kind == RoundingKind::NearestEven) {
+            moveImmToScratch(int64_t(0x4330000000000000), memoryTempRegister); // 2^52
+            m_assembler.std(memoryTempRegister, integerSlot, stackPointerRegister);
+            m_assembler.lfd(fpTempRegister, integerSlot, stackPointerRegister);
+            Jump negative = branch64(LessThan, dataTempRegister, TrustedImm32(0));
+            m_assembler.fadd(dest, src, fpTempRegister);
+            m_assembler.fsub(dest, dest, fpTempRegister);
+            m_assembler.fabs(dest, dest);
+            Jump donePositive = jump();
+            negative.link(this);
+            m_assembler.fsub(dest, src, fpTempRegister);
+            m_assembler.fadd(dest, dest, fpTempRegister);
+            m_assembler.fnabs(dest, dest);
+            donePositive.link(this);
+        } else {
+            m_assembler.fctidz(fpTempRegister, src);
+            if (kind != RoundingKind::Trunc) {
+                m_assembler.stfd(fpTempRegister, integerSlot, stackPointerRegister);
+                m_assembler.ld(memoryTempRegister, integerSlot, stackPointerRegister);
+                m_assembler.fcfid(fpTempRegister, fpTempRegister);
+                Jump exact = branchDouble(kind == RoundingKind::Floor ? DoubleLessThanOrEqualAndOrdered : DoubleGreaterThanOrEqualAndOrdered, fpTempRegister, src);
+                m_assembler.addi(memoryTempRegister, memoryTempRegister, kind == RoundingKind::Floor ? -1 : 1);
+                exact.link(this);
+                m_assembler.std(memoryTempRegister, integerSlot, stackPointerRegister);
+                m_assembler.lfd(fpTempRegister, integerSlot, stackPointerRegister);
+            }
+            m_assembler.fcfid(dest, fpTempRegister);
+            Jump negative = branch64(LessThan, dataTempRegister, TrustedImm32(0));
+            m_assembler.fabs(dest, dest);
+            Jump donePositive = jump();
+            negative.link(this);
+            m_assembler.fnabs(dest, dest);
+            donePositive.link(this);
+        }
+        doneSpecial.link(this);
+        doneLarge.link(this);
+    }
+    void floorDouble(FPRegisterID src, FPRegisterID dest)
+    {
+        if (supportsISA2_07())
+            m_assembler.frim(dest, src);
+        else
+            emitRoundToIntegralPre207(RoundingKind::Floor, src, dest);
+    }
+    void ceilDouble(FPRegisterID src, FPRegisterID dest)
+    {
+        if (supportsISA2_07())
+            m_assembler.frip(dest, src);
+        else
+            emitRoundToIntegralPre207(RoundingKind::Ceil, src, dest);
+    }
+    void truncDouble(FPRegisterID src, FPRegisterID dest)
+    {
+        if (supportsISA2_07())
+            m_assembler.friz(dest, src);
+        else
+            emitRoundToIntegralPre207(RoundingKind::Trunc, src, dest);
+    }
+    void roundTowardZeroDouble(FPRegisterID src, FPRegisterID dest)   { truncDouble(src, dest); }
     // Ties-to-even, as ARM64 frintn: frin rounds ties away from zero, so use
     // xsrdpic, which rounds in the current mode (round-to-nearest-even).
-    void roundTowardNearestIntDouble(FPRegisterID src, FPRegisterID dest) { m_assembler.xsrdpic(dest, src); }
+    void roundTowardNearestIntDouble(FPRegisterID src, FPRegisterID dest)
+    {
+        if (supportsISA2_07())
+            m_assembler.xsrdpic(dest, src);
+        else
+            emitRoundToIntegralPre207(RoundingKind::NearestEven, src, dest);
+    }
 
     void truncateDoubleToInt32(FPRegisterID src, RegisterID dest)
     {
         m_assembler.fctiwz(fpTempRegister, src);
-        m_assembler.mfvsrwz(dest, fpTempRegister);
+        moveLowWordToGPR(dest, fpTempRegister);
     }
     void truncateDoubleToInt64(FPRegisterID src, RegisterID dest)
     {
         m_assembler.fctidz(fpTempRegister, src);
-        m_assembler.mfvsrd(dest, fpTempRegister);
+        moveBitsToGPR(dest, fpTempRegister);
     }
     void truncateDoubleToUint32(FPRegisterID src, RegisterID dest)
     {
         // fctiduz truncates toward zero to unsigned 64-bit (saturating);
         // in-range uint32 values convert exactly, matching the contract's
-        // defined domain.
-        m_assembler.fctiduz(fpTempRegister, src);
-        m_assembler.mfvsrd(dest, fpTempRegister);
+        // defined domain. So does the signed fctidz, which is all there is
+        // before ISA 2.06.
+        if (supportsISA2_07())
+            m_assembler.fctiduz(fpTempRegister, src);
+        else
+            m_assembler.fctidz(fpTempRegister, src);
+        moveBitsToGPR(dest, fpTempRegister);
         zeroExtend32ToWordInternal(dest);
     }
     void truncateDoubleToUint64(FPRegisterID src, RegisterID dest)
     {
+        if (!supportsISA2_07()) {
+            // No fctiduz before ISA 2.06. Values below 2^63 convert with the
+            // signed fctidz; the others are converted 2^63 lower and get the top
+            // bit back. (Out-of-range inputs are outside the contract.)
+            moveImmToScratch(0x43E0000000000000ll, dataTempRegister);       // 2^63
+            m_assembler.std(dataTempRegister, bitMoveSlot, stackPointerRegister);
+            m_assembler.lfd(fpTempRegister, bitMoveSlot, stackPointerRegister);
+            m_assembler.fcmpu(0, src, fpTempRegister);
+            m_assembler.addi(dataTempRegister, PPC64Registers::r0, 0);
+            m_assembler.bc(12, 0, 16);                                       // src < 2^63: plain conversion
+            m_assembler.fsub(fpTempRegister, src, fpTempRegister);
+            m_assembler.addi(dataTempRegister, PPC64Registers::r0, 1);
+            m_assembler.bc(20, 0, 8);                                        // always: skip the copy
+            m_assembler.fmr(fpTempRegister, src);
+            m_assembler.fctidz(fpTempRegister, fpTempRegister);
+            m_assembler.rldicr(dataTempRegister, dataTempRegister, 63, 0);   // 0 or 2^63
+            m_assembler.stfd(fpTempRegister, bitMoveSlot, stackPointerRegister);
+            m_assembler.ld(dest, bitMoveSlot, stackPointerRegister);
+            m_assembler.xor_(dest, dest, dataTempRegister);
+            return;
+        }
         m_assembler.fctiduz(fpTempRegister, src);
-        m_assembler.mfvsrd(dest, fpTempRegister);
+        moveBitsToGPR(dest, fpTempRegister);
     }
     // The four-operand form exists for backends that need scratch FPRs to
     // synthesise the unsigned conversion; fctiduz does it directly.
@@ -1996,19 +2192,49 @@ public:
     // exactly representable as single (below 2^24 integrals are exact; larger
     // singles are already integral and unchanged), so the double
     // round-to-integral instructions suffice.
-    void floorFloat(FPRegisterID src, FPRegisterID dest)              { m_assembler.frim(dest, src); }
-    void ceilFloat(FPRegisterID src, FPRegisterID dest)               { m_assembler.frip(dest, src); }
-    void truncFloat(FPRegisterID src, FPRegisterID dest)              { m_assembler.friz(dest, src); }
-    void roundTowardZeroFloat(FPRegisterID src, FPRegisterID dest)    { m_assembler.friz(dest, src); }
-    void roundTowardNearestIntFloat(FPRegisterID src, FPRegisterID dest) { m_assembler.xsrdpic(dest, src); }
+    void floorFloat(FPRegisterID src, FPRegisterID dest)              { floorDouble(src, dest); }
+    void ceilFloat(FPRegisterID src, FPRegisterID dest)               { ceilDouble(src, dest); }
+    void truncFloat(FPRegisterID src, FPRegisterID dest)              { truncDouble(src, dest); }
+    void roundTowardZeroFloat(FPRegisterID src, FPRegisterID dest)    { truncDouble(src, dest); }
+    void roundTowardNearestIntFloat(FPRegisterID src, FPRegisterID dest) { roundTowardNearestIntDouble(src, dest); }
     // Bitwise float ops act on the 32-bit single-format pattern. Convert both
     // operands to single format in place (xscvdpspn, non-signalling, into word 0
     // of the VSR), combine the VSRs, and convert word 0 back. Four instructions
     // and no GPR or memory, against six memory accesses before. Both operands
     // are read before dest is written, so dest may alias either.
     using VSXLogicalOp = void (PPC64Assembler::*)(uint32_t, uint32_t, uint32_t);
+    // Without VSX, the bit patterns are combined in the scratch GPRs.
+    void emitGPRLogicalOp(VSXLogicalOp op)
+    {
+        if (op == static_cast<VSXLogicalOp>(&PPC64Assembler::xxland))
+            m_assembler.and_(dataTempRegister, dataTempRegister, memoryTempRegister);
+        else if (op == static_cast<VSXLogicalOp>(&PPC64Assembler::xxlor))
+            m_assembler.or_(dataTempRegister, dataTempRegister, memoryTempRegister);
+        else {
+            ASSERT(op == static_cast<VSXLogicalOp>(&PPC64Assembler::xxlxor));
+            m_assembler.xor_(dataTempRegister, dataTempRegister, memoryTempRegister);
+        }
+    }
+    void doubleBitwise(VSXLogicalOp op, FPRegisterID a, FPRegisterID b, FPRegisterID dest)
+    {
+        if (!supportsISA2_07()) {
+            moveBitsToGPR(dataTempRegister, a);
+            moveBitsToGPR(memoryTempRegister, b);
+            emitGPRLogicalOp(op);
+            moveBitsToFPR(dest, dataTempRegister);
+            return;
+        }
+        (m_assembler.*op)(vsr(dest), vsr(a), vsr(b));
+    }
     void floatBitwise(VSXLogicalOp op, FPRegisterID a, FPRegisterID b, FPRegisterID dest)
     {
+        if (!supportsISA2_07()) {
+            moveFloatTo32(a, dataTempRegister);
+            moveFloatTo32(b, memoryTempRegister);
+            emitGPRLogicalOp(op);
+            move32ToFloat(dataTempRegister, dest);
+            return;
+        }
         m_assembler.xscvdpspn(vsr(fpTempRegister), vsr(a));
         m_assembler.xscvdpspn(vsr(dest), vsr(b));
         (m_assembler.*op)(vsr(dest), vsr(fpTempRegister), vsr(dest));
@@ -2268,7 +2494,7 @@ public:
             return;
         }
         moveImmToScratch(static_cast<int64_t>(dw0), dataTempRegister);
-        m_assembler.mtvsrd(destVSR, dataTempRegister);
+        moveBitsToFPR(destVSR, dataTempRegister);
         if (dw1 == dw0) {
             m_assembler.xxpermdi(destVSR, destVSR, destVSR, 0);
             return;
@@ -2326,9 +2552,9 @@ public:
         ASSERT(lane < 2 * perDoubleword);
         if (lane >= perDoubleword) {
             m_assembler.xxswapd(vsr(vecTemp0), vsr(src));
-            m_assembler.mfvsrd(dest, vsr(vecTemp0));
+            moveBitsToGPR(dest, vsr(vecTemp0));
         } else
-            m_assembler.mfvsrd(dest, vsr(src));
+            moveBitsToGPR(dest, vsr(src));
         if (elementBytes == 8)
             return;
         unsigned width = elementBytes * 8;
@@ -2367,17 +2593,17 @@ public:
         bool high = lane >= perDoubleword;
         uint32_t temp = vsr(vecTemp0);
         if (elementBytes == 8)
-            m_assembler.mtvsrd(temp, src);
+            moveBitsToFPR(temp, src);
         else {
             unsigned width = elementBytes * 8;
             unsigned shift = (lane % perDoubleword) * width;
             if (high) {
                 m_assembler.xxswapd(temp, vsr(dest));
-                m_assembler.mfvsrd(dataTempRegister, temp);
+                moveBitsToGPR(dataTempRegister, temp);
             } else
-                m_assembler.mfvsrd(dataTempRegister, vsr(dest));
+                moveBitsToGPR(dataTempRegister, vsr(dest));
             m_assembler.rldimi(dataTempRegister, src, shift, 64 - shift - width);
-            m_assembler.mtvsrd(temp, dataTempRegister);
+            moveBitsToFPR(temp, dataTempRegister);
         }
         if (high)
             m_assembler.xxpermdi(vsr(dest), vsr(dest), temp, 0);
@@ -2459,7 +2685,7 @@ public:
         }
         // double -> single bits in word 0, then into a GPR and in as an i32 lane.
         m_assembler.xscvdpspn(vsr(vecTemp0), vsr(src));
-        m_assembler.mfvsrd(memoryTempRegister, vsr(vecTemp0));
+        moveBitsToGPR(memoryTempRegister, vsr(vecTemp0));
         m_assembler.srdi(memoryTempRegister, memoryTempRegister, 32);
         vectorReplaceLaneFromGPR(4, lane.m_value, memoryTempRegister, dest);
     }
@@ -2652,14 +2878,14 @@ public:
                 return;
             }
             // No doubleword vector multiply before POWER10: one mulld per lane.
-            m_assembler.mfvsrd(dataTempRegister, vsr(left));
-            m_assembler.mfvsrd(memoryTempRegister, vsr(right));
+            moveBitsToGPR(dataTempRegister, vsr(left));
+            moveBitsToGPR(memoryTempRegister, vsr(right));
             m_assembler.mulld(dataTempRegister, dataTempRegister, memoryTempRegister);
             m_assembler.mtvsrd(vsr(vecTemp0), dataTempRegister);
             m_assembler.xxswapd(vsr(vecTemp1), vsr(left));
-            m_assembler.mfvsrd(dataTempRegister, vsr(vecTemp1));
+            moveBitsToGPR(dataTempRegister, vsr(vecTemp1));
             m_assembler.xxswapd(vsr(vecTemp1), vsr(right));
-            m_assembler.mfvsrd(memoryTempRegister, vsr(vecTemp1));
+            moveBitsToGPR(memoryTempRegister, vsr(vecTemp1));
             m_assembler.mulld(dataTempRegister, dataTempRegister, memoryTempRegister);
             m_assembler.mtvsrd(vsr(vecTemp1), dataTempRegister);
             m_assembler.xxpermdi(vsr(dest), vsr(vecTemp0), vsr(vecTemp1), 0);
@@ -2883,9 +3109,9 @@ public:
     // dest = (dw0 | dw1 of vr) != 0
     void vectorAnyBitSetInVR(VRegisterID vr, RegisterID dest)
     {
-        m_assembler.mfvsrd(dest, vsr(vr));
+        moveBitsToGPR(dest, vsr(vr));
         m_assembler.xxswapd(vsr(vecTemp4), vsr(vr));
-        m_assembler.mfvsrd(dataTempRegister, vsr(vecTemp4));
+        moveBitsToGPR(dataTempRegister, vsr(vecTemp4));
         m_assembler.or_(dest, dest, dataTempRegister);
         m_assembler.neg(dataTempRegister, dest);
         m_assembler.or_(dest, dest, dataTempRegister);
@@ -2906,9 +3132,9 @@ public:
     Jump branchTest128(ResultCondition cond, FPRegisterID vec)
     {
         ASSERT(cond == Zero || cond == NonZero);
-        m_assembler.mfvsrd(dataTempRegister, vsr(vec));
+        moveBitsToGPR(dataTempRegister, vsr(vec));
         m_assembler.xxswapd(vsr(vecTemp4), vsr(vec));
-        m_assembler.mfvsrd(memoryTempRegister, vsr(vecTemp4));
+        moveBitsToGPR(memoryTempRegister, vsr(vecTemp4));
         m_assembler.or_(dataTempRegister, dataTempRegister, memoryTempRegister);
         return branchTest64(cond, dataTempRegister);
     }
@@ -2963,7 +3189,7 @@ public:
         materializeVectorBits(dw0, dw1, vsr(vecTemp1));
         copyToVR(vec, vecTemp0);
         m_assembler.vbpermq(vecTemp0, vecTemp0, vecTemp1);
-        m_assembler.mfvsrd(dest, vsr(vecTemp0));
+        moveBitsToGPR(dest, vsr(vecTemp0));
     }
     void vectorBitmask(SIMDInfo simdInfo, FPRegisterID vec, RegisterID dest, FPRegisterID) { vectorBitmask(simdInfo, vec, dest); }
 
@@ -3342,6 +3568,21 @@ public:
     {
         ASSERT(whenTaken != PPC64Registers::r0 && whenNotTaken != PPC64Registers::r0);
         ASSERT(bits.bo == 12 || bits.bo == 4);
+        if (!supportsISA2_07()) {
+            // No isel before ISA 2.06: branch over a register move.
+            if (dest == whenTaken) {
+                emitSkipOneInstruction(bits.bo, bits.bi);          // taken: keep it
+                m_assembler.mr(dest, whenNotTaken);
+            } else if (dest == whenNotTaken) {
+                emitSkipOneInstruction(bits.bo ^ 0x8, bits.bi);    // not taken: keep it
+                m_assembler.mr(dest, whenTaken);
+            } else {
+                m_assembler.mr(dest, whenNotTaken);
+                emitSkipOneInstruction(bits.bo ^ 0x8, bits.bi);
+                m_assembler.mr(dest, whenTaken);
+            }
+            return;
+        }
         if (bits.bo == 12)
             m_assembler.isel(dest, whenTaken, whenNotTaken, bits.bi);
         else
@@ -3708,7 +3949,8 @@ public:
         m_assembler.subfic(dest, dest, 64);
     }
 
-    static bool supportsCountPopulation() { return true; }
+    // popcntw/popcntd are ISA 2.06; below POWER8 the callers use their fallbacks.
+    static bool supportsCountPopulation() { return supportsISA2_07(); }
     // The FP temp is part of the shared signature (ARM64 needs a vector
     // register for its cnt/addv sequence); PPC64 has a direct instruction.
     void countPopulation32(RegisterID src, RegisterID dest, FPRegisterID)
@@ -4412,12 +4654,12 @@ public:
     void loadFloat16(Address address, FPRegisterID dest)
     {
         load16(address, dataTempRegister);
-        m_assembler.mtvsrd(dest, dataTempRegister);
+        moveBitsToFPR(dest, dataTempRegister);
     }
     void loadFloat16(BaseIndex address, FPRegisterID dest)
     {
         load16(address, dataTempRegister);
-        m_assembler.mtvsrd(dest, dataTempRegister);
+        moveBitsToFPR(dest, dataTempRegister);
     }
     void convertFloat16ToDouble(FPRegisterID src, FPRegisterID dest)
     {
@@ -4448,13 +4690,13 @@ public:
     void storeFloat16(FPRegisterID src, Address address)
     {
         add64(TrustedImm32(address.offset), address.base, memoryTempRegister);
-        m_assembler.mfvsrd(dataTempRegister, src);
+        moveBitsToGPR(dataTempRegister, src);
         m_assembler.sth(dataTempRegister, 0, memoryTempRegister);
     }
     void storeFloat16(FPRegisterID src, BaseIndex address)
     {
         getEffectiveAddress(address, memoryTempRegister);
-        m_assembler.mfvsrd(dataTempRegister, src);
+        moveBitsToGPR(dataTempRegister, src);
         m_assembler.sth(dataTempRegister, 0, memoryTempRegister);
     }
 
@@ -4544,7 +4786,7 @@ public:
         // result (NaN, or an out-of-int32-range value that fctiwz saturated to
         // INT32_MIN/MAX) means the double was not an exact int32 -> failure.
         m_assembler.fctiwz(fpTempRegister, src);
-        m_assembler.mfvsrwz(dest, fpTempRegister);
+        moveLowWordToGPR(dest, fpTempRegister);
         convertInt32ToDouble(dest, fpTemp);
         failureCases.append(branchDouble(DoubleNotEqualOrUnordered, src, fpTemp));
 
@@ -4739,7 +4981,17 @@ public:
     template<typename AddressType>
     void load64LittleEndian(AddressType address, RegisterID dest)
     {
-        m_assembler.ldbrx(dest, PPC64Registers::r0, littleEndianAddress(address));
+        RegisterID base = littleEndianAddress(address);
+        if (!supportsISA2_07()) {
+            // No ldbrx before ISA 2.06: two reversed words. The high half is at
+            // base + 4; r0 serves as both its index and its destination.
+            m_assembler.addi(PPC64Registers::r0, PPC64Registers::r0, 4);
+            m_assembler.lwbrx(PPC64Registers::r0, base, PPC64Registers::r0);
+            m_assembler.lwbrx(dest, PPC64Registers::r0, base);
+            m_assembler.rldimi(dest, PPC64Registers::r0, 32, 0);
+            return;
+        }
+        m_assembler.ldbrx(dest, PPC64Registers::r0, base);
     }
     template<typename AddressType>
     void loadFloatLittleEndian(AddressType address, FPRegisterID dest)
@@ -4751,7 +5003,7 @@ public:
     void loadDoubleLittleEndian(AddressType address, FPRegisterID dest)
     {
         load64LittleEndian(address, dataTempRegister);
-        m_assembler.mtvsrd(dest, dataTempRegister);
+        moveBitsToFPR(dest, dataTempRegister);
     }
     template<typename AddressType>
     void store16LittleEndian(RegisterID src, AddressType address)
@@ -4763,10 +5015,28 @@ public:
     {
         m_assembler.stwbrx(src, PPC64Registers::r0, littleEndianAddress(address));
     }
+    void emitStore64Reversed(RegisterID src, RegisterID base)
+    {
+        if (supportsISA2_07()) {
+            m_assembler.stdbrx(src, PPC64Registers::r0, base);
+            return;
+        }
+        // No stdbrx before ISA 2.06: two reversed words, the high half at
+        // base + 4. base is stepped and restored, since both scratch registers
+        // may be in use as src and base. The word at the higher address goes
+        // first: a store that runs off the end of a wasm memory then faults
+        // before it has written anything, as the single instruction does.
+        ASSERT(src != base);
+        m_assembler.rldicl(PPC64Registers::r0, src, 32, 32);
+        m_assembler.addi(base, base, 4);
+        m_assembler.stwbrx(PPC64Registers::r0, PPC64Registers::r0, base);
+        m_assembler.addi(base, base, -4);
+        m_assembler.stwbrx(src, PPC64Registers::r0, base);
+    }
     template<typename AddressType>
     void store64LittleEndian(RegisterID src, AddressType address)
     {
-        m_assembler.stdbrx(src, PPC64Registers::r0, littleEndianAddress(address));
+        emitStore64Reversed(src, littleEndianAddress(address));
     }
     template<typename AddressType>
     void storeFloatLittleEndian(FPRegisterID src, AddressType address)
@@ -4779,8 +5049,8 @@ public:
     void storeDoubleLittleEndian(FPRegisterID src, AddressType address)
     {
         RegisterID base = littleEndianAddress(address);
-        m_assembler.mfvsrd(dataTempRegister, src);
-        m_assembler.stdbrx(dataTempRegister, PPC64Registers::r0, base);
+        moveBitsToGPR(dataTempRegister, src);
+        emitStore64Reversed(dataTempRegister, base);
     }
 
     void byteSwap16(RegisterID reg)
@@ -4852,12 +5122,84 @@ public:
     // clobbered — zero-extended to `width` to match the zero-extended larx
     // result. The load value uses dataTempRegister; the address uses
     // memoryTempRegister.
+    // --- 8- and 16-bit atomics before ISA 2.06 -----------------------------
+    // lbarx/lharx and stbcx./sthcx. arrived with POWER7. Without them a narrow
+    // atomic operates on the aligned word that contains the field: load-reserve
+    // the word, extract the field, and store-conditional the word with the
+    // field replaced. That takes a shift, a mask and the word besides the three
+    // scratch registers, so three registers the operation does not use are
+    // saved in the protected zone below the stack pointer and restored on
+    // every exit. A 16-bit field must be aligned (wasm traps otherwise, and
+    // typed arrays are), so it never straddles two words.
+    struct NarrowAtomicScratch {
+        RegisterID shift;
+        RegisterID mask;
+        RegisterID word;
+        unsigned width;
+    };
+    std::optional<NarrowAtomicScratch> beginNarrowAtomic(unsigned width, RegisterID addr, std::initializer_list<RegisterID> operands)
+    {
+        if (width >= 32 || supportsISA2_07())
+            return std::nullopt;
+        RegisterID picked[3];
+        unsigned count = 0;
+        for (RegisterID candidate : { PPC64Registers::r30, PPC64Registers::r29, PPC64Registers::r28, PPC64Registers::r27, PPC64Registers::r26, PPC64Registers::r25, PPC64Registers::r24 }) {
+            bool used = candidate == addr;
+            for (RegisterID operand : operands)
+                used |= candidate == operand;
+            if (!used && count < 3)
+                picked[count++] = candidate;
+        }
+        RELEASE_ASSERT(count == 3);
+        NarrowAtomicScratch scratch { picked[0], picked[1], picked[2], width };
+        m_assembler.std(scratch.shift, -16, stackPointerRegister);
+        m_assembler.std(scratch.mask, -24, stackPointerRegister);
+        m_assembler.std(scratch.word, -32, stackPointerRegister);
+        // Bit offset of the field in its word: the byte offset times eight on
+        // little-endian, counted from the other end on big-endian.
+        m_assembler.rlwinm(scratch.shift, addr, 3, 27, 28);
+        if (std::endian::native == std::endian::big)
+            m_assembler.xori(scratch.shift, scratch.shift, 32 - width);
+        m_assembler.rldicr(memoryTempRegister, addr, 0, 61);   // the aligned word
+        m_assembler.addi(scratch.mask, PPC64Registers::r0, 0);
+        m_assembler.ori(scratch.mask, scratch.mask, width == 8 ? 0xFF : 0xFFFF);
+        m_assembler.slw(scratch.mask, scratch.mask, scratch.shift);
+        return scratch;
+    }
+    // dataTempRegister = the field, zero-extended.
+    void emitNarrowAtomicLoad(unsigned width, const NarrowAtomicScratch& scratch)
+    {
+        m_assembler.lwarx(scratch.word, PPC64Registers::r0, memoryTempRegister);
+        m_assembler.srw(dataTempRegister, scratch.word, scratch.shift);
+        m_assembler.rlwinm(dataTempRegister, dataTempRegister, 0, 32 - width, 31);
+    }
+    // Sets CR0[EQ] as stwcx. does. value may be any register, including
+    // dataTempRegister; only its low `width` bits are stored.
+    void emitNarrowAtomicStore(const NarrowAtomicScratch& scratch, RegisterID value)
+    {
+        m_assembler.slw(PPC64Registers::r0, value, scratch.shift);
+        m_assembler.and_(PPC64Registers::r0, PPC64Registers::r0, scratch.mask);
+        m_assembler.andc(scratch.word, scratch.word, scratch.mask);
+        m_assembler.or_(PPC64Registers::r0, PPC64Registers::r0, scratch.word);
+        m_assembler.stwcx_(PPC64Registers::r0, PPC64Registers::r0, memoryTempRegister);
+    }
+    // ld does not touch CR0, so the stwcx. result survives.
+    void endNarrowAtomic(const std::optional<NarrowAtomicScratch>& scratch)
+    {
+        if (!scratch)
+            return;
+        m_assembler.ld(scratch->shift, -16, stackPointerRegister);
+        m_assembler.ld(scratch->mask, -24, stackPointerRegister);
+        m_assembler.ld(scratch->word, -32, stackPointerRegister);
+    }
+
     template<typename AddressType>
     Jump branchAtomicWeakCAS(unsigned width, StatusCondition cond, RegisterID expected, RegisterID newValue, AddressType address)
     {
         RegisterID addr = prepareAtomicAddress(address, memoryTempRegister);
         RegisterID tmp = dataTempRegister;
         constexpr RegisterID zero = PPC64Registers::r0; // rA=0 -> literal 0 in larx/stcx.
+        auto narrow = beginNarrowAtomic(width, addr, { expected, newValue });
 
         switch (width) {
         case 8:  and64(TrustedImm32(0xFF), expected); break;
@@ -4868,21 +5210,29 @@ public:
 
         m_assembler.sync(); // seq-cst leading barrier
 
-        switch (width) {
-        case 8:  m_assembler.lbarx(tmp, zero, addr); break;
-        case 16: m_assembler.lharx(tmp, zero, addr); break;
-        case 32: m_assembler.lwarx(tmp, zero, addr); break;
-        default: m_assembler.ldarx(tmp, zero, addr); break;
+        if (narrow)
+            emitNarrowAtomicLoad(width, *narrow);
+        else {
+            switch (width) {
+            case 8:  m_assembler.lbarx(tmp, zero, addr); break;
+            case 16: m_assembler.lharx(tmp, zero, addr); break;
+            case 32: m_assembler.lwarx(tmp, zero, addr); break;
+            default: m_assembler.ldarx(tmp, zero, addr); break;
+            }
         }
 
         m_assembler.cmpld(0, expected, tmp); // unsigned 64-bit; both zero-extended
         Jump mismatch = makeBranch(NotEqual);
 
-        switch (width) {
-        case 8:  m_assembler.stbcx_(newValue, zero, addr); break;
-        case 16: m_assembler.sthcx_(newValue, zero, addr); break;
-        case 32: m_assembler.stwcx_(newValue, zero, addr); break;
-        default: m_assembler.stdcx_(newValue, zero, addr); break;
+        if (narrow)
+            emitNarrowAtomicStore(*narrow, newValue);
+        else {
+            switch (width) {
+            case 8:  m_assembler.stbcx_(newValue, zero, addr); break;
+            case 16: m_assembler.sthcx_(newValue, zero, addr); break;
+            case 32: m_assembler.stwcx_(newValue, zero, addr); break;
+            default: m_assembler.stdcx_(newValue, zero, addr); break;
+            }
         }
         // stcx. sets CR0[EQ]=1 iff the store succeeded (reservation held).
 
@@ -4891,20 +5241,20 @@ public:
         // caller may act on that (the strong CAS does the same).
         if (cond == Success) {
             Jump storeFailed = makeBranch(NotEqual); // CR0[EQ] clear -> stcx. failed
-            m_assembler.isync();                     // acquire on success
+            endNarrowAtomic(narrow); m_assembler.isync();                     // acquire on success
             Jump success = jump();
             mismatch.link(this);
             storeFailed.link(this);
-            m_assembler.isync();                     // acquire on failure
+            endNarrowAtomic(narrow); m_assembler.isync();                     // acquire on failure
             return success;
         }
         // Failure form: taken on value mismatch or a lost reservation.
         Jump stored = makeBranch(Equal); // CR0[EQ] set -> stcx. succeeded
         mismatch.link(this);             // mismatch joins the store-failed fall-through
-        m_assembler.isync();             // acquire on failure
+        endNarrowAtomic(narrow); m_assembler.isync();             // acquire on failure
         Jump failure = jump();
         stored.link(this);
-        m_assembler.isync();             // acquire on the success path
+        endNarrowAtomic(narrow); m_assembler.isync();             // acquire on the success path
         return failure;
     }
 
@@ -4930,6 +5280,7 @@ public:
         RegisterID addr = prepareAtomicAddress(address, memoryTempRegister);
         RegisterID tmp = dataTempRegister;
         constexpr RegisterID zero = PPC64Registers::r0;
+        auto narrow = beginNarrowAtomic(width, addr, { expectedAndResult, newValue, result });
 
         // Match the zero-extended larx result so cmpld compares like for like.
         switch (width) {
@@ -4941,23 +5292,31 @@ public:
 
         m_assembler.sync(); // seq-cst leading barrier
         Label reloop(this);
-        switch (width) {
-        case 8:  m_assembler.lbarx(tmp, zero, addr); break;
-        case 16: m_assembler.lharx(tmp, zero, addr); break;
-        case 32: m_assembler.lwarx(tmp, zero, addr); break;
-        default: m_assembler.ldarx(tmp, zero, addr); break;
+        if (narrow)
+            emitNarrowAtomicLoad(width, *narrow);
+        else {
+            switch (width) {
+            case 8:  m_assembler.lbarx(tmp, zero, addr); break;
+            case 16: m_assembler.lharx(tmp, zero, addr); break;
+            case 32: m_assembler.lwarx(tmp, zero, addr); break;
+            default: m_assembler.ldarx(tmp, zero, addr); break;
+            }
         }
         m_assembler.cmpld(0, expectedAndResult, tmp);
         Jump failure = makeBranch(NotEqual);
 
-        switch (width) {
-        case 8:  m_assembler.stbcx_(newValue, zero, addr); break;
-        case 16: m_assembler.sthcx_(newValue, zero, addr); break;
-        case 32: m_assembler.stwcx_(newValue, zero, addr); break;
-        default: m_assembler.stdcx_(newValue, zero, addr); break;
+        if (narrow)
+            emitNarrowAtomicStore(*narrow, newValue);
+        else {
+            switch (width) {
+            case 8:  m_assembler.stbcx_(newValue, zero, addr); break;
+            case 16: m_assembler.sthcx_(newValue, zero, addr); break;
+            case 32: m_assembler.stwcx_(newValue, zero, addr); break;
+            default: m_assembler.stdcx_(newValue, zero, addr); break;
+            }
         }
         makeBranch(NotEqual).linkTo(reloop, this); // reservation lost -> retry
-        m_assembler.isync();                       // acquire
+        endNarrowAtomic(narrow); m_assembler.isync();                       // acquire
         move(TrustedImm32(cond == Success), result);
         Jump done = jump();
 
@@ -4971,7 +5330,7 @@ public:
         // against itself, matches, and stores newValue: a mismatching CAS that
         // writes, whenever the store-back's stcx. fails.
         move(tmp, expectedAndResult); // report the value we actually saw
-        m_assembler.isync();
+        endNarrowAtomic(narrow); m_assembler.isync();
         move(TrustedImm32(cond == Failure), result);
 
         done.link(this);
@@ -4985,6 +5344,7 @@ public:
         RegisterID addr = prepareAtomicAddress(address, memoryTempRegister);
         RegisterID tmp = dataTempRegister;
         constexpr RegisterID zero = PPC64Registers::r0;
+        auto narrow = beginNarrowAtomic(width, addr, { expectedAndResult, newValue });
 
         switch (width) {
         case 8:  and64(TrustedImm32(0xFF), expectedAndResult); break;
@@ -4995,23 +5355,31 @@ public:
 
         m_assembler.sync();
         Label reloop(this);
-        switch (width) {
-        case 8:  m_assembler.lbarx(tmp, zero, addr); break;
-        case 16: m_assembler.lharx(tmp, zero, addr); break;
-        case 32: m_assembler.lwarx(tmp, zero, addr); break;
-        default: m_assembler.ldarx(tmp, zero, addr); break;
+        if (narrow)
+            emitNarrowAtomicLoad(width, *narrow);
+        else {
+            switch (width) {
+            case 8:  m_assembler.lbarx(tmp, zero, addr); break;
+            case 16: m_assembler.lharx(tmp, zero, addr); break;
+            case 32: m_assembler.lwarx(tmp, zero, addr); break;
+            default: m_assembler.ldarx(tmp, zero, addr); break;
+            }
         }
         m_assembler.cmpld(0, expectedAndResult, tmp);
         Jump mismatch = makeBranch(NotEqual);
-        switch (width) {
-        case 8:  m_assembler.stbcx_(newValue, zero, addr); break;
-        case 16: m_assembler.sthcx_(newValue, zero, addr); break;
-        case 32: m_assembler.stwcx_(newValue, zero, addr); break;
-        default: m_assembler.stdcx_(newValue, zero, addr); break;
+        if (narrow)
+            emitNarrowAtomicStore(*narrow, newValue);
+        else {
+            switch (width) {
+            case 8:  m_assembler.stbcx_(newValue, zero, addr); break;
+            case 16: m_assembler.sthcx_(newValue, zero, addr); break;
+            case 32: m_assembler.stwcx_(newValue, zero, addr); break;
+            default: m_assembler.stdcx_(newValue, zero, addr); break;
+            }
         }
         makeBranch(NotEqual).linkTo(reloop, this); // strong: retry a lost reservation
         mismatch.link(this);
-        m_assembler.isync();
+        endNarrowAtomic(narrow); m_assembler.isync();
         move(tmp, expectedAndResult);
     }
 
@@ -5037,28 +5405,37 @@ public:
         RegisterID addr = prepareAtomicAddress(address, memoryTempRegister);
         RegisterID tmp = dataTempRegister;
         constexpr RegisterID zero = PPC64Registers::r0; // rA=0 -> literal 0 in larx/stcx.
+        auto narrow = beginNarrowAtomic(width, addr, { reg });
 
         m_assembler.sync(); // seq-cst leading barrier
         Label reloop(this);
-        switch (width) {
-        case 8:  m_assembler.lbarx(tmp, zero, addr); break;
-        case 16: m_assembler.lharx(tmp, zero, addr); break;
-        case 32: m_assembler.lwarx(tmp, zero, addr); break;
-        default: m_assembler.ldarx(tmp, zero, addr); break;
+        if (narrow)
+            emitNarrowAtomicLoad(width, *narrow);
+        else {
+            switch (width) {
+            case 8:  m_assembler.lbarx(tmp, zero, addr); break;
+            case 16: m_assembler.lharx(tmp, zero, addr); break;
+            case 32: m_assembler.lwarx(tmp, zero, addr); break;
+            default: m_assembler.ldarx(tmp, zero, addr); break;
+            }
         }
         // Hold the *sum* in tmp rather than the old value: that keeps reg
         // intact for a retry, and the old value is recovered exactly as
         // sum - reg once the store sticks (true at every width, since larx
         // zero-extends and the subtraction is done at full 64-bit width).
         m_assembler.add(tmp, tmp, reg);
-        switch (width) {
-        case 8:  m_assembler.stbcx_(tmp, zero, addr); break;
-        case 16: m_assembler.sthcx_(tmp, zero, addr); break;
-        case 32: m_assembler.stwcx_(tmp, zero, addr); break;
-        default: m_assembler.stdcx_(tmp, zero, addr); break;
+        if (narrow)
+            emitNarrowAtomicStore(*narrow, tmp);
+        else {
+            switch (width) {
+            case 8:  m_assembler.stbcx_(tmp, zero, addr); break;
+            case 16: m_assembler.sthcx_(tmp, zero, addr); break;
+            case 32: m_assembler.stwcx_(tmp, zero, addr); break;
+            default: m_assembler.stdcx_(tmp, zero, addr); break;
+            }
         }
         makeBranch(NotEqual).linkTo(reloop, this); // CR0[EQ] clear -> reservation lost
-        m_assembler.isync();                       // acquire
+        endNarrowAtomic(narrow); m_assembler.isync();                       // acquire
         m_assembler.subf(reg, reg, tmp);           // reg = tmp - reg = old value
     }
 
@@ -5068,23 +5445,32 @@ public:
         RegisterID addr = prepareAtomicAddress(address, memoryTempRegister);
         RegisterID tmp = dataTempRegister;
         constexpr RegisterID zero = PPC64Registers::r0;
+        auto narrow = beginNarrowAtomic(width, addr, { reg });
 
         m_assembler.sync();
         Label reloop(this);
-        switch (width) {
-        case 8:  m_assembler.lbarx(tmp, zero, addr); break;
-        case 16: m_assembler.lharx(tmp, zero, addr); break;
-        case 32: m_assembler.lwarx(tmp, zero, addr); break;
-        default: m_assembler.ldarx(tmp, zero, addr); break;
+        if (narrow)
+            emitNarrowAtomicLoad(width, *narrow);
+        else {
+            switch (width) {
+            case 8:  m_assembler.lbarx(tmp, zero, addr); break;
+            case 16: m_assembler.lharx(tmp, zero, addr); break;
+            case 32: m_assembler.lwarx(tmp, zero, addr); break;
+            default: m_assembler.ldarx(tmp, zero, addr); break;
+            }
         }
-        switch (width) {
-        case 8:  m_assembler.stbcx_(reg, zero, addr); break;
-        case 16: m_assembler.sthcx_(reg, zero, addr); break;
-        case 32: m_assembler.stwcx_(reg, zero, addr); break;
-        default: m_assembler.stdcx_(reg, zero, addr); break;
+        if (narrow)
+            emitNarrowAtomicStore(*narrow, reg);
+        else {
+            switch (width) {
+            case 8:  m_assembler.stbcx_(reg, zero, addr); break;
+            case 16: m_assembler.sthcx_(reg, zero, addr); break;
+            case 32: m_assembler.stwcx_(reg, zero, addr); break;
+            default: m_assembler.stdcx_(reg, zero, addr); break;
+            }
         }
         makeBranch(NotEqual).linkTo(reloop, this);
-        m_assembler.isync();
+        endNarrowAtomic(narrow); m_assembler.isync();
         move(tmp, reg); // previous value
     }
 
@@ -5146,8 +5532,54 @@ public:
     // release on its own, independent of how the reserve was taken.
     // larx/stcx. take a bare register address, so these ignore address.offset;
     // callers (Air SimpleAddr, BBQ's Address(pointer)) always pass 0.
-    void loadLink8(Address address, RegisterID dest)  { ASSERT(!address.offset); m_assembler.lbarx(dest, PPC64Registers::r0, address.base); }
-    void loadLink16(Address address, RegisterID dest) { ASSERT(!address.offset); m_assembler.lharx(dest, PPC64Registers::r0, address.base); }
+    // The split forms of the narrow atomics before ISA 2.06 (see
+    // beginNarrowAtomic): the load reserves the aligned word and leaves it at
+    // -24(sp) for the store-conditional, which rebuilds it around the new
+    // field. An ordinary store does not give up the reservation. Both use the
+    // three scratch registers; src and result may be the same register.
+    void loadLinkNarrow(unsigned width, RegisterID base, RegisterID dest)
+    {
+        m_assembler.rldicr(memoryTempRegister, base, 0, 61);
+        m_assembler.lwarx(dataTempRegister, PPC64Registers::r0, memoryTempRegister);
+        m_assembler.std(dataTempRegister, -24, stackPointerRegister);
+        m_assembler.rlwinm(PPC64Registers::r0, base, 3, 27, 28);
+        if (std::endian::native == std::endian::big)
+            m_assembler.xori(PPC64Registers::r0, PPC64Registers::r0, 32 - width);
+        m_assembler.srw(dest, dataTempRegister, PPC64Registers::r0);
+        m_assembler.rlwinm(dest, dest, 0, 32 - width, 31);
+    }
+    void storeCondNarrow(unsigned width, RegisterID src, RegisterID base)
+    {
+        m_assembler.rlwinm(PPC64Registers::r0, base, 3, 27, 28);
+        if (std::endian::native == std::endian::big)
+            m_assembler.xori(PPC64Registers::r0, PPC64Registers::r0, 32 - width);
+        m_assembler.addi(memoryTempRegister, PPC64Registers::r0, -1);
+        m_assembler.rldicl(memoryTempRegister, memoryTempRegister, 0, 64 - width);
+        m_assembler.slw(memoryTempRegister, memoryTempRegister, PPC64Registers::r0);   // the field's mask
+        m_assembler.ld(dataTempRegister, -24, stackPointerRegister);
+        m_assembler.andc(dataTempRegister, dataTempRegister, memoryTempRegister);
+        m_assembler.slw(PPC64Registers::r0, src, PPC64Registers::r0);
+        m_assembler.and_(PPC64Registers::r0, PPC64Registers::r0, memoryTempRegister);
+        m_assembler.or_(dataTempRegister, dataTempRegister, PPC64Registers::r0);
+        m_assembler.rldicr(memoryTempRegister, base, 0, 61);
+        m_assembler.stwcx_(dataTempRegister, PPC64Registers::r0, memoryTempRegister);
+    }
+    void loadLink8(Address address, RegisterID dest)
+    {
+        ASSERT(!address.offset);
+        if (supportsISA2_07())
+            m_assembler.lbarx(dest, PPC64Registers::r0, address.base);
+        else
+            loadLinkNarrow(8, address.base, dest);
+    }
+    void loadLink16(Address address, RegisterID dest)
+    {
+        ASSERT(!address.offset);
+        if (supportsISA2_07())
+            m_assembler.lharx(dest, PPC64Registers::r0, address.base);
+        else
+            loadLinkNarrow(16, address.base, dest);
+    }
     void loadLink32(Address address, RegisterID dest) { ASSERT(!address.offset); m_assembler.lwarx(dest, PPC64Registers::r0, address.base); }
     void loadLink64(Address address, RegisterID dest) { ASSERT(!address.offset); m_assembler.ldarx(dest, PPC64Registers::r0, address.base); }
     void loadLinkAcq8(Address address, RegisterID dest)  { m_assembler.sync(); loadLink8(address, dest); m_assembler.lwsync(); }
@@ -5161,8 +5593,24 @@ public:
         m_assembler.rlwinm(result, result, 3, 31, 31); // CR0 bit 2 (EQ) -> LSB
         m_assembler.xori(result, result, 1);
     }
-    void storeCond8(RegisterID src, Address address, RegisterID result)  { ASSERT(!address.offset); m_assembler.stbcx_(src, PPC64Registers::r0, address.base); emitStoreCondResult(result); }
-    void storeCond16(RegisterID src, Address address, RegisterID result) { ASSERT(!address.offset); m_assembler.sthcx_(src, PPC64Registers::r0, address.base); emitStoreCondResult(result); }
+    void storeCond8(RegisterID src, Address address, RegisterID result)
+    {
+        ASSERT(!address.offset);
+        if (supportsISA2_07())
+            m_assembler.stbcx_(src, PPC64Registers::r0, address.base);
+        else
+            storeCondNarrow(8, src, address.base);
+        emitStoreCondResult(result);
+    }
+    void storeCond16(RegisterID src, Address address, RegisterID result)
+    {
+        ASSERT(!address.offset);
+        if (supportsISA2_07())
+            m_assembler.sthcx_(src, PPC64Registers::r0, address.base);
+        else
+            storeCondNarrow(16, src, address.base);
+        emitStoreCondResult(result);
+    }
     void storeCond32(RegisterID src, Address address, RegisterID result) { ASSERT(!address.offset); m_assembler.stwcx_(src, PPC64Registers::r0, address.base); emitStoreCondResult(result); }
     void storeCond64(RegisterID src, Address address, RegisterID result) { ASSERT(!address.offset); m_assembler.stdcx_(src, PPC64Registers::r0, address.base); emitStoreCondResult(result); }
     void storeCondRel8(RegisterID src, Address address, RegisterID result)  { m_assembler.lwsync(); storeCond8(src, address, result); }
@@ -5180,11 +5628,11 @@ public:
     void move16ToFloat16(RegisterID src, FPRegisterID dest)
     {
         zeroExtend16To32(src, dataTempRegister);
-        m_assembler.mtvsrd(dest, dataTempRegister);
+        moveBitsToFPR(dest, dataTempRegister);
     }
     void moveFloat16To16(FPRegisterID src, RegisterID dest)
     {
-        m_assembler.mfvsrd(dest, src);
+        moveBitsToGPR(dest, src);
         zeroExtend16To32(dest, dest);
     }
 
@@ -5325,24 +5773,81 @@ public:
     // the round-to-single convert (fcfids/fcfidus). Move the integer into the
     // FPR/VSR: mtvsrwa sign-extends a 32-bit source, mtvsrwz zero-extends it,
     // mtvsrd moves a full 64-bit source.
+    //
+    // Before ISA 2.06 there is only fcfid (signed doubleword to double), then
+    // frsp to round to single. A 32-bit integer is exact as a double, so that
+    // is one rounding. A 64-bit one may round twice, so when it does not fit 53
+    // bits its low 11 bits are folded into a sticky bit first (as GCC does for
+    // -mcpu=970): fcfid is then exact and frsp does the only rounding.
     void convertInt32ToFloat(RegisterID src, FPRegisterID dest)
     {
-        m_assembler.mtvsrwa(dest, src);
-        m_assembler.fcfids(dest, dest);
+        moveSignExtendedWordToFPR(dest, src);
+        if (supportsISA2_07())
+            m_assembler.fcfids(dest, dest);
+        else {
+            m_assembler.fcfid(dest, dest);
+            m_assembler.frsp(dest, dest);
+        }
     }
     void convertUInt32ToFloat(RegisterID src, FPRegisterID dest)
     {
-        m_assembler.mtvsrwz(dest, src);
-        m_assembler.fcfidus(dest, dest);
+        moveZeroExtendedWordToFPR(dest, src);
+        if (supportsISA2_07())
+            m_assembler.fcfidus(dest, dest);
+        else {
+            m_assembler.fcfid(dest, dest);
+            m_assembler.frsp(dest, dest);
+        }
+    }
+    // r0 = value with the low 11 bits folded into bit 11 when it needs more
+    // than 53 significant bits, else the value. Clobbers memoryTempRegister.
+    void emitStickyFoldForFloat(RegisterID value)
+    {
+        m_assembler.sradi(memoryTempRegister, value, 53);
+        m_assembler.addi(memoryTempRegister, memoryTempRegister, 1);
+        m_assembler.cmpldi(0, memoryTempRegister, 1);
+        if (value != PPC64Registers::r0)
+            m_assembler.mr(PPC64Registers::r0, value);
+        m_assembler.bc(4, 1, 20);                                         // fits 53 bits: skip the fold
+        m_assembler.rldicl(memoryTempRegister, PPC64Registers::r0, 0, 53); // low 11 bits
+        m_assembler.addi(memoryTempRegister, memoryTempRegister, 2047);
+        m_assembler.or_(PPC64Registers::r0, PPC64Registers::r0, memoryTempRegister);
+        m_assembler.rldicr(PPC64Registers::r0, PPC64Registers::r0, 0, 52); // clear the low 11 bits
     }
     void convertInt64ToFloat(RegisterID src, FPRegisterID dest)
     {
-        m_assembler.mtvsrd(dest, src);
+        if (!supportsISA2_07()) {
+            emitStickyFoldForFloat(src);
+            moveBitsToFPR(dest, PPC64Registers::r0);
+            m_assembler.fcfid(dest, dest);
+            m_assembler.frsp(dest, dest);
+            return;
+        }
+        moveBitsToFPR(dest, src);
         m_assembler.fcfids(dest, dest);
     }
     void convertUInt64ToFloat(RegisterID src, FPRegisterID dest)
     {
-        m_assembler.mtvsrd(dest, src);
+        if (!supportsISA2_07()) {
+            // As convertUInt64ToDouble: halve a value with the top bit set,
+            // keeping a sticky bit, and double the result (exact in single).
+            m_assembler.rldicl(PPC64Registers::r0, src, 0, 63);
+            m_assembler.cmpdi(0, src, 0);
+            m_assembler.rldicl(memoryTempRegister, src, 63, 1);
+            m_assembler.or_(PPC64Registers::r0, PPC64Registers::r0, memoryTempRegister);
+            emitSkipOneInstruction(12, 0);
+            m_assembler.mr(PPC64Registers::r0, src);
+            emitStickyFoldForFloat(PPC64Registers::r0);
+            moveBitsToFPR(dest, PPC64Registers::r0);
+            m_assembler.fcfid(dest, dest);
+            m_assembler.frsp(dest, dest);
+            ASSERT(src != memoryTempRegister);                            // the fold clobbered it
+            m_assembler.cmpdi(0, src, 0);
+            emitSkipOneInstruction(4, 0);                                 // non-negative: done
+            m_assembler.fadds(dest, dest, dest);
+            return;
+        }
+        moveBitsToFPR(dest, src);
         m_assembler.fcfidus(dest, dest);
     }
 

@@ -36,11 +36,14 @@
 #include <sys/auxv.h>
 #endif
 
-// AT_HWCAP2 bits for Power ISA 3.0 and 3.1 (asm/cputable.h's PPC_FEATURE2_ARCH_3_00 / _3_1).
+// AT_HWCAP2 bits for Power ISA 2.07, 3.0 and 3.1 (asm/cputable.h's PPC_FEATURE2_ARCH_2_07 / _3_00 / _3_1).
+#define PPC64_FEATURE2_ARCH_2_07 0x80000000
 #define PPC64_FEATURE2_ARCH_3_00 0x00800000
 #define PPC64_FEATURE2_ARCH_3_1 0x00040000
 
 namespace JSC {
+
+bool PPC64Assembler::s_rejectNewerThanISA2_01 = false;
 
 unsigned MacroAssemblerPPC64::isaLevel()
 {
@@ -51,8 +54,15 @@ unsigned MacroAssemblerPPC64::isaLevel()
             return 310u;
         if (hwcap2 & PPC64_FEATURE2_ARCH_3_00)
             return 300u;
-#endif
+        if (hwcap2 & PPC64_FEATURE2_ARCH_2_07)
+            return 207u;
+        // Anything older (PowerPC 970, POWER5 to POWER7) is treated alike: the
+        // 64-bit base instruction set of ISA 2.01, with no VSX and none of the
+        // 2.02 to 2.06 additions.
+        return 201u;
+#else
         return 207u;
+#endif
     }();
     return std::min(hardwareLevel, Options::maximumPPC64ISALevel());
 }

@@ -951,6 +951,11 @@ macro pushCalleeSaves()
         emit "std 28, 40(1)"
         emit "std 29, 48(1)"
         emit "std 30, 56(1)"
+        # CR2 says which instructions the interpreters may use (see
+        # ppc64SelectPOWER8 in ppc64.rb). It is a nonvolatile field: C code
+        # preserves it for us while we run, and the C caller's value is kept
+        # in the alignment gap at 8(sp) for popCalleeSaves.
+        ppc64setcpufeatures _g_jscPPC64Pre207
     elsif ARMv7
         emit "vpush.64 {d14, d15}"
         emit "push {r4-r6, r8-r9}"
@@ -971,6 +976,8 @@ macro popCalleeSaves()
         emit "ld 28, 40(1)"
         emit "ld 29, 48(1)"
         emit "ld 30, 56(1)"
+        emit "ld 0, 8(1)"
+        emit "mtcrf 32, 0"
         emit "addi 1, 1, 96"
     elsif ARMv7
         emit "pop {r4-r6, r8-r9}"

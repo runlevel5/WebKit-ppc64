@@ -845,6 +845,12 @@ void Options::notifyOptionsChanged()
     // Big-endian hosts would need the lanes of every v128 memory access reversed.
     Options::useWasmSIMD() = false;
 #endif
+#if CPU(PPC64) && ENABLE(JIT)
+    // The wasm SIMD code needs VSX and the ISA 2.07 vector instructions (POWER8).
+    if (!MacroAssemblerPPC64::supportsISA2_07())
+        Options::useWasmSIMD() = false;
+    PPC64Assembler::s_rejectNewerThanISA2_01 = Options::validatePPC64ISALevel() && !MacroAssemblerPPC64::supportsISA2_07();
+#endif
 #if !CPU(PPC64)
     Options::useWasmIPInt() = false;
 #endif
